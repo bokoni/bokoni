@@ -1,0 +1,21 @@
+[package]
+name = "bokoni"
+version = "0.1.0"
+edition = "2024"
+description = "Langage de script intégré à Rust, syntaxe à la Ruby, typage graduel"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bokoni"
+path = "src/main.rs"
+
+[dependencies]
+stacker = "0.1"
+
+[profile.release]
+debug = 1
+
+[dev-dependencies]
+peg = "0.8"
