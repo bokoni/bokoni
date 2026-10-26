@@ -30,6 +30,10 @@ erreur de type: `str` n'a pas de méthode `lenght` (voulez-vous dire `len` ?)
 Typage graduel : seules les erreurs certaines sont signalées, le reste est vérifié à
 l'exécution.
 
+Les fonctions entièrement typées sont compilées en code natif (JIT Cranelift) à leur
+premier appel : `fib(25)` passe de 28 ms (interprété) à 0,5 ms. Le reste est interprété,
+avec exactement le même résultat.
+
 ## Utilisation depuis Rust
 
 ```rust
@@ -54,6 +58,7 @@ cargo run -- script.bk            # exécute un fichier
 cargo run -- -e '1 + 2'           # => 3
 cargo run -- --ast -e '1 + 2 * 3' # (+ 1 (* 2 3))
 cargo run -- --ir script.bk       # IR exécutée (registres typés, blocs de base)
+cargo run -- --no-jit script.bk   # sans compilation native
 ```
 
 ## Documentation
@@ -66,5 +71,6 @@ cargo run -- --ir script.bk       # IR exécutée (registres typés, blocs de ba
 ```sh
 cargo test                                       # tests (dont tous les exemples de syntax.md)
 cargo run --release --example bench_parser       # parseur vs peg
-cargo run --release --example bench_interp       # vitesse d'exécution
+cargo run --release --example bench_interp       # vitesse d'exécution (avec / sans JIT)
+cargo build --no-default-features                # sans le JIT (plateformes sans Cranelift)
 ```

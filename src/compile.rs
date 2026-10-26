@@ -578,6 +578,7 @@ impl Compiler<'_> {
             children: f.children,
             decls: f.decls,
             decl: f.decl,
+            jit: Default::default(),
         })
     }
 

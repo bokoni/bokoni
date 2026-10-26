@@ -17,6 +17,8 @@ pub mod engine;
 pub mod globals;
 pub mod intern;
 pub mod ir;
+#[cfg(feature = "jit")]
+pub mod jit;
 pub mod lexer;
 pub mod objects;
 pub mod ops;

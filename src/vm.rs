@@ -74,6 +74,10 @@ pub struct Runtime {
     /// par appel en régime établi).
     frames: Vec<Vec<Value>>,
     no_ctx: Rc<[u32]>,
+    /// Compilation native des fonctions typées (créée au premier besoin).
+    pub jit_enabled: bool,
+    #[cfg(feature = "jit")]
+    jit: Option<crate::jit::Jit>,
 }
 
 impl Default for Runtime {
@@ -115,6 +119,9 @@ impl Runtime {
             syms,
             frames: Vec::new(),
             no_ctx: Rc::from([]),
+            jit_enabled: cfg!(feature = "jit"),
+            #[cfg(feature = "jit")]
+            jit: None,
         }
     }
 
@@ -229,6 +236,10 @@ impl Runtime {
         regs.resize(proto.regs.len(), Value::Nil);
         let r = stacker::maybe_grow(RED_ZONE, STACK_GROW, || {
             bind(self, &mut regs)?;
+            #[cfg(feature = "jit")]
+            if let Some(r) = self.try_jit(proto, &regs) {
+                return r;
+            }
             self.exec(proto, upvals, ctx, &mut regs)
         });
         regs.clear();
@@ -911,6 +922,36 @@ impl Runtime {
         Ok(())
     }
 
+    /// Exécute `proto` en natif s'il est (ou devient) compilé ; `None` sinon.
+    #[cfg(feature = "jit")]
+    fn try_jit(&mut self, proto: &Rc<Proto>, regs: &[Value]) -> Option<R> {
+        if !self.jit_enabled || proto.kind != ProtoKind::Function {
+            return None;
+        }
+        if matches!(*proto.jit.borrow(), JitState::Untried) {
+            if self.jit.is_none() {
+                self.jit = crate::jit::Jit::new();
+                if self.jit.is_none() {
+                    // Machine non prise en charge par Cranelift.
+                    self.jit_enabled = false;
+                    return None;
+                }
+            }
+            self.jit.as_mut()?.compile(proto, &mut self.globals);
+        }
+        let state = proto.jit.borrow();
+        let JitState::Native(code) = &*state else {
+            return None;
+        };
+        let args: Vec<Value> = proto
+            .params
+            .iter()
+            .map(|p| regs[p.reg as usize].clone())
+            .collect();
+        let jit = self.jit.as_mut()?;
+        jit.call(code, &args, self.depth, self.max_depth)
+    }
+
     // ─── Aides de l'exécution ────────────────────────────────────────────────
 
     fn set_global(&mut self, g: u32, v: Value, span: Span) -> R<()> {
@@ -932,7 +973,7 @@ impl Runtime {
                 span,
             ),
             (Some(_), true) => {
-                self.globals.at_mut(g).value = Some(v);
+                self.globals.assign(g, v);
                 Ok(())
             }
         }

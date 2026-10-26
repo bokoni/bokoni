@@ -66,6 +66,27 @@ pub struct Proto {
     pub decls: Vec<Decl>,
     /// Déclaration source (signature pour le vérificateur, introspection).
     pub decl: Option<Rc<FnDecl>>,
+    /// Compilation native (JIT) de la fonction.
+    pub jit: std::cell::RefCell<JitState>,
+}
+
+/// État de la compilation native d'une fonction.
+#[derive(Clone, Debug, Default)]
+pub enum JitState {
+    /// Pas encore essayée (ou invalidée : une fonction appelée a été redéfinie).
+    #[default]
+    Untried,
+    Native(NativeCode),
+    /// Non compilable : l'interpréteur l'exécute.
+    Rejected,
+}
+
+/// Code natif d'une fonction : point d'entrée `extern "C" fn(ctx, args, ret) -> statut`.
+#[derive(Clone, Debug)]
+pub struct NativeCode {
+    pub entry: usize,
+    pub params: Vec<RegTy>,
+    pub ret: RegTy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

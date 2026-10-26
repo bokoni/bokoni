@@ -11,12 +11,14 @@ usage :
   bokoni -e \"code\"          exécute du code et affiche le résultat
   bokoni --ast fichier.bk   affiche l'arbre syntaxique (S-expressions)
   bokoni --ir fichier.bk    affiche l'IR (ce qu'exécute l'interpréteur)
-  (--ast et --ir acceptent aussi -e \"code\")";
+  (--ast et --ir acceptent aussi -e \"code\")
+  --no-jit                  sans compilation native (interpréteur seul)";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut ast = false;
     let mut ir = false;
+    let mut jit = true;
     let mut code: Option<(String, String)> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -27,6 +29,7 @@ fn main() -> ExitCode {
             }
             "--ast" => ast = true,
             "--ir" => ir = true,
+            "--no-jit" => jit = false,
             "-e" => match it.next() {
                 Some(src) => code = Some((src.clone(), "<-e>".into())),
                 None => return usage_error("`-e` attend du code"),
@@ -44,6 +47,7 @@ fn main() -> ExitCode {
     }
 
     let mut engine = Engine::new();
+    engine.set_jit(jit);
     match code {
         None if ast || ir => usage_error("`--ast` / `--ir` attendent un fichier ou `-e`"),
         Some((src, name)) if ir => match engine.ir(&src) {

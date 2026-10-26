@@ -75,10 +75,33 @@ c'est le travail du JIT (appels directs, valeurs non boxées).
 
 ### v0.4 — JIT Cranelift
 
-- [ ] Compilation native des fonctions entièrement typées, interprétation des autres
-- [ ] Appels JIT ↔ interpréteur ↔ fonctions Rust avec une convention unique
-- [ ] Compilation à chaud (fonctions souvent appelées)
-- Référence : `piss/createJit/resources/examples/cranelift-jit-demo`
+- [x] Compilation native (`src/jit.rs`, Cranelift 0.136) des fonctions dont paramètres et
+      retour sont annotés `int` / `float` / `bool` et dont le corps ne fait que calculer,
+      comparer, brancher et appeler d'autres fonctions compilables (récursion comprise)
+- [x] Analyse de l'IR : les registres `valeur` sont typés (résultat d'un appel à une
+      fonction `: int`…) ; sinon, la fonction reste interprétée
+- [x] Mêmes résultats et mêmes erreurs que l'interpréteur : dépassement de capacité,
+      division euclidienne, division par zéro, profondeur d'appels, pile d'appels
+      (vérifié par des tests d'équivalence)
+- [x] Appels directs natif → natif ; redéfinition d'une fonction globale : le code qui
+      l'appelle est invalidé et recompilé au besoin
+- [x] Compilation au premier appel ; une fonction appelée une seule fois mais qui boucle
+      en profite aussi
+- [x] Pile native insuffisante (récursion très profonde) : l'appel est refait par
+      l'interpréteur (sans risque : les fonctions compilées n'ont pas d'effet de bord)
+- [x] Fonctionnalité Cargo `jit` (par défaut) ; `Engine::set_jit(false)`, `bokoni --no-jit`
+- [ ] Compiler davantage : méthodes, listes, chaînes, appels à l'interpréteur depuis le
+      code natif (valeurs boxées)
+
+| Programme (`cargo run --release --example bench_interp`) | Interpréteur | JIT    |
+|-----------------------------------------------------------|-------------:|-------:|
+| `fib(25)` récursif                                         | 28 ms        | 0,5 ms |
+| boucle `while`, 1 M tours                                  | 29 ms        | 1,2 ms |
+| `for` sur un intervalle, 1 M tours                         | 20 ms        | 0,5 ms |
+| `float` : série harmonique, 1 M tours                      | 33 ms        | 0,9 ms |
+| listes, closures, objets, chaînes                          | inchangé (interprété) | |
+
+Temps compilation comprise.
 
 ### Ensuite
 

@@ -1,4 +1,4 @@
-//! Vitesse d'exécution de l'interpréteur sur quelques programmes typiques.
+//! Vitesse d'exécution sur quelques programmes typiques, avec et sans JIT.
 //!
 //! `cargo run --release --example bench_interp`
 
@@ -19,6 +19,10 @@ const PROGRAMS: &[(&str, &str)] = &[
         "def run(): int\n  let s = 0\n  for i in 0...1000000\n    s += i\n  end\n  s\nend\nrun()",
     ),
     (
+        "float : série harmonique (1 M)",
+        "def h(n: int): float\n  let s = 0.0\n  for i in 1..n\n    s += 1.0 / i\n  end\n  s\nend\nh(1000000)",
+    ),
+    (
         "listes : map / filter / sum (100 k)",
         "let xs = (0...100000).to_list()\nxs.map(|x| x * 2).filter(|x| x % 3 == 0).sum()",
     ),
@@ -37,17 +41,27 @@ const PROGRAMS: &[(&str, &str)] = &[
 ];
 
 fn main() {
-    println!("{:<42} {:>10}", "programme", "temps");
+    println!("{:<42} {:>12} {:>12}", "programme", "interpréteur", "JIT");
     for (name, src) in PROGRAMS {
-        let mut best = f64::MAX;
+        let mut times = [0.0; 2];
         let mut result = String::new();
-        for _ in 0..7 {
-            let mut e = Engine::new();
-            let t = Instant::now();
-            let v = e.eval(src).unwrap_or_else(|err| panic!("{name}: {err}"));
-            best = best.min(t.elapsed().as_secs_f64());
-            result = e.inspect(&v);
+        for (k, jit) in [false, true].into_iter().enumerate() {
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                let mut e = Engine::new();
+                e.set_jit(jit);
+                let t = Instant::now();
+                let v = e.eval(src).unwrap_or_else(|err| panic!("{name}: {err}"));
+                best = best.min(t.elapsed().as_secs_f64());
+                result = e.inspect(&v);
+            }
+            times[k] = best;
         }
-        println!("{name:<42} {:>8.1}ms   => {result}", best * 1e3);
+        println!(
+            "{name:<42} {:>10.1}ms {:>10.1}ms  ×{:<5.1} => {result}",
+            times[0] * 1e3,
+            times[1] * 1e3,
+            times[0] / times[1]
+        );
     }
 }

@@ -67,6 +67,27 @@ impl Engine {
         self.static_checks = enabled;
     }
 
+    /// Active ou désactive la compilation native (JIT) des fonctions typées (activée par
+    /// défaut quand la fonctionnalité `jit` est compilée). Le résultat est le même ; seule
+    /// la vitesse change.
+    pub fn set_jit(&mut self, enabled: bool) {
+        self.rt.jit_enabled = enabled && cfg!(feature = "jit");
+    }
+
+    /// La fonction globale `name` a-t-elle été compilée en code natif (après au moins un
+    /// appel) ?
+    pub fn is_native(&self, name: &str) -> bool {
+        match self.get_global(name) {
+            Some(Value::Function(f)) => match &*f {
+                Function::Script(c) => {
+                    matches!(*c.proto.jit.borrow(), crate::ir::JitState::Native(_))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Profondeur d'appels maximale avant l'erreur « récursion infinie ? » (défaut : 1000).
     pub fn set_max_call_depth(&mut self, depth: usize) {
         self.rt.max_depth = depth;
