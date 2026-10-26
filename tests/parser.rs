@@ -13,7 +13,7 @@ fn err(src: &str) -> String {
     let mut i = Interner::new();
     match parser::parse(src, &mut i) {
         Ok(p) => panic!("devrait échouer : {}", printer::program(&p, &i)),
-        Err(e) => e.message.clone(),
+        Err(e) => e.to_string(),
     }
 }
 
@@ -227,9 +227,13 @@ fn errors() {
 
     // Les erreurs en fin de source sont marquées « incomplètes » (le REPL lit la suite).
     let mut i = Interner::new();
-    assert!(parser::parse("def f\n  1", &mut i).unwrap_err().incomplete);
-    assert!(parser::parse("[1,", &mut i).unwrap_err().incomplete);
-    assert!(!parser::parse("1 + )", &mut i).unwrap_err().incomplete);
+    assert!(
+        parser::parse("def f\n  1", &mut i)
+            .unwrap_err()
+            .is_incomplete()
+    );
+    assert!(parser::parse("[1,", &mut i).unwrap_err().is_incomplete());
+    assert!(!parser::parse("1 + )", &mut i).unwrap_err().is_incomplete());
 }
 
 #[test]
@@ -269,4 +273,84 @@ fn spec_examples_parse() {
         count += 1;
     }
     assert!(count >= 15, "seulement {count} exemples trouvés");
+}
+
+/// Lignes (à partir de 1) des erreurs signalées.
+fn error_lines(src: &str) -> Vec<usize> {
+    let mut i = Interner::new();
+    match parser::parse(src, &mut i) {
+        Ok(_) => Vec::new(),
+        Err(errs) => errs
+            .iter()
+            .map(|e| bokoni::span::line_col(src, e.span.unwrap().start).0)
+            .collect(),
+    }
+}
+
+#[test]
+fn reports_every_error_once() {
+    let src = r#"let a = 1 +* 2
+def f(x y)
+  x + 1
+end
+if a b
+  print(a)
+end
+let c = [1, 2,, 3]
+x = 0 if a > 1 b
+while a && b
+  a = a - 1
+end
+[1, 2].each do |n|
+  print(n n)
+end
+let s = {"a": 1}
+let d = 5 € 2
+def g = 1
+def h(x) = x * 2
+print(g)
+"#;
+    assert_eq!(error_lines(src), [1, 2, 5, 8, 9, 10, 14, 16, 17]);
+}
+
+#[test]
+fn recovery_skips_whole_broken_construct() {
+    // L'en-tête cassé d'un `def` / `if` / `case` : son corps et son `end` sont sautés,
+    // sans erreur en cascade.
+    assert_eq!(
+        error_lines("def f(a b)\n  if a\n    1\n  end\nend\nf(1)\n"),
+        [1]
+    );
+    assert_eq!(
+        error_lines("case x y\nwhen 1 then 2\nend\nlet z = 1 +\n"),
+        [1, 4]
+    );
+    // `if` en modificateur dans la partie sautée : n'ouvre pas de construction.
+    assert_eq!(error_lines("let a = 1 2 if b\nlet c = (\n"), [1, 2]);
+    // Un bloc `do` ouvert sur la ligne erronée est sauté jusqu'à son `end`.
+    assert_eq!(error_lines("foo(1 2) do |x|\n  x\nend\nbar(\n"), [1, 4]);
+}
+
+#[test]
+fn recovery_inside_bodies() {
+    // Les erreurs dans un corps sont signalées et le reste du corps est analysé.
+    assert_eq!(error_lines("def f\n  1 +\n  let x = 2 3\n  x\nend\n"), [3]);
+    assert_eq!(
+        error_lines("type S\n  a: = 1\n  b: int\n  c: [int = 2\nend\nlet ok = 1\n"),
+        [2, 4]
+    );
+    assert_eq!(error_lines("enum E\n  A = \n  B C\n  D\nend\n"), [3]);
+    assert_eq!(error_lines("if x\n  a b\nelse\n  c d\nend\n"), [2, 4]);
+}
+
+#[test]
+fn incomplete_source_stops_cleanly() {
+    let mut i = Interner::new();
+    let e = parser::parse("let a = 1 2\ndef f\n  1\n", &mut i).unwrap_err();
+    assert_eq!(e.len(), 2);
+    assert!(e[1].incomplete);
+    // Chaîne non fermée : les erreurs du parseur situées après n'ont pas de sens.
+    let e = parser::parse("let a = 1 2\nlet s = \"abc\nlet b = 1 2\n", &mut i).unwrap_err();
+    assert_eq!(e.len(), 2, "{e}");
+    assert!(e[1].message.contains("chaîne non fermée"));
 }

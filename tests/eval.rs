@@ -25,7 +25,7 @@ fn err(src: &str) -> (ErrorKind, String) {
     e.set_output(|_| {});
     match e.eval(src) {
         Ok(v) => panic!("devrait échouer, a donné {}", e.inspect(&v)),
-        Err(err) => (err.kind, err.message.clone()),
+        Err(err) => (err[0].kind, err[0].message.clone()),
     }
 }
 
@@ -335,11 +335,11 @@ fn engine_api() {
     assert_eq!(e.eval_as::<i64>("total([1, 2, 3])").unwrap(), 6);
     assert_eq!(e.eval_as::<i64>("maybe(nil)").unwrap(), -1);
 
-    let msg = e.eval("safe_div(1, 0)").unwrap_err().message.clone();
+    let msg = e.eval("safe_div(1, 0)").unwrap_err()[0].message.clone();
     assert_eq!(msg, "division par zéro");
-    let msg = e.eval("double(\"a\")").unwrap_err().message.clone();
+    let msg = e.eval("double(\"a\")").unwrap_err()[0].message.clone();
     assert_eq!(msg, "argument 1 de `double` : int attendu, reçu str");
-    let msg = e.eval("double(1, 2)").unwrap_err().message.clone();
+    let msg = e.eval("double(1, 2)").unwrap_err()[0].message.clone();
     assert_eq!(msg, "`double` attend 1 argument, reçu 2");
 
     // L'état persiste entre les appels ; appel d'une fonction du script depuis Rust.

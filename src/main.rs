@@ -113,7 +113,7 @@ fn repl(engine: &mut Engine) -> ExitCode {
             Ok(Value::Nil) => {}
             Ok(v) => println!("=> {}", engine.inspect(&v)),
             // Construction pas encore terminée (`def` sans `end`…) : on lit la suite.
-            Err(e) if e.incomplete => {
+            Err(e) if e.is_incomplete() => {
                 n -= 1;
                 continue;
             }

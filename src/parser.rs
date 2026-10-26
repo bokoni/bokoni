@@ -23,7 +23,7 @@
 //! | 11     | `f()` `x.y` `x[i]` `A::B` `do` | gauche        |
 
 use crate::ast::*;
-use crate::diagnostic::{Error, Result};
+use crate::diagnostic::{Error, Errors, Result};
 use crate::intern::{Interner, Symbol};
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::span::{Span, line_col};
@@ -39,7 +39,12 @@ const MAX_DEPTH: u32 = 1000;
 const RED_ZONE: usize = 128 * 1024;
 const STACK_GROW: usize = 2 * 1024 * 1024;
 
-pub fn parse(src: &str, interner: &mut Interner) -> Result<Program> {
+/// Nombre maximal d'erreurs signalées en une passe.
+const MAX_ERRORS: usize = 50;
+
+/// Analyse un programme. En cas d'erreur, l'analyse reprend à l'instruction suivante :
+/// toutes les erreurs du fichier sont renvoyées, triées par position.
+pub fn parse(src: &str, interner: &mut Interner) -> std::result::Result<Program, Errors> {
     let mut lexer = Lexer::new(src);
     let cur = lexer.next_token();
     let mut p = Parser {
@@ -57,19 +62,33 @@ pub fn parse(src: &str, interner: &mut Interner) -> Result<Program> {
         s_parts: Vec::new(),
         depth: 0,
         no_do: false,
+        errors: Vec::new(),
+        abort: false,
     };
-    let result = p.block(&[]).and_then(|body| {
-        p.expect(T::Eof, "")?;
-        Ok(body)
+    // En cas d'abandon (`Err`), l'erreur est déjà dans `p.errors`.
+    let body = p.block(&[]).ok();
+    let mut errors = std::mem::take(&mut p.errors);
+    // Une erreur du parseur qui suit, sur la même ligne, une erreur du lexer en est la
+    // conséquence (le caractère fautif a été sauté) : elle n'est pas affichée.
+    let lexer_errors = std::mem::take(&mut p.lexer.errors);
+    let line_of = |e: &Error| e.span.map(|s| line_col(src, s.start).0);
+    errors.retain(|e| {
+        !lexer_errors
+            .iter()
+            .any(|l| line_of(l) == line_of(e) && l.span.map(|s| s.start) < e.span.map(|s| s.start))
     });
-    // Une erreur du lexer est remontée en priorité : le parseur n'a vu qu'un `Eof` à sa place.
-    if let Some(e) = p.lexer.error.take() {
-        return Err(e);
+    errors.extend(lexer_errors);
+    // Après une erreur fatale du lexer (chaîne non fermée…), le parseur n'a vu qu'un `Eof` :
+    // ses erreurs situées plus loin n'ont pas de sens.
+    if let Some(fatal) = p.lexer.error.take() {
+        let at = fatal.span.map_or(0, |s| s.start);
+        errors.retain(|e| !e.incomplete && e.span.is_some_and(|s| s.start < at));
+        errors.push(fatal);
     }
-    Ok(Program {
-        body: result?,
-        ast: p.ast,
-    })
+    match body {
+        Some(body) if errors.is_empty() => Ok(Program { body, ast: p.ast }),
+        _ => Err(Errors::new(errors)),
+    }
 }
 
 struct Parser<'s, 'i> {
@@ -92,6 +111,129 @@ struct Parser<'s, 'i> {
     depth: u32,
     /// Dans l'en-tête d'un `while` / `for`, un `do` ne s'attache pas à l'expression.
     no_do: bool,
+    /// Erreurs signalées ; l'analyse continue après chacune.
+    errors: Vec<Error>,
+    /// Arrêt de l'analyse (fin de source prématurée, trop d'erreurs).
+    abort: bool,
+}
+
+/// État à restaurer quand une instruction échoue.
+struct Snapshot {
+    depth: u32,
+    no_do: bool,
+    lens: [usize; 5],
+}
+
+/// Suit les constructions ouvertes (`if`, `def`, `do`… jusqu'à leur `end`) dans une suite
+/// de jetons : sert à sauter proprement une instruction erronée.
+#[derive(Default)]
+struct Tracker {
+    stack: Vec<Frame>,
+    brackets: i32,
+    prev: Option<Token>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Frame {
+    /// Construction fermée par `end`.
+    Block,
+    /// Signature d'un `def` : devient `Block`, ou `Endless` (`def f = …`, sans `end`).
+    DefSig {
+        name_end: Option<u32>,
+        brackets: i32,
+    },
+    /// `def f = …` : se termine à la fin de ligne.
+    Endless { brackets: i32 },
+}
+
+impl Tracker {
+    fn depth(&self) -> usize {
+        self.stack.len()
+    }
+
+    /// `if` / `unless` / `while` ouvrent une construction, sauf en modificateur
+    /// (`x = 0 if c`), c'est-à-dire après un jeton qui termine une expression.
+    fn opens(&self, kind: TokenKind) -> bool {
+        match kind {
+            T::Def
+            | T::Type
+            | T::Class
+            | T::Enum
+            | T::Annotation
+            | T::Macro
+            | T::Case
+            | T::For
+            | T::Do => true,
+            T::If | T::Unless | T::While => !self.prev.is_some_and(|p| {
+                matches!(
+                    p.kind,
+                    T::Ident
+                        | T::IVar
+                        | T::Int
+                        | T::Float
+                        | T::Str
+                        | T::StrTail
+                        | T::RParen
+                        | T::RBracket
+                        | T::RBrace
+                        | T::True
+                        | T::False
+                        | T::Nil
+                        | T::SelfKw
+                        | T::End
+                        | T::Break
+                        | T::Next
+                        | T::Return
+                )
+            }),
+            _ => false,
+        }
+    }
+
+    fn feed(&mut self, t: Token) {
+        let top = self.stack.last().copied();
+        match t.kind {
+            T::LParen | T::LBracket | T::LBrace | T::AtLBracket | T::StrHead => self.brackets += 1,
+            T::RParen | T::RBracket | T::RBrace | T::StrTail => {
+                self.brackets = (self.brackets - 1).max(0)
+            }
+            T::End => {
+                self.stack.pop();
+            }
+            T::Newline | T::Semi => match top {
+                Some(Frame::DefSig { brackets, .. }) if brackets == self.brackets => {
+                    *self.stack.last_mut().unwrap() = Frame::Block;
+                }
+                Some(Frame::Endless { brackets }) if brackets == self.brackets => {
+                    self.stack.pop();
+                }
+                _ => {}
+            },
+            // `=` dans la signature d'un `def` : corps sur une ligne, pas de `end`
+            // (sauf le `=` collé au nom d'un setter, `def nom=(v)`).
+            T::Eq => {
+                if let Some(Frame::DefSig { name_end, brackets }) = top
+                    && brackets == self.brackets
+                    && name_end != Some(t.span.start)
+                {
+                    *self.stack.last_mut().unwrap() = Frame::Endless { brackets };
+                }
+            }
+            T::Def => self.stack.push(Frame::DefSig {
+                name_end: None,
+                brackets: self.brackets,
+            }),
+            k if self.opens(k) => self.stack.push(Frame::Block),
+            _ => {}
+        }
+        // Nom du `def` : le jeton qui suit `def`.
+        if self.prev.is_some_and(|p| p.kind == T::Def)
+            && let Some(Frame::DefSig { name_end, .. }) = self.stack.last_mut()
+        {
+            *name_end = Some(t.span.end);
+        }
+        self.prev = Some(t);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -249,7 +391,10 @@ impl Parser<'_, '_> {
     fn bump(&mut self) -> Token {
         let t = self.cur;
         if t.kind != T::Eof {
-            self.prev_end = t.span.end;
+            // Les fins de ligne ne comptent pas : `prev_end` reste sur le dernier jeton utile.
+            if !matches!(t.kind, T::Newline | T::Semi) {
+                self.prev_end = t.span.end;
+            }
             self.cur = match self.ahead.take() {
                 Some(next) => next,
                 None => self.lexer.next_token(),
@@ -304,7 +449,14 @@ impl Parser<'_, '_> {
     }
 
     fn error_here<R>(&self, msg: impl Into<String>) -> Result<R> {
-        let mut e = Error::syntax(msg, self.tok().span);
+        // En fin de source, l'erreur est placée juste après le dernier jeton lu
+        // (là où il manque quelque chose) plutôt que sur la dernière ligne, souvent vide.
+        let span = if self.at(T::Eof) {
+            Span::new(self.prev_end, self.prev_end)
+        } else {
+            self.tok().span
+        };
+        let mut e = Error::syntax(msg, span);
         e.incomplete = self.at(T::Eof);
         Err(e)
     }
@@ -322,12 +474,149 @@ impl Parser<'_, '_> {
         ))
     }
 
+    /// Le jeton courant est sur une autre ligne que le précédent alors qu'une expression
+    /// était attendue : la ligne précédente se termine par un opérateur (ou `,`, `(`…).
+    fn continuation_hint(&self) -> &'static str {
+        let gap = &self.src[(self.prev_end as usize).min(self.cur.span.start as usize)
+            ..self.cur.span.start as usize];
+        if self.prev_end > 0 && gap.contains('\n') {
+            " (la ligne précédente se termine par un opérateur : l'expression continue sur cette ligne)"
+        } else {
+            ""
+        }
+    }
+
     fn unclosed<R>(&self, opener: &str, opener_span: Span) -> Result<R> {
         let (line, _) = line_col(self.src, opener_span.start);
         self.error_here(format!(
             "`end` attendu pour fermer `{opener}` (ligne {line}), trouvé {}",
             self.found()
         ))
+    }
+
+    // ─── Reprise après erreur ────────────────────────────────────────────────
+
+    /// Range une erreur. Renvoie `Err` (et arrête l'analyse) si elle vient d'une fin de
+    /// source prématurée ou s'il y en a trop.
+    fn report(&mut self, e: Error) -> Result<()> {
+        if e.incomplete || self.errors.len() + 1 >= MAX_ERRORS {
+            self.abort = true;
+            self.errors.push(e.clone());
+            return Err(e);
+        }
+        self.errors.push(e);
+        Ok(())
+    }
+
+    /// Analyse un élément (instruction, membre…) avec `f`. En cas d'erreur, la signale et
+    /// saute jusqu'à la fin de l'élément : `Ok(None)`, l'analyse continue. `Err` seulement
+    /// si l'analyse doit s'arrêter (fin de source prématurée, trop d'erreurs).
+    fn recovering<V>(
+        &mut self,
+        terminators: &[TokenKind],
+        what: &str,
+        f: impl FnOnce(&mut Self) -> Result<V>,
+    ) -> Result<Option<V>> {
+        let snap = self.snapshot();
+        let start = self.tok().span.start;
+        match f(self) {
+            Ok(v) => {
+                let k = self.peek();
+                if !matches!(k, T::Newline | T::Semi | T::Eof) && !terminators.contains(&k) {
+                    let e = Error::syntax(
+                        format!(
+                            "fin de ligne attendue après {what}, trouvé {}",
+                            self.found()
+                        ),
+                        self.tok().span,
+                    );
+                    self.report(e)?;
+                    self.recover(start, terminators);
+                }
+                Ok(Some(v))
+            }
+            Err(e) => {
+                if self.abort {
+                    return Err(e);
+                }
+                self.restore(snap);
+                self.report(e)?;
+                self.recover(start, terminators);
+                Ok(None)
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            depth: self.depth,
+            no_do: self.no_do,
+            lens: [
+                self.s_exprs.len(),
+                self.s_args.len(),
+                self.s_fields.len(),
+                self.s_entries.len(),
+                self.s_parts.len(),
+            ],
+        }
+    }
+
+    fn restore(&mut self, s: Snapshot) {
+        self.depth = s.depth;
+        self.no_do = s.no_do;
+        self.s_exprs.truncate(s.lens[0]);
+        self.s_args.truncate(s.lens[1]);
+        self.s_fields.truncate(s.lens[2]);
+        self.s_entries.truncate(s.lens[3]);
+        self.s_parts.truncate(s.lens[4]);
+    }
+
+    /// Saute la fin d'une instruction erronée commencée à `stmt_start` : jusqu'à la fin
+    /// de ligne, ou jusqu'au `end` des constructions qu'elle a ouvertes, ou jusqu'à un
+    /// terminateur du bloc courant (`end`, `else`…).
+    fn recover(&mut self, stmt_start: u32, terminators: &[TokenKind]) {
+        // Constructions ouvertes dans la partie déjà lue : on la relit.
+        let mut tracker = Tracker::default();
+        let consumed =
+            &self.src[stmt_start as usize..(self.cur.span.start as usize).max(stmt_start as usize)];
+        let mut relex = Lexer::new(consumed);
+        loop {
+            let t = relex.next_token();
+            if t.kind == T::Eof {
+                break;
+            }
+            tracker.feed(t);
+        }
+        // Une parenthèse restée ouverte dans la partie cassée ne doit pas tout avaler.
+        tracker.brackets = 0;
+        for f in &mut tracker.stack {
+            match f {
+                Frame::DefSig { brackets, .. } | Frame::Endless { brackets } => *brackets = 0,
+                Frame::Block => {}
+            }
+        }
+        loop {
+            let t = self.tok();
+            if t.kind == T::Eof {
+                return;
+            }
+            if tracker.depth() == 0 && tracker.brackets == 0 {
+                if matches!(t.kind, T::Newline | T::Semi) {
+                    self.bump();
+                    return;
+                }
+                if terminators.contains(&t.kind) {
+                    return;
+                }
+            }
+            let before = tracker.depth();
+            tracker.feed(t);
+            self.bump();
+            // Une construction sur une ligne (`def f = …`) vient de se fermer.
+            if before > 0 && tracker.depth() == 0 && matches!(t.kind, T::Newline | T::Semi) {
+                return;
+            }
+        }
     }
 
     fn enter(&mut self) -> Result<()> {
@@ -368,13 +657,8 @@ impl Parser<'_, '_> {
             if k == T::Eof || terminators.contains(&k) {
                 break;
             }
-            stmts.push(self.stmt()?);
-            let k = self.peek();
-            if !matches!(k, T::Newline | T::Semi | T::Eof) && !terminators.contains(&k) {
-                return self.error_here(format!(
-                    "fin de ligne attendue après l'instruction, trouvé {}",
-                    self.found()
-                ));
+            if let Some(stmt) = self.recovering(terminators, "l'instruction", Self::stmt)? {
+                stmts.push(stmt);
             }
         }
         self.depth -= 1;
@@ -676,48 +960,8 @@ impl Parser<'_, '_> {
             if matches!(self.peek(), T::End | T::Eof) {
                 break;
             }
-            let annotations = self.annotations()?;
-            let start = self.tok().span;
-            let member = match (self.peek(), self.peek2()) {
-                (T::Def, _) => Member::Method(self.def(annotations)?),
-                (T::Ident, T::Colon | T::Eq) => {
-                    let (name, _) = self.ident("")?;
-                    let ty = if self.eat(T::Colon) {
-                        Some(self.type_expr(true)?)
-                    } else {
-                        None
-                    };
-                    let default = if self.eat(T::Eq) {
-                        Some(self.expr()?)
-                    } else {
-                        None
-                    };
-                    let span = self.span_from(start);
-                    let dup = members
-                        .iter()
-                        .any(|m| matches!(m, Member::Field(g) if g.name == name));
-                    if dup {
-                        return self.error_at(
-                            format!("champ `{}` déclaré deux fois", self.interner.resolve(name)),
-                            span,
-                        );
-                    }
-                    Member::Field(Field {
-                        name,
-                        ty,
-                        default,
-                        annotations,
-                        span,
-                    })
-                }
-                _ => Member::Stmt(self.stmt_with(annotations)?),
-            };
-            members.push(member);
-            if !matches!(self.peek(), T::Newline | T::Semi | T::End) {
-                return self.error_here(format!(
-                    "fin de ligne attendue après le membre, trouvé {}",
-                    self.found()
-                ));
+            if let Some(m) = self.recovering(&[T::End], "le membre", |p| p.type_member(&members))? {
+                members.push(m);
             }
         }
         self.end(opener, kw.span)?;
@@ -728,6 +972,46 @@ impl Parser<'_, '_> {
             members,
             annotations,
             span: self.span_from(kw.span),
+        })
+    }
+
+    /// Membre d'un `type` / `class` : champ, méthode ou autre instruction.
+    fn type_member(&mut self, members: &[Member]) -> Result<Member> {
+        let annotations = self.annotations()?;
+        let start = self.tok().span;
+        Ok(match (self.peek(), self.peek2()) {
+            (T::Def, _) => Member::Method(self.def(annotations)?),
+            (T::Ident, T::Colon | T::Eq) => {
+                let (name, _) = self.ident("")?;
+                let ty = if self.eat(T::Colon) {
+                    Some(self.type_expr(true)?)
+                } else {
+                    None
+                };
+                let default = if self.eat(T::Eq) {
+                    Some(self.expr()?)
+                } else {
+                    None
+                };
+                let span = self.span_from(start);
+                let dup = members
+                    .iter()
+                    .any(|m| matches!(m, Member::Field(g) if g.name == name));
+                if dup {
+                    return self.error_at(
+                        format!("champ `{}` déclaré deux fois", self.interner.resolve(name)),
+                        span,
+                    );
+                }
+                Member::Field(Field {
+                    name,
+                    ty,
+                    default,
+                    annotations,
+                    span,
+                })
+            }
+            _ => Member::Stmt(self.stmt_with(annotations)?),
         })
     }
 
@@ -746,37 +1030,10 @@ impl Parser<'_, '_> {
             if matches!(self.peek(), T::End | T::Eof) {
                 break;
             }
-            let annotations = self.annotations()?;
-            if self.at(T::Def) {
-                methods.push(self.def(annotations)?);
-            } else {
-                let (vname, start) = self.ident("(variante de l'enum)")?;
-                if variants.iter().any(|v| v.name == vname) {
-                    return self.error_at(
-                        format!(
-                            "variante `{}` déclarée deux fois",
-                            self.interner.resolve(vname)
-                        ),
-                        start,
-                    );
-                }
-                let value = if self.eat(T::Eq) {
-                    Some(self.expr()?)
-                } else {
-                    None
-                };
-                variants.push(Variant {
-                    name: vname,
-                    value,
-                    annotations,
-                    span: self.span_from(start),
-                });
-            }
-            if !matches!(self.peek(), T::Newline | T::Semi | T::End) {
-                return self.error_here(format!(
-                    "fin de ligne attendue après la variante, trouvé {}",
-                    self.found()
-                ));
+            match self.recovering(&[T::End], "la variante", |p| p.enum_member(&variants))? {
+                Some(Ok(v)) => variants.push(v),
+                Some(Err(m)) => methods.push(m),
+                None => {}
             }
         }
         self.end("enum", kw.span)?;
@@ -789,6 +1046,38 @@ impl Parser<'_, '_> {
             annotations,
             span: self.span_from(kw.span),
         })
+    }
+
+    /// Variante (`Ok`) ou méthode (`Err`) d'un `enum`.
+    fn enum_member(
+        &mut self,
+        variants: &[Variant],
+    ) -> Result<std::result::Result<Variant, FnDecl>> {
+        let annotations = self.annotations()?;
+        if self.at(T::Def) {
+            return Ok(Err(self.def(annotations)?));
+        }
+        let (vname, start) = self.ident("(variante de l'enum)")?;
+        if variants.iter().any(|v| v.name == vname) {
+            return self.error_at(
+                format!(
+                    "variante `{}` déclarée deux fois",
+                    self.interner.resolve(vname)
+                ),
+                start,
+            );
+        }
+        let value = if self.eat(T::Eq) {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        Ok(Ok(Variant {
+            name: vname,
+            value,
+            annotations,
+            span: self.span_from(start),
+        }))
     }
 
     // ─── Types ───────────────────────────────────────────────────────────────
@@ -1317,11 +1606,18 @@ impl Parser<'_, '_> {
                 );
             }
             T::Let => {
-                return self.error_here(
-                    "`let` est une instruction : il ne peut pas être dans une expression",
-                );
+                return self.error_here(format!(
+                    "`let` est une instruction : il ne peut pas être dans une expression{}",
+                    self.continuation_hint()
+                ));
             }
-            _ => return self.error_here(format!("expression attendue, trouvé {}", self.found())),
+            _ => {
+                return self.error_here(format!(
+                    "expression attendue, trouvé {}{}",
+                    self.found(),
+                    self.continuation_hint()
+                ));
+            }
         };
         let span = self.span_from(t.span);
         Ok(self.mk(kind, span))

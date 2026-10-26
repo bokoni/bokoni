@@ -278,16 +278,6 @@ fn keyword(s: &[u8]) -> Option<TokenKind> {
     })
 }
 
-#[inline]
-fn is_ident_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_' || b >= 0x80
-}
-
-#[inline]
-fn is_ident_continue(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
-}
-
 /// Découpe tout le source en jetons. Le dernier jeton est toujours `Eof`.
 ///
 /// Le parseur n'utilise pas cette fonction : il lit les jetons un par un avec
@@ -302,7 +292,12 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>> {
             break;
         }
     }
-    match lx.error.take() {
+    let mut errors = std::mem::take(&mut lx.errors);
+    errors.extend(lx.error.take());
+    match errors
+        .into_iter()
+        .min_by_key(|e| e.span.map_or(0, |s| s.start))
+    {
         Some(e) => Err(e),
         None => Ok(tokens),
     }
@@ -317,7 +312,9 @@ pub struct Lexer<'a> {
     /// Type du dernier jeton produit (règles des fins de ligne). `Newline` au départ :
     /// les lignes vides en tête de fichier sont ignorées.
     last: TokenKind,
-    /// Première erreur rencontrée ; le lexer ne produit ensuite plus que `Eof`.
+    /// Erreurs locales (caractère inconnu, `&&`…) : signalées, puis le lexer continue.
+    pub errors: Vec<Error>,
+    /// Erreur fatale (chaîne non fermée…) : le lexer ne produit ensuite plus que `Eof`.
     pub error: Option<Error>,
 }
 
@@ -328,6 +325,7 @@ impl<'a> Lexer<'a> {
             pos: 0,
             interp: Vec::new(),
             last: TokenKind::Newline,
+            errors: Vec::new(),
             error: None,
         };
         if src.len() > u32::MAX as usize {
@@ -373,19 +371,47 @@ impl Lexer<'_> {
         }
     }
 
-    fn err<T>(&self, msg: impl Into<String>, start: usize) -> Result<T> {
-        Err(Error::syntax(
+    /// Signale une erreur locale ; le lexer continue.
+    fn report(&mut self, msg: impl Into<String>, start: usize) {
+        self.errors.push(Error::syntax(
             msg,
             Span::new(start as u32, (self.pos.max(start + 1)) as u32),
-        ))
+        ));
+    }
+
+    /// Longueur en octets du caractère d'identifiant à `pos`, 0 si ce n'en est pas un.
+    /// Identifiants : lettres (Unicode comprises : `é`, `ß`, `π`), `_`, puis chiffres.
+    #[inline]
+    fn ident_char(&self, pos: usize, first: bool) -> usize {
+        match self.src.get(pos) {
+            Some(&b) if b < 0x80 => {
+                (b.is_ascii_alphabetic() || b == b'_' || (!first && b.is_ascii_digit())) as usize
+            }
+            Some(&b) => {
+                let len = match b {
+                    0xF0.. => 4,
+                    0xE0.. => 3,
+                    _ => 2,
+                };
+                let bytes = &self.src[pos..(pos + len).min(self.src.len())];
+                std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                    .filter(|c| c.is_alphabetic() || (!first && c.is_numeric()))
+                    .map_or(0, char::len_utf8)
+            }
+            None => 0,
+        }
     }
 
     #[inline]
     fn skip_ident(&mut self) {
-        while let Some(&c) = self.src.get(self.pos)
-            && is_ident_continue(c)
-        {
-            self.pos += 1;
+        loop {
+            let n = self.ident_char(self.pos, false);
+            if n == 0 {
+                return;
+            }
+            self.pos += n;
         }
     }
 
@@ -443,19 +469,22 @@ impl Lexer<'_> {
                         self.pos += 1;
                         return Ok(self.token(AtLBracket, start));
                     }
-                    if is_ident_start(self.peek_at(0)) {
+                    if self.ident_char(self.pos, true) > 0 {
                         self.skip_ident();
                         return Ok(self.token(IVar, start));
                     }
-                    return self.err("`@` doit être suivi d'un nom ou de `[`", start);
+                    self.report("`@` doit être suivi d'un nom ou de `[`", start);
                 }
-                _ if is_ident_start(b) => {
-                    self.pos += 1;
+                _ if self.ident_char(self.pos, true) > 0 => {
                     self.skip_ident();
                     let kind = keyword(&self.src[start..self.pos]).unwrap_or(Ident);
                     return Ok(self.token(kind, start));
                 }
-                _ => return self.punct(start, b),
+                _ => {
+                    if let Some(t) = self.punct(start, b) {
+                        return Ok(t);
+                    }
+                }
             }
         }
     }
@@ -471,7 +500,8 @@ impl Lexer<'_> {
             e.incomplete = true;
             return Err(e);
         }
-        let kind = if matches!(self.last, Newline | Eof) {
+        // Pas de fin de ligne finale après un opérateur : l'expression est incomplète.
+        let kind = if matches!(self.last, Newline | Eof) || self.last.continues_line() {
             Eof
         } else {
             Newline
@@ -551,21 +581,22 @@ impl Lexer<'_> {
                 digits(self);
             }
         }
-        if is_ident_start(self.peek_at(0)) {
-            self.pos += 1;
-            return self.err("nombre mal formé", start);
+        let kind = if float {
+            TokenKind::Float
+        } else {
+            TokenKind::Int
+        };
+        let number = self.token(kind, start);
+        if self.ident_char(self.pos, true) > 0 {
+            // `12abc` : signalé, puis lu comme le nombre `12`.
+            self.skip_ident();
+            self.report("nombre mal formé", start);
         }
-        Ok(self.token(
-            if float {
-                TokenKind::Float
-            } else {
-                TokenKind::Int
-            },
-            start,
-        ))
+        Ok(number)
     }
 
-    fn punct(&mut self, start: usize, b: u8) -> Result<Token> {
+    /// Ponctuation ; `None` pour un caractère inconnu (signalé et sauté).
+    fn punct(&mut self, start: usize, b: u8) -> Option<Token> {
         use TokenKind::*;
         let next = self.peek_at(1);
         let (kind, len) = match (b, next) {
@@ -601,13 +632,16 @@ impl Lexer<'_> {
             (b'/', _) => (Slash, 1),
             (b'%', b'=') => (PercentEq, 2),
             (b'%', _) => (Percent, 1),
+            // Signalés, puis lus comme leur équivalent pour continuer l'analyse.
             (b'!', _) => {
                 self.pos += 1;
-                return self.err("`!` n'existe pas : utiliser `not`", start);
+                self.report("`!` n'existe pas : utiliser `not`", start);
+                return Some(self.token(Not, start));
             }
             (b'&', b'&') => {
                 self.pos += 2;
-                return self.err("`&&` n'existe pas : utiliser `and`", start);
+                self.report("`&&` n'existe pas : utiliser `and`", start);
+                return Some(self.token(And, start));
             }
             _ => {
                 // Caractère complet (UTF-8) pour le message.
@@ -620,11 +654,12 @@ impl Lexer<'_> {
                 let end = (start + len).min(self.src.len());
                 let ch = String::from_utf8_lossy(&self.src[start..end]).into_owned();
                 self.pos = end;
-                return self.err(format!("caractère inattendu `{ch}`"), start);
+                self.report(format!("caractère inattendu `{ch}`"), start);
+                return None;
             }
         };
         self.pos += len;
-        Ok(self.token(kind, start))
+        Some(self.token(kind, start))
     }
 }
 
@@ -689,6 +724,17 @@ mod tests {
         assert_eq!(
             kinds("@[Tag] @name"),
             [AtLBracket, Ident, RBracket, IVar, Newline, Eof]
+        );
+    }
+
+    #[test]
+    fn unicode_identifiers() {
+        assert_eq!(kinds("déjà π"), [Ident, Ident, Newline, Eof]);
+        assert!(
+            tokenize("5 € 2")
+                .unwrap_err()
+                .message
+                .contains("caractère inattendu `€`")
         );
     }
 

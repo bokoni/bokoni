@@ -20,6 +20,6 @@ pub mod printer;
 pub mod span;
 pub mod value;
 
-pub use diagnostic::{Error, ErrorKind};
+pub use diagnostic::{Error, ErrorKind, Errors};
 pub use engine::{Engine, FromValue, IntoValue};
 pub use value::Value;

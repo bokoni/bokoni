@@ -20,7 +20,7 @@
 //! assert_eq!(v, 49);
 //! ```
 
-use crate::diagnostic::Error;
+use crate::diagnostic::{Error, Errors};
 use crate::intern::Interner;
 use crate::interp::{Runtime, Script};
 use crate::value::{Function, NativeFn, NativeImpl, Value};
@@ -103,32 +103,39 @@ impl Engine {
     }
 
     /// Exécute du code. Ses `let` et `def` restent visibles pour les appels suivants.
-    pub fn eval(&mut self, src: &str) -> Result<Value, Error> {
+    ///
+    /// Les erreurs de syntaxe sont toutes signalées en une fois (`Errors`) ; une erreur
+    /// d'exécution arrête le script et est seule.
+    pub fn eval(&mut self, src: &str) -> Result<Value, Errors> {
         self.eval_named(src, "<eval>")
     }
 
     /// Comme [`eval`](Self::eval), en nommant le script pour les messages d'erreur.
-    pub fn eval_named(&mut self, src: &str, name: &str) -> Result<Value, Error> {
-        let program = parser::parse(src, &mut self.rt.interner).map_err(|mut e| {
-            e.src = Some((name.into(), src.into()));
-            e
+    pub fn eval_named(&mut self, src: &str, name: &str) -> Result<Value, Errors> {
+        let src_rc: Rc<str> = src.into();
+        let name_rc: Rc<str> = name.into();
+        let program = parser::parse(src, &mut self.rt.interner).map_err(|mut errs| {
+            for e in &mut errs.0 {
+                e.src = Some((name_rc.clone(), src_rc.clone()));
+            }
+            errs
         })?;
         let script = Rc::new(Script {
             program,
-            src: src.into(),
-            name: name.into(),
+            src: src_rc,
+            name: name_rc,
         });
-        self.rt.run(&script)
+        Ok(self.rt.run(&script)?)
     }
 
     /// Exécute du code et convertit le résultat.
-    pub fn eval_as<T: FromValue>(&mut self, src: &str) -> Result<T, Error> {
+    pub fn eval_as<T: FromValue>(&mut self, src: &str) -> Result<T, Errors> {
         let v = self.eval(src)?;
-        T::from_value(&v).map_err(|msg| Error::new(crate::ErrorKind::Type, msg, None))
+        T::from_value(&v).map_err(|msg| Error::new(crate::ErrorKind::Type, msg, None).into())
     }
 
     /// Appelle une fonction du script (ou enregistrée) par son nom.
-    pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, Error> {
+    pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, Errors> {
         let f = self.get_global(name).ok_or_else(|| {
             Error::new(
                 crate::ErrorKind::Runtime,
@@ -138,23 +145,24 @@ impl Engine {
         })?;
         match self.rt.call_value(&f, args, Vec::new(), Default::default()) {
             Ok(v) | Err(crate::interp::Flow::Return(v)) => Ok(v),
-            Err(crate::interp::Flow::Error(e)) => Err(e),
+            Err(crate::interp::Flow::Error(e)) => Err(e.into()),
             Err(_) => Err(Error::new(
                 crate::ErrorKind::Runtime,
                 "`break` / `next` en dehors d'une boucle",
                 None,
-            )),
+            )
+            .into()),
         }
     }
 
     /// Appelle une fonction avec des arguments Rust (un tuple) et convertit le résultat.
-    pub fn call_as<T: FromValue>(&mut self, name: &str, args: impl IntoArgs) -> Result<T, Error> {
+    pub fn call_as<T: FromValue>(&mut self, name: &str, args: impl IntoArgs) -> Result<T, Errors> {
         let v = self.call(name, args.into_args())?;
-        T::from_value(&v).map_err(|msg| Error::new(crate::ErrorKind::Type, msg, None))
+        T::from_value(&v).map_err(|msg| Error::new(crate::ErrorKind::Type, msg, None).into())
     }
 
     /// AST du code, en S-expressions (pour déboguer le parseur).
-    pub fn ast(&mut self, src: &str) -> Result<String, Error> {
+    pub fn ast(&mut self, src: &str) -> Result<String, Errors> {
         let program = parser::parse(src, &mut self.rt.interner)?;
         Ok(printer::program(&program, &self.rt.interner))
     }

@@ -131,3 +131,64 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Une ou plusieurs erreurs, triées par position. L'analyse (parseur, vérificateur de
+/// types) continue après une erreur pour toutes les signaler en une passe.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Errors(pub Vec<Error>);
+
+impl Errors {
+    /// Trie par position et retire les doublons (même position, même message).
+    pub fn new(mut errors: Vec<Error>) -> Self {
+        errors.sort_by_key(|e| e.span.map_or(u32::MAX, |s| s.start));
+        errors.dedup_by(|b, a| a.span == b.span && a.message == b.message);
+        Errors(errors)
+    }
+
+    /// Vrai si la première erreur vient d'une fin de source prématurée (le REPL lit la suite).
+    pub fn is_incomplete(&self) -> bool {
+        self.0.first().is_some_and(|e| e.incomplete)
+    }
+
+    /// Toutes les erreurs, suivies d'un résumé s'il y en a plusieurs.
+    pub fn render(&self, src: &str, file: &str) -> String {
+        let mut out = String::new();
+        for (n, e) in self.0.iter().enumerate() {
+            if n > 0 {
+                out.push('\n');
+            }
+            out.push_str(&e.render(src, file));
+        }
+        if self.0.len() > 1 {
+            out.push_str(&format!("\n{} erreurs\n", self.0.len()));
+        }
+        out
+    }
+}
+
+impl std::ops::Deref for Errors {
+    type Target = [Error];
+    fn deref(&self) -> &[Error] {
+        &self.0
+    }
+}
+
+impl From<Error> for Errors {
+    fn from(e: Error) -> Self {
+        Errors(vec![e])
+    }
+}
+
+impl fmt::Display for Errors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (n, e) in self.0.iter().enumerate() {
+            if n > 0 {
+                f.write_str("\n")?;
+            }
+            f.write_str(&e.message)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for Errors {}
