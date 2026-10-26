@@ -9,6 +9,7 @@
 use crate::ast::*;
 use crate::diagnostic::Error;
 use crate::intern::{FxHashMap, Interner, Symbol};
+use crate::objects::{ConstructCtx, Syms, tail_expr};
 use crate::printer;
 use crate::span::Span;
 use crate::value::{Function, HashKey, HashMap, Range, Record, Value};
@@ -138,8 +139,47 @@ impl From<Error> for Flow {
 
 type R<T = Value> = Result<T, Flow>;
 
-/// Arguments d'un appel : positionnels, puis nommés.
-type Args = (Vec<Value>, Vec<(Symbol, Value)>);
+/// Arguments évalués d'un appel.
+pub struct CallArgs {
+    pub pos: Vec<Value>,
+    pub named: Vec<(Symbol, Value)>,
+    /// Expressions qui ont produit les arguments, pour convertir un record littéral vers
+    /// le type attendu par le paramètre. Absent pour un appel depuis Rust ou une méthode
+    /// intégrée (`map`…).
+    pub lits: Option<Lits>,
+}
+
+pub struct Lits {
+    pub sc: Rc<Script>,
+    pub pos: Vec<Option<ExprId>>,
+    pub named: Vec<ExprId>,
+}
+
+impl CallArgs {
+    pub fn plain(pos: Vec<Value>) -> Self {
+        CallArgs {
+            pos,
+            named: Vec::new(),
+            lits: None,
+        }
+    }
+}
+
+/// Ce qu'il faut pour exécuter une fonction, une méthode ou un lambda.
+pub(crate) struct Callee<'a> {
+    pub name: &'a str,
+    pub script: &'a Rc<Script>,
+    pub params: &'a [Param],
+    pub body: &'a Block,
+    pub ret: Option<&'a TypeExpr>,
+    /// Portée de définition : parente de la portée de l'appel, et où se résolvent les
+    /// noms de types des annotations.
+    pub env: &'a Env,
+    /// Lambda : argument manquant = nil, arguments en trop ignorés.
+    pub lenient: bool,
+    /// `self` pour une méthode.
+    pub this: Option<Value>,
+}
 
 const RED_ZONE: usize = 128 * 1024;
 const STACK_GROW: usize = 2 * 1024 * 1024;
@@ -201,10 +241,14 @@ pub struct Runtime {
     pub output: Box<dyn FnMut(&str)>,
     /// Profondeur d'appels maximale (protège la pile contre la récursion infinie).
     pub max_depth: usize,
-    depth: usize,
+    pub(crate) depth: usize,
     methods: FxHashMap<Symbol, Method>,
     /// Chaînes littérales déjà converties en `Rc<str>`.
     strings: FxHashMap<Symbol, Rc<str>>,
+    /// Constructions de `type` en cours (blocs `Server do … end` imbriqués).
+    pub(crate) constructs: Vec<ConstructCtx>,
+    pub(crate) next_ctx: u32,
+    pub(crate) syms: Syms,
 }
 
 impl Default for Runtime {
@@ -220,6 +264,7 @@ impl Runtime {
             .iter()
             .map(|&(name, m)| (interner.intern(name), m))
             .collect();
+        let syms = Syms::new(&mut interner);
         let globals = Env::root();
         for (name, b) in Builtin::ALL {
             let sym = interner.intern(name);
@@ -233,6 +278,9 @@ impl Runtime {
             depth: 0,
             methods,
             strings: FxHashMap::default(),
+            constructs: Vec::new(),
+            next_ctx: 0,
+            syms,
         }
     }
 
@@ -250,7 +298,7 @@ impl Runtime {
         r.map_err(|e| attach_src(e, sc))
     }
 
-    fn name(&self, s: Symbol) -> &str {
+    pub(crate) fn name(&self, s: Symbol) -> &str {
         self.interner.resolve(s)
     }
 
@@ -266,11 +314,14 @@ impl Runtime {
     // ─── Blocs ───────────────────────────────────────────────────────────────
 
     /// Exécute un bloc ; sa valeur est celle de la dernière instruction (`nil` si vide).
-    fn exec_block(&mut self, sc: &Rc<Script>, b: &Block, env: &Env, new_scope: bool) -> R {
-        let declares = b
-            .stmts
-            .iter()
-            .any(|s| matches!(s.kind, StmtKind::Let(_) | StmtKind::Def(_)));
+    pub(crate) fn exec_block(
+        &mut self,
+        sc: &Rc<Script>,
+        b: &Block,
+        env: &Env,
+        new_scope: bool,
+    ) -> R {
+        let declares = b.stmts.iter().any(|s| !matches!(s.kind, StmtKind::Expr(_)));
         let local;
         let env = if new_scope && declares {
             local = env.child();
@@ -278,8 +329,15 @@ impl Runtime {
         } else {
             env
         };
-        // Les `def` d'un bloc sont visibles dans tout le bloc (appel avant définition,
-        // récursion mutuelle).
+        // Les `type`, `enum` et `def` d'un bloc sont visibles dans tout le bloc (utilisation
+        // avant la définition, récursion mutuelle).
+        for s in &b.stmts {
+            match &s.kind {
+                StmtKind::Type(t) => self.declare_type(sc, t, env)?,
+                StmtKind::Enum(e) => self.declare_enum(sc, e, env)?,
+                _ => {}
+            }
+        }
         for s in &b.stmts {
             if let StmtKind::Def(f) = &s.kind {
                 let closure = Closure {
@@ -308,23 +366,14 @@ impl Runtime {
             StmtKind::Let(l) => {
                 let mut v = self.eval(sc, l.value, env)?;
                 if let Some(ty) = &l.ty {
-                    v = self.check_type(v, ty, sc.program.ast.span(l.value))?;
+                    let span = sc.program.ast.span(l.value);
+                    v = self.coerce(v, ty, env, Some((sc, l.value)), span)?;
                 }
                 self.bind_pattern(&l.pattern, v, env)?;
                 Ok(Value::Nil)
             }
-            StmtKind::Def(_) => Ok(Value::Nil),
-            StmtKind::Type(t) => rt_err(
-                format!(
-                    "`{}` : les déclarations `type` / `class` / `annotation` arrivent en v0.2",
-                    self.name(t.name)
-                ),
-                t.name_span,
-            ),
-            StmtKind::Enum(e) => rt_err(
-                format!("`{}` : les `enum` arrivent en v0.2", self.name(e.name)),
-                e.name_span,
-            ),
+            // Déjà déclarés en tête de bloc.
+            StmtKind::Def(_) | StmtKind::Type(_) | StmtKind::Enum(_) => Ok(Value::Nil),
         }
     }
 
@@ -401,7 +450,7 @@ impl Runtime {
 
     /// Évalue une expression. Comme dans le parseur, la récursion passe sur une pile
     /// allouée sur le tas quand la pile du thread est presque pleine.
-    fn eval(&mut self, sc: &Rc<Script>, e: ExprId, env: &Env) -> R {
+    pub(crate) fn eval(&mut self, sc: &Rc<Script>, e: ExprId, env: &Env) -> R {
         stacker::maybe_grow(RED_ZONE, STACK_GROW, || self.eval_inner(sc, e, env))
     }
 
@@ -421,22 +470,20 @@ impl Runtime {
                         StrPart::Lit(s) => out.push_str(self.name(s)),
                         StrPart::Expr(e) => {
                             let v = self.eval(sc, e, env)?;
-                            out.push_str(&v.to_display(&self.interner));
+                            out.push_str(&self.display(&v, ast.span(e))?);
                         }
                     }
                 }
                 Ok(Value::Str(out.into()))
             }
             ExprKind::Ident(name) => match env.get(name) {
+                Some(Value::FieldRef(id, i)) => self.field_ref_get(id, i, span),
                 Some(v) => Ok(v),
                 None => rt_err(format!("`{}` n'est pas défini", self.name(name)), span),
             },
-            ExprKind::IVar(name) => rt_err(
-                format!("`@{}` : les classes arrivent en v0.2", self.name(name)),
-                span,
-            ),
-            ExprKind::SelfRef => rt_err("`self` : les classes arrivent en v0.2", span),
-            ExprKind::Path(_) => rt_err("`A::B` : les enums et types arrivent en v0.2", span),
+            ExprKind::IVar(name) => self.ivar_get(env, name, span),
+            ExprKind::SelfRef => self.this(env, span),
+            ExprKind::Path(p) => self.path_value(ast.get(p), env, span),
 
             ExprKind::List(items) => {
                 let mut out = Vec::with_capacity(items.len as usize);
@@ -532,8 +579,13 @@ impl Runtime {
                 block,
             } => {
                 let f = self.eval(sc, callee, env)?;
-                let (pos, named) = self.eval_args(sc, args, block, env)?;
-                self.call_value(&f, pos, named, span)
+                // Construction : le bloc `do` remplit les champs (il n'est pas un argument).
+                if let Value::Type(info) = &f {
+                    let args = self.eval_args(sc, args, None, env)?;
+                    return self.construct(info, args, block.map(|b| (sc, b, env)), span);
+                }
+                let args = self.eval_args(sc, args, block, env)?;
+                self.call_value(&f, args, span)
             }
             ExprKind::MethodCall {
                 recv,
@@ -542,15 +594,31 @@ impl Runtime {
                 block,
             } => {
                 let r = self.eval(sc, recv, env)?;
-                // Un champ de record qui contient une fonction s'appelle comme une méthode.
-                if let Value::Record(rec) = &r {
-                    let field = rec.borrow().get(name).cloned();
-                    if let Some(f) = field {
-                        let (pos, named) = self.eval_args(sc, args, block, env)?;
-                        return self.call_value(&f, pos, named, span);
+                // Un champ (record, `type`) qui contient une fonction s'appelle comme une méthode.
+                let field_fn = match &r {
+                    Value::Record(rec) => rec.borrow().get(name).cloned(),
+                    Value::Object(o) => {
+                        let o = o.borrow();
+                        match (o.info.kind, o.info.field_index(name)) {
+                            (TypeDeclKind::Class, _) | (_, None) => None,
+                            (_, Some(i)) => Some(o.fields[i].clone()),
+                        }
                     }
+                    _ => None,
+                };
+                if let Some(f) = field_fn {
+                    let args = self.eval_args(sc, args, block, env)?;
+                    return self.call_value(&f, args, span);
                 }
-                let (pos, named) = self.eval_args(sc, args, block, env)?;
+                if let Some((m, msc, menv)) = self.user_method(&r, name) {
+                    let args = self.eval_args(sc, args, block, env)?;
+                    return self.call_method(r, &m, &msc, &menv, args, span);
+                }
+                let args = self.eval_args(sc, args, block, env)?;
+                if let Value::Enum(e) = &r {
+                    return self.enum_method(e, name, &args.pos, span);
+                }
+                let CallArgs { pos, named, .. } = args;
                 if let Some(&(n, _)) = named.first() {
                     return rt_err(
                         format!(
@@ -738,6 +806,18 @@ impl Runtime {
         let tspan = ast.span(target);
         match ast.kind(target) {
             ExprKind::Ident(name) => {
+                // Champ d'un bloc de construction.
+                if let Some(Value::FieldRef(id, i)) = env.get(name) {
+                    let mut v = self.eval(sc, value, env)?;
+                    let mut lit = Some((sc, value));
+                    if let Some(op) = op {
+                        let old = self.field_ref_get(id, i, tspan)?;
+                        v = self.binary(op, old, v, tspan)?;
+                        lit = None;
+                    }
+                    self.field_ref_set(id, i, v.clone(), lit, tspan)?;
+                    return Ok(v);
+                }
                 let mut v = self.eval(sc, value, env)?;
                 if let Some(op) = op {
                     let Some(old) = env.get(name) else {
@@ -753,6 +833,14 @@ impl Runtime {
                         if op.is_none() && n.starts_with(|c: char| c.is_ascii_uppercase()) {
                             env.declare(name, v.clone(), false);
                             Ok(v)
+                        } else if let Some(t) = self.construct_name() {
+                            rt_err(
+                                format!(
+                                    "`{n}` n'est ni un champ de `{t}` ni une variable déclarée \
+                                     (utiliser `let {n} = …` pour une variable locale)"
+                                ),
+                                tspan,
+                            )
                         } else {
                             rt_err(
                                 format!("`{n}` n'est pas déclaré : utiliser `let {n} = …`"),
@@ -771,17 +859,17 @@ impl Runtime {
             }
             ExprKind::Field(recv, name) => {
                 let r = self.eval(sc, recv, env)?;
-                let Value::Record(rec) = &r else {
-                    return type_err(
-                        format!("impossible d'assigner un champ sur {}", r.type_name()),
-                        tspan,
-                    );
-                };
                 let mut v = self.eval(sc, value, env)?;
+                let mut lit = Some((sc, value));
                 if let Some(op) = op {
                     let old = self.field(&r, name, tspan)?;
                     v = self.binary(op, old, v, tspan)?;
+                    lit = None;
                 }
+                let Value::Record(rec) = &r else {
+                    self.object_set_field(&r, name, v.clone(), lit, tspan)?;
+                    return Ok(v);
+                };
                 match rec.borrow_mut().get_mut(name) {
                     Some(slot) => *slot = v.clone(),
                     None => {
@@ -820,10 +908,17 @@ impl Runtime {
                 }
                 Ok(v)
             }
-            ExprKind::IVar(name) => rt_err(
-                format!("`@{}` : les classes arrivent en v0.2", self.name(name)),
-                tspan,
-            ),
+            ExprKind::IVar(name) => {
+                let mut v = self.eval(sc, value, env)?;
+                let mut lit = Some((sc, value));
+                if let Some(op) = op {
+                    let old = self.ivar_get(env, name, tspan)?;
+                    v = self.binary(op, old, v, tspan)?;
+                    lit = None;
+                }
+                self.ivar_set(env, name, v.clone(), lit, tspan)?;
+                Ok(v)
+            }
             _ => rt_err("on ne peut pas assigner à cette expression", tspan),
         }
     }
@@ -841,7 +936,7 @@ impl Runtime {
         }
     }
 
-    fn field(&self, r: &Value, name: Symbol, span: Span) -> R {
+    fn field(&mut self, r: &Value, name: Symbol, span: Span) -> R {
         match r {
             Value::Record(rec) => match rec.borrow().get(name) {
                 Some(v) => Ok(v.clone()),
@@ -850,6 +945,7 @@ impl Runtime {
                     span,
                 ),
             },
+            Value::Object(_) | Value::Variant(..) => self.object_field(r, name, span),
             _ if self.methods.contains_key(&name) => rt_err(
                 format!(
                     "`{n}` est une méthode : écrire `.{n}()`",
@@ -999,7 +1095,7 @@ impl Runtime {
 
     // ─── Appels ──────────────────────────────────────────────────────────────
 
-    fn make_lambda(&self, sc: &Rc<Script>, id: LambdaId, env: &Env) -> Value {
+    pub(crate) fn make_lambda(&self, sc: &Rc<Script>, id: LambdaId, env: &Env) -> Value {
         Value::Function(Rc::new(Function::Script(Closure {
             name: "lambda".into(),
             script: sc.clone(),
@@ -1015,36 +1111,49 @@ impl Runtime {
         args: Slice<Arg>,
         block: Option<LambdaId>,
         env: &Env,
-    ) -> R<Args> {
-        let mut pos = Vec::with_capacity(args.len as usize + block.is_some() as usize);
+    ) -> R<CallArgs> {
+        let n = args.len as usize + block.is_some() as usize;
+        let mut pos = Vec::with_capacity(n);
         let mut named = Vec::new();
+        let mut lits = Lits {
+            sc: sc.clone(),
+            pos: Vec::with_capacity(n),
+            named: Vec::new(),
+        };
         for a in sc.program.ast.get(args) {
             let v = self.eval(sc, a.value, env)?;
             match a.name {
-                Some(n) => named.push((n, v)),
-                None => pos.push(v),
+                Some(name) => {
+                    named.push((name, v));
+                    lits.named.push(a.value);
+                }
+                None => {
+                    pos.push(v);
+                    lits.pos.push(Some(a.value));
+                }
             }
         }
         if let Some(b) = block {
             pos.push(self.make_lambda(sc, b, env));
+            lits.pos.push(None);
         }
-        Ok((pos, named))
+        Ok(CallArgs {
+            pos,
+            named,
+            lits: Some(lits),
+        })
     }
 
-    /// Appelle une valeur avec des arguments.
-    pub fn call_value(
-        &mut self,
-        f: &Value,
-        args: Vec<Value>,
-        named: Vec<(Symbol, Value)>,
-        span: Span,
-    ) -> R {
-        let Value::Function(func) = f else {
-            return type_err(format!("{} n'est pas une fonction", f.type_name()), span);
+    /// Appelle une valeur : fonction, lambda, fonction Rust, ou type (construction).
+    pub fn call_value(&mut self, f: &Value, args: CallArgs, span: Span) -> R {
+        let func = match f {
+            Value::Function(func) => func,
+            Value::Type(info) => return self.construct(info, args, None, span),
+            _ => return type_err(format!("{} n'est pas une fonction", f.type_label()), span),
         };
         match &**func {
             Function::Native(n) => {
-                if let Some(&(name, _)) = named.first() {
+                if let Some(&(name, _)) = args.named.first() {
                     return rt_err(
                         format!(
                             "`{}` (fonction Rust) n'accepte pas d'argument nommé (`{}`)",
@@ -1054,67 +1163,80 @@ impl Runtime {
                         span,
                     );
                 }
-                (n.f)(&args).map_err(|msg| Flow::Error(Error::runtime(msg, span)))
+                (n.f)(&args.pos).map_err(|msg| Flow::Error(Error::runtime(msg, span)))
             }
-            Function::Builtin(b) => self.builtin(*b, args, span),
+            Function::Builtin(b) => self.builtin(*b, args.pos, span),
             Function::Script(c) => {
-                if self.depth >= self.max_depth {
-                    return rt_err(
-                        format!(
-                            "trop d'appels imbriqués ({}) : récursion infinie ?",
-                            self.max_depth
+                let sc = &c.script;
+                let (params, body, ret, lenient): (&[Param], &Block, Option<&TypeExpr>, bool) =
+                    match &c.body {
+                        Body::Def(f) => (
+                            f.params.as_deref().unwrap_or(&[]),
+                            &f.body,
+                            f.ret.as_ref(),
+                            false,
                         ),
-                        span,
-                    );
-                }
-                self.depth += 1;
-                let r = self.call_closure(c, args, named, span);
-                self.depth -= 1;
-                r.map_err(|f| match f {
-                    Flow::Error(mut e) => {
-                        e = attach_src(e, &c.script);
-                        if e.trace.len() < 16 {
-                            e.trace.push((c.name.to_string(), span));
+                        // Les lambdas sont tolérants (comme les blocs Ruby) : argument manquant
+                        // = nil, arguments en trop ignorés. Pratique pour `each do |k, v|`.
+                        Body::Lambda(id) => {
+                            let l = sc.program.ast.lambda(*id);
+                            (&l.params, &l.body, None, true)
                         }
-                        Flow::Error(e)
-                    }
-                    f => f,
-                })
+                    };
+                let callee = Callee {
+                    name: &c.name,
+                    script: sc,
+                    params,
+                    body,
+                    ret,
+                    env: &c.env,
+                    lenient,
+                    this: None,
+                };
+                self.invoke(callee, args, span)
             }
         }
     }
 
-    fn call_closure(
-        &mut self,
-        c: &Closure,
-        args: Vec<Value>,
-        named: Vec<(Symbol, Value)>,
-        call_span: Span,
-    ) -> R {
-        let sc = &c.script;
-        let (params, body, ret, lenient): (&[Param], &Block, Option<&TypeExpr>, bool) =
-            match &c.body {
-                Body::Def(f) => (
-                    f.params.as_deref().unwrap_or(&[]),
-                    &f.body,
-                    f.ret.as_ref(),
-                    false,
+    /// Exécute une fonction, une méthode ou un lambda.
+    pub(crate) fn invoke(&mut self, c: Callee, args: CallArgs, span: Span) -> R {
+        if self.depth >= self.max_depth {
+            return rt_err(
+                format!(
+                    "trop d'appels imbriqués ({}) : récursion infinie ?",
+                    self.max_depth
                 ),
-                // Les lambdas sont tolérants (comme les blocs Ruby) : argument manquant = nil,
-                // arguments en trop ignorés. Pratique pour `each do |k, v|`.
-                Body::Lambda(id) => {
-                    let l = sc.program.ast.lambda(*id);
-                    (&l.params, &l.body, None, true)
+                span,
+            );
+        }
+        self.depth += 1;
+        let name = c.name.to_string();
+        let script = c.script.clone();
+        let r = self.invoke_inner(c, args, span);
+        self.depth -= 1;
+        r.map_err(|f| match f {
+            Flow::Error(mut e) => {
+                e = attach_src(e, &script);
+                if e.trace.len() < 16 {
+                    e.trace.push((name, span));
                 }
-            };
-        if !lenient && args.len() > params.len() {
+                Flow::Error(e)
+            }
+            f => f,
+        })
+    }
+
+    fn invoke_inner(&mut self, c: Callee, args: CallArgs, call_span: Span) -> R {
+        let CallArgs { pos, named, lits } = args;
+        let params = c.params;
+        if !c.lenient && pos.len() > params.len() {
             return rt_err(
                 format!(
                     "`{}` attend {} argument{}, reçu {}",
                     c.name,
                     params.len(),
                     if params.len() > 1 { "s" } else { "" },
-                    args.len()
+                    pos.len()
                 ),
                 call_span,
             );
@@ -1128,27 +1250,33 @@ impl Runtime {
             }
         }
         let env = c.env.child();
-        let mut args = args.into_iter();
+        if let Some(this) = &c.this {
+            env.declare(self.syms.self_, this.clone(), false);
+        }
+        let mut pos = pos.into_iter().enumerate();
         for p in params {
-            if p.is_field {
-                return rt_err("les paramètres `@champ` (classes) arrivent en v0.2", p.span);
-            }
-            let given = args.next();
-            let named_v = named
-                .iter()
-                .find(|(n, _)| *n == p.name)
-                .map(|(_, v)| v.clone());
-            if given.is_some() && named_v.is_some() {
+            let given = pos.next();
+            let named_i = named.iter().position(|(n, _)| *n == p.name);
+            if given.is_some() && named_i.is_some() {
                 return rt_err(
                     format!("argument `{}` donné deux fois", self.name(p.name)),
                     call_span,
                 );
             }
-            let v = match given.or(named_v) {
-                Some(v) => v,
-                None => match p.default {
-                    Some(d) => self.eval(sc, d, &env)?,
-                    None if lenient => Value::Nil,
+            // Valeur, et l'expression qui l'a produite (conversion des records littéraux).
+            let (v, lit) = match (given, named_i) {
+                (Some((i, v)), _) => (
+                    v,
+                    lits.as_ref()
+                        .and_then(|l| Some((&l.sc, l.pos.get(i).copied().flatten()?))),
+                ),
+                (None, Some(j)) => (
+                    named[j].1.clone(),
+                    lits.as_ref().and_then(|l| Some((&l.sc, *l.named.get(j)?))),
+                ),
+                (None, None) => match p.default {
+                    Some(d) => (self.eval(c.script, d, &env)?, Some((c.script, d))),
+                    None if c.lenient => (Value::Nil, None),
                     None => {
                         return rt_err(
                             format!(
@@ -1162,19 +1290,32 @@ impl Runtime {
                 },
             };
             let v = match &p.ty {
-                Some(ty) => self.check_type(v, ty, p.span)?,
+                Some(ty) => self.coerce(v, ty, c.env, lit, p.span)?,
                 None => v,
             };
+            if p.is_field {
+                // `init(@nom)` : déclare et assigne le champ.
+                if c.this.is_none() {
+                    return rt_err(
+                        "un paramètre `@champ` ne s'utilise que dans une méthode",
+                        p.span,
+                    );
+                }
+                self.ivar_set(&env, p.name, v.clone(), None, p.span)?;
+            }
             env.declare(p.name, v, true);
         }
-        let result = match self.exec_block(sc, body, &env, false) {
+        let result = match self.exec_block(c.script, c.body, &env, false) {
             Ok(v) | Err(Flow::Return(v)) => v,
             Err(Flow::Break(s)) => return rt_err("`break` en dehors d'une boucle", s),
             Err(Flow::Next(s)) => return rt_err("`next` en dehors d'une boucle", s),
             Err(e) => return Err(e),
         };
-        match ret {
-            Some(ty) => self.check_type(result, ty, ty.span),
+        match c.ret {
+            Some(ty) => {
+                let lit = tail_expr(c.body).map(|e| (c.script, e));
+                self.coerce(result, ty, c.env, lit, ty.span)
+            }
             None => Ok(result),
         }
     }
@@ -1187,7 +1328,7 @@ impl Runtime {
                     if n > 0 {
                         line.push(' ');
                     }
-                    line.push_str(&a.to_display(&self.interner));
+                    line.push_str(&self.display(a, span)?);
                 }
                 line.push('\n');
                 (self.output)(&line);
@@ -1195,7 +1336,7 @@ impl Runtime {
             }
             Builtin::TypeOf => {
                 arity("typeof", &args, 1, span)?;
-                Ok(Value::str(args[0].type_name()))
+                Ok(Value::Str(args[0].type_label().into()))
             }
             Builtin::Assert => {
                 if args.is_empty() || args.len() > 2 {
@@ -1220,7 +1361,7 @@ impl Runtime {
     // ─── Méthodes intégrées ──────────────────────────────────────────────────
 
     fn call1(&mut self, f: &Value, a: Value, span: Span) -> R {
-        self.call_value(f, vec![a], Vec::new(), span)
+        self.call_value(f, CallArgs::plain(vec![a]), span)
     }
 
     fn method(&mut self, recv: Value, name: Symbol, args: Vec<Value>, span: Span) -> R {
@@ -1246,7 +1387,7 @@ impl Runtime {
                 n(0)?;
                 Ok(Value::Str(recv.inspect(&self.interner).into()))
             }
-            (M::Call, Value::Function(_)) => self.call_value(&recv, args, Vec::new(), span),
+            (M::Call, Value::Function(_)) => self.call_value(&recv, CallArgs::plain(args), span),
 
             // ── Nombres
             (M::Abs, Value::Int(i)) => {
@@ -1518,7 +1659,7 @@ impl Runtime {
                 let f = args[1].clone();
                 let mut acc = args[0].clone();
                 for v in iter_values(&recv) {
-                    acc = self.call_value(&f, vec![acc, v], Vec::new(), span)?;
+                    acc = self.call_value(&f, CallArgs::plain(vec![acc, v]), span)?;
                 }
                 Ok(acc)
             }
@@ -1587,7 +1728,7 @@ impl Runtime {
                     .map(|(k, v)| (k.to_value(), v.clone()))
                     .collect();
                 for (k, v) in entries {
-                    self.call_value(&f, vec![k, v], Vec::new(), span)?;
+                    self.call_value(&f, CallArgs::plain(vec![k, v]), span)?;
                 }
                 Ok(recv.clone())
             }
@@ -1608,21 +1749,22 @@ impl Runtime {
     // ─── Types ───────────────────────────────────────────────────────────────
 
     /// Vérifie `v` contre une annotation. Renvoie la valeur, éventuellement convertie
-    /// (`int` → `float` quand un `float` est attendu).
-    fn check_type(&self, v: Value, ty: &TypeExpr, span: Span) -> R {
+    /// (`int` → `float` quand un `float` est attendu). Les noms de types utilisateur se
+    /// résolvent dans `tenv`.
+    pub(crate) fn check_type(&self, v: Value, ty: &TypeExpr, tenv: &Env, span: Span) -> R {
         if let (TypeKind::Named(path), Value::Int(i)) = (&ty.kind, &v)
             && path.len() == 1
             && self.name(path[0]) == "float"
         {
             return Ok(Value::Float(*i as f64));
         }
-        match self.matches_type(&v, ty) {
+        match self.matches_type(&v, ty, tenv) {
             Ok(true) => Ok(v),
             Ok(false) => type_err(
                 format!(
                     "type attendu `{}`, reçu {} ({})",
                     printer::type_expr(ty, &self.interner),
-                    v.type_name(),
+                    v.type_label(),
                     short(&v.inspect(&self.interner))
                 ),
                 span,
@@ -1631,7 +1773,12 @@ impl Runtime {
         }
     }
 
-    fn matches_type(&self, v: &Value, ty: &TypeExpr) -> Result<bool, String> {
+    pub(crate) fn matches_type(
+        &self,
+        v: &Value,
+        ty: &TypeExpr,
+        tenv: &Env,
+    ) -> Result<bool, String> {
         Ok(match &ty.kind {
             TypeKind::Named(path) => {
                 let name = path
@@ -1647,17 +1794,21 @@ impl Runtime {
                     | ("bool", Value::Bool(_))
                     | ("nil", Value::Nil) => true,
                     ("int" | "float" | "str" | "bool" | "nil", _) => false,
-                    _ => {
-                        return Err(format!(
-                            "type `{name}` inconnu (les types utilisateur arrivent en v0.2)"
-                        ));
-                    }
+                    _ => match (path.as_slice(), tenv.get(path[0])) {
+                        ([_], Some(Value::Type(info))) => {
+                            matches!(v, Value::Object(o) if Rc::ptr_eq(&o.borrow().info, &info))
+                        }
+                        ([_], Some(Value::Enum(e))) => {
+                            matches!(v, Value::Variant(x, _) if Rc::ptr_eq(x, &e))
+                        }
+                        _ => return Err(format!("type `{name}` inconnu")),
+                    },
                 }
             }
             TypeKind::List(inner) => match v {
                 Value::List(l) => {
                     for item in l.borrow().iter() {
-                        if !self.matches_type(item, inner)? {
+                        if !self.matches_type(item, inner, tenv)? {
                             return Ok(false);
                         }
                     }
@@ -1668,7 +1819,9 @@ impl Runtime {
             TypeKind::Hash(kt, vt) => match v {
                 Value::Hash(h) => {
                     for (k, val) in h.borrow().iter() {
-                        if !self.matches_type(&k.to_value(), kt)? || !self.matches_type(val, vt)? {
+                        if !self.matches_type(&k.to_value(), kt, tenv)?
+                            || !self.matches_type(val, vt, tenv)?
+                        {
                             return Ok(false);
                         }
                     }
@@ -1684,7 +1837,7 @@ impl Runtime {
                     }
                     for (name, fty) in fields {
                         match r.get(*name) {
-                            Some(fv) if self.matches_type(fv, fty)? => {}
+                            Some(fv) if self.matches_type(fv, fty, tenv)? => {}
                             _ => return Ok(false),
                         }
                     }
@@ -1698,7 +1851,7 @@ impl Runtime {
                         return Ok(false);
                     }
                     for (val, ity) in t.iter().zip(items) {
-                        if !self.matches_type(val, ity)? {
+                        if !self.matches_type(val, ity, tenv)? {
                             return Ok(false);
                         }
                     }
@@ -1706,10 +1859,12 @@ impl Runtime {
                 }
                 _ => false,
             },
-            TypeKind::Optional(inner) => matches!(v, Value::Nil) || self.matches_type(v, inner)?,
+            TypeKind::Optional(inner) => {
+                matches!(v, Value::Nil) || self.matches_type(v, inner, tenv)?
+            }
             TypeKind::Union(items) => {
                 for it in items {
-                    if self.matches_type(v, it)? {
+                    if self.matches_type(v, it, tenv)? {
                         return Ok(true);
                     }
                 }

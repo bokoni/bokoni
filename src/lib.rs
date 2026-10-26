@@ -15,6 +15,7 @@ pub mod engine;
 pub mod intern;
 pub mod interp;
 pub mod lexer;
+pub mod objects;
 pub mod parser;
 pub mod printer;
 pub mod span;

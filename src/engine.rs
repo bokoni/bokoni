@@ -143,7 +143,10 @@ impl Engine {
                 None,
             )
         })?;
-        match self.rt.call_value(&f, args, Vec::new(), Default::default()) {
+        match self
+            .rt
+            .call_value(&f, crate::interp::CallArgs::plain(args), Default::default())
+        {
             Ok(v) | Err(crate::interp::Flow::Return(v)) => Ok(v),
             Err(crate::interp::Flow::Error(e)) => Err(e.into()),
             Err(_) => Err(Error::new(

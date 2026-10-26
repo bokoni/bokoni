@@ -5,6 +5,7 @@
 //! `let b = a` ne copie pas la liste, les deux noms désignent la même.
 
 use crate::intern::{FxHashMap, Interner, Symbol};
+use crate::objects::{EnumInfo, Object, TypeInfo};
 use std::cell::RefCell;
 use std::fmt::{self, Write};
 use std::rc::Rc;
@@ -22,6 +23,19 @@ pub enum Value {
     Tuple(Rc<[Value]>),
     Range(Rc<Range>),
     Function(Rc<Function>),
+    /// Instance d'un `type` ou d'une `class`.
+    Object(Rc<RefCell<Object>>),
+    /// Variante d'un `enum` (`Protocol::Tcp`) : l'enum et l'index de la variante.
+    Variant(Rc<EnumInfo>, u32),
+    /// Un `type` / une `class` eux-mêmes (appelables : construction).
+    Type(Rc<TypeInfo>),
+    /// Un `enum` lui-même (`Protocol.values()`).
+    Enum(Rc<EnumInfo>),
+    /// Interne : champ d'une construction en cours (bloc `Server do … end`).
+    /// N'est jamais visible du script : sa lecture donne la valeur du champ.
+    FieldRef(u32, u32),
+    /// Interne : champ d'objet pas encore initialisé (avant la fin de `init`).
+    Uninit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,6 +221,23 @@ impl Value {
             Value::Tuple(_) => "tuple",
             Value::Range(_) => "range",
             Value::Function(_) => "fonction",
+            Value::Object(o) => match o.borrow().info.kind {
+                crate::ast::TypeDeclKind::Class => "objet",
+                _ => "valeur de type",
+            },
+            Value::Variant(..) => "variante d'enum",
+            Value::Type(_) => "type",
+            Value::Enum(_) => "enum",
+            Value::FieldRef(..) | Value::Uninit => "valeur non initialisée",
+        }
+    }
+
+    /// Nom du type pour les messages : le nom du type utilisateur quand il y en a un.
+    pub fn type_label(&self) -> String {
+        match self {
+            Value::Object(o) => o.borrow().info.name.to_string(),
+            Value::Variant(e, _) => e.name.to_string(),
+            v => v.type_name().to_string(),
         }
     }
 
@@ -253,6 +284,18 @@ impl Value {
             }
             (Range(a), Range(b)) => a == b,
             (Function(a), Function(b)) => Rc::ptr_eq(a, b),
+            // `class` : identité ; `type` : mêmes champs (données).
+            (Object(a), Object(b)) => {
+                Rc::ptr_eq(a, b) || {
+                    let (a, b) = (a.borrow(), b.borrow());
+                    Rc::ptr_eq(&a.info, &b.info)
+                        && a.info.kind != crate::ast::TypeDeclKind::Class
+                        && a.fields.iter().zip(&b.fields).all(|(x, y)| x.equals(y))
+                }
+            }
+            (Variant(a, i), Variant(b, j)) => Rc::ptr_eq(a, b) && i == j,
+            (Type(a), Type(b)) => Rc::ptr_eq(a, b),
+            (Enum(a), Enum(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -355,6 +398,43 @@ impl Value {
             Value::Function(f) => {
                 let _ = write!(out, "<fonction {}>", f.name());
             }
+            Value::Object(o) => {
+                let o = o.borrow();
+                out.push_str(&o.info.name);
+                out.push('(');
+                for (n, (f, v)) in o.info.fields.iter().zip(&o.fields).enumerate() {
+                    if n > 0 {
+                        out.push_str(", ");
+                    }
+                    match i {
+                        Some(i) => out.push_str(i.resolve(f.name)),
+                        None => {
+                            let _ = write!(out, "#{}", f.name.0);
+                        }
+                    }
+                    out.push_str(": ");
+                    v.write_inspect(out, i, d);
+                }
+                out.push(')');
+            }
+            Value::Variant(e, idx) => {
+                let name = e.variants[*idx as usize].0;
+                match i {
+                    Some(i) => {
+                        let _ = write!(out, "{}::{}", e.name, i.resolve(name));
+                    }
+                    None => {
+                        let _ = write!(out, "{}::#{}", e.name, name.0);
+                    }
+                }
+            }
+            Value::Type(t) => {
+                let _ = write!(out, "<type {}>", t.name);
+            }
+            Value::Enum(e) => {
+                let _ = write!(out, "<enum {}>", e.name);
+            }
+            Value::FieldRef(..) | Value::Uninit => out.push_str("<non initialisé>"),
         }
     }
 }

@@ -271,13 +271,205 @@ fn type_annotations() {
             .contains("type attendu `str`")
     );
     assert!(err("let s: Server = 1").1.contains("type `Server` inconnu"));
+    assert!(
+        err("let s: Serveur = 1")
+            .1
+            .contains("type `Serveur` inconnu")
+    );
+}
+
+const ROUTE: &str = "type Route\n  path: str\n  methods: [str] = [\"GET\"]\nend\n";
+
+#[test]
+fn types_and_construction() {
+    let r = |src: &str| run(&format!("{ROUTE}{src}"));
+    assert_eq!(
+        r("Route(path: \"/\")"),
+        "=> Route(path: \"/\", methods: [\"GET\"])"
+    );
+    assert_eq!(r("Route(\"/a\", [\"PUT\"]).methods"), "=> [\"PUT\"]");
+    assert_eq!(
+        r("let x = Route do\n  path = \"/b\"\nend\nx.path"),
+        "=> \"/b\""
+    );
+    // Champs publics modifiables, avec vérification du type.
+    assert_eq!(
+        r("let x = Route(path: \"/\")\nx.path = \"/z\"\nx.path"),
+        "=> \"/z\""
+    );
+    assert!(
+        err(&format!("{ROUTE}let x = Route(path: \"/\")\nx.path = 1"))
+            .1
+            .contains("type attendu `str`")
+    );
+    // Égalité par valeur pour un `type`.
+    assert_eq!(r("Route(path: \"/\") == Route(path: \"/\")"), "=> true");
+    assert_eq!(r("typeof(Route(path: \"/\"))"), "=> \"Route\"");
+    assert!(
+        err(&format!("{ROUTE}Route()"))
+            .1
+            .contains("champ `path` obligatoire")
+    );
+    assert!(
+        err(&format!("{ROUTE}Route(path: \"/\", verb: 1)"))
+            .1
+            .contains("pas de champ `verb`")
+    );
+    assert!(
+        err(&format!("{ROUTE}Route(path: 1)"))
+            .1
+            .contains("type attendu `str`")
+    );
 }
 
 #[test]
-fn not_yet_supported_is_explicit() {
-    assert!(err("type S\n  x: int\nend").1.contains("v0.2"));
-    assert!(err("enum E\n  A\nend").1.contains("v0.2"));
-    assert!(err("@x").1.contains("v0.2"));
+fn construction_blocks() {
+    let server = "type Server\n  protocol = \"tcp\"\n  port: int = if protocol == \"tcp\" then 80 else 40 end\n  routes: [str] = []\nend\n";
+    let r = |src: &str| run(&format!("{server}{src}"));
+    // Défaut calculé après le bloc, en fonction des champs fixés par le bloc.
+    assert_eq!(r("Server do\n  protocol = \"udp\"\nend.port"), "=> 40");
+    assert_eq!(r("Server().port"), "=> 80");
+    // Un champ lu dans le bloc reçoit d'abord sa valeur par défaut.
+    assert_eq!(
+        r("let s = Server do\n  routes << \"/a\"\n  routes << \"/b\"\nend\ns.routes"),
+        "=> [\"/a\", \"/b\"]"
+    );
+    // Variables locales, variables extérieures, boucles.
+    assert_eq!(
+        r("let base = 8000\nServer do\n  let off = 80\n  port = base + off\nend.port"),
+        "=> 8080"
+    );
+    assert!(
+        err(&format!("{server}Server do\n  prot = 1\nend"))
+            .1
+            .contains("ni un champ de `Server`")
+    );
+    assert!(
+        err(&format!("{server}Server do\n  port = \"x\"\nend"))
+            .1
+            .contains("type attendu `int`")
+    );
+    assert!(
+        err("type A\n  x: int = y\n  y: int = x\nend\nA()")
+            .1
+            .contains("circulaire")
+    );
+}
+
+#[test]
+fn record_literals_convert_to_types() {
+    let r = |src: &str| run(&format!("{ROUTE}{src}"));
+    assert_eq!(
+        r("def reg(r: Route) = typeof(r)\nreg({path: \"/\"})"),
+        "=> \"Route\""
+    );
+    assert_eq!(r("let x: Route = {path: \"/\"}\nx.methods"), "=> [\"GET\"]");
+    assert_eq!(
+        r("let xs: [Route] = [{path: \"/a\"}, {path: \"/b\"}]\nxs[1].path"),
+        "=> \"/b\""
+    );
+    assert_eq!(
+        r("let x: Route? = {path: \"/\"}\ntypeof(x)"),
+        "=> \"Route\""
+    );
+    assert_eq!(
+        r("def mk(): Route = {path: \"/r\"}\nmk().path"),
+        "=> \"/r\""
+    );
+    // Seuls les littéraux sont convertis.
+    assert!(
+        err(&format!(
+            "{ROUTE}def reg(r: Route) = r\nlet x = {{path: \"/\"}}\nreg(x)"
+        ))
+        .1
+        .contains("type attendu `Route`, reçu record")
+    );
+    assert!(
+        err(&format!(
+            "{ROUTE}def reg(r: Route) = r\nreg({{path: \"/\", verb: 1}})"
+        ))
+        .1
+        .contains("pas de champ `verb`")
+    );
+}
+
+#[test]
+fn classes() {
+    let user = "class User\n  count = 0\n  def init(@name: str, @email: str? = nil)\n  end\n  def name: str = @name\n  def name=(v: str)\n    @name = v.capitalize()\n  end\n  def greet(other) = \"#{@name} salue #{other.name}\"\n  def bump()\n    @count += 1\n    self\n  end\n  def to_s: str = \"User(#{@name})\"\nend\n";
+    let r = |src: &str| run(&format!("{user}{src}"));
+    assert_eq!(
+        r("let u = User(\"ana\")\nu.name = \"bob\"\nu.name"),
+        "=> \"Bob\""
+    );
+    assert_eq!(r("User(\"a\").greet(User(\"b\"))"), "=> \"a salue b\"");
+    assert_eq!(r("print(User(\"zoé\"))"), "User(zoé)");
+    assert_eq!(r("\"#{User(\"x\")}\""), "=> \"User(x)\"");
+    assert_eq!(r("User(\"a\").bump().bump().to_s()"), "=> \"User(a)\"");
+    // Identité, pas égalité de valeur.
+    assert_eq!(
+        r("let a = User(\"a\")\n[a == a, a == User(\"a\")]"),
+        "=> [true, false]"
+    );
+    assert!(
+        err(&format!("{user}User(\"a\").email"))
+            .1
+            .contains("champ privé")
+    );
+    assert!(
+        err(&format!("{user}let u = User(\"a\")\nu.email = \"x\""))
+            .1
+            .contains("champ privé")
+    );
+    assert!(
+        err(&format!("{user}User(1)"))
+            .1
+            .contains("type attendu `str`")
+    );
+    assert!(
+        err("class C\n  x: int\nend\nC()")
+            .1
+            .contains("`@x` de `C` n'est pas initialisé")
+    );
+    assert!(err("@x").1.contains("que dans une méthode"));
+}
+
+#[test]
+fn enums() {
+    let e = "enum Protocol: str\n  Tcp = \"TCP\"\n  Udp = \"UDP\"\n  def secure = self == Protocol::Tcp\nend\nenum Color\n  Red\n  Green\nend\n";
+    let r = |src: &str| run(&format!("{e}{src}"));
+    assert_eq!(r("Protocol::Tcp.value"), "=> \"TCP\"");
+    assert_eq!(
+        r("[Color::Green.value, Color::Green.name]"),
+        "=> [1, \"Green\"]"
+    );
+    assert_eq!(r("Protocol::Udp"), "=> Protocol::Udp");
+    assert_eq!(
+        r("[Protocol::Tcp.secure, Protocol::Udp.secure]"),
+        "=> [true, false]"
+    );
+    assert_eq!(r("Protocol.from(\"UDP\") == Protocol::Udp"), "=> true");
+    assert_eq!(r("Protocol.from(\"x\")"), "");
+    assert_eq!(r("Color.values().len()"), "=> 2");
+    assert_eq!(
+        r("case Protocol::Udp\n  when Protocol::Tcp then 1\n  when Protocol::Udp then 2\nend"),
+        "=> 2"
+    );
+    assert_eq!(r("let p: Protocol = Protocol::Tcp\np.name"), "=> \"Tcp\"");
+    assert!(
+        err(&format!("{e}Protocol::Ftp"))
+            .1
+            .contains("pas de variante `Ftp`")
+    );
+    assert!(
+        err(&format!("{e}let p: Protocol = \"TCP\""))
+            .1
+            .contains("type attendu `Protocol`")
+    );
+    assert!(
+        err("enum E: int\n  A = \"a\"\nend")
+            .1
+            .contains("doit être de type `int`")
+    );
 }
 
 #[test]
