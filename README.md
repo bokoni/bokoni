@@ -53,6 +53,7 @@ cargo run                         # REPL
 cargo run -- script.bk            # exécute un fichier
 cargo run -- -e '1 + 2'           # => 3
 cargo run -- --ast -e '1 + 2 * 3' # (+ 1 (* 2 3))
+cargo run -- --ir script.bk       # IR exécutée (registres typés, blocs de base)
 ```
 
 ## Documentation
@@ -65,4 +66,5 @@ cargo run -- --ast -e '1 + 2 * 3' # (+ 1 (* 2 3))
 ```sh
 cargo test                                       # tests (dont tous les exemples de syntax.md)
 cargo run --release --example bench_parser       # parseur vs peg
+cargo run --release --example bench_interp       # vitesse d'exécution
 ```

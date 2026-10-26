@@ -14,8 +14,9 @@
 
 use crate::ast::*;
 use crate::diagnostic::Error;
+use crate::globals::Globals;
 use crate::intern::{FxHashMap, Interner, Symbol};
-use crate::interp::{Body, Env};
+use crate::ir::RegTy;
 use crate::objects::{EnumInfo, TypeInfo};
 use crate::span::Span;
 use crate::value::{Function, Value};
@@ -23,8 +24,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 /// Vérifie un programme. `globals` : variables déjà définies (fonctions Rust enregistrées,
-/// scripts exécutés avant), considérées de type inconnu.
-pub fn check(program: &Program, interner: &Interner, globals: &Env) -> Vec<Error> {
+/// scripts exécutés avant).
+///
+/// Renvoie les erreurs, et le type déduit des variables `int` / `float` / `bool` (par
+/// position de leur déclaration) : le compilateur en fait des registres typés.
+pub fn check(program: &Program, interner: &Interner, globals: &Globals) -> (Vec<Error>, Prims) {
     let mut c = Checker {
         ast: &program.ast,
         i: interner,
@@ -36,9 +40,22 @@ pub fn check(program: &Program, interner: &Interner, globals: &Env) -> Vec<Error
         fns: vec![FnCtx::default()],
         quiet: 0,
         imported: FxHashMap::default(),
+        prims: Prims::default(),
     };
     c.block_stmts(&program.body);
-    c.errors
+    (c.errors, c.prims)
+}
+
+/// Type déduit des variables, par position de leur déclaration.
+pub type Prims = FxHashMap<u32, RegTy>;
+
+fn prim(t: &Ty) -> Option<RegTy> {
+    match t {
+        Ty::Int | Ty::LitInt(_) => Some(RegTy::Int),
+        Ty::Float => Some(RegTy::Float),
+        Ty::Bool => Some(RegTy::Bool),
+        _ => None,
+    }
 }
 
 // ─── Types statiques ────────────────────────────────────────────────────────
@@ -234,7 +251,7 @@ struct FnCtx {
 struct Checker<'a> {
     ast: &'a Ast,
     i: &'a Interner,
-    globals: &'a Env,
+    globals: &'a Globals,
     errors: Vec<Error>,
     scopes: Vec<Scope>,
     types: Vec<TypeDef>,
@@ -244,6 +261,7 @@ struct Checker<'a> {
     quiet: u32,
     /// Types et enums déjà définis à l'exécution, importés (clé : adresse du `Rc`).
     imported: FxHashMap<usize, Ty>,
+    prims: Prims,
 }
 
 /// Bloc de construction d'un type inconnu : assignations libres, sans erreur en cascade.
@@ -463,8 +481,8 @@ impl Checker<'_> {
             Value::Type(info) => Ty::TypeValue(self.import_type(info)),
             Value::Enum(e) => Ty::EnumValue(self.import_enum(e)),
             Value::Function(f) => match &**f {
-                Function::Script(c) => match &c.body {
-                    Body::Def(d) => {
+                Function::Script(c) => match &c.proto.decl {
+                    Some(d) => {
                         self.quiet += 1;
                         let sig = self.signature(
                             d.params.as_deref().unwrap_or(&[]),
@@ -474,7 +492,7 @@ impl Checker<'_> {
                         self.quiet -= 1;
                         Ty::Fn(sig)
                     }
-                    Body::Lambda(_) => Ty::Any,
+                    None => Ty::Any,
                 },
                 _ => Ty::Any,
             },
@@ -503,19 +521,14 @@ impl Checker<'_> {
             .iter()
             .map(|f| FieldDef {
                 name: f.name,
-                ty: f.ty.as_ref().map_or(Ty::Any, |t| self.resolve(t)),
+                ty: f.ty.as_ref().map_or(Ty::Any, |t| self.resolve(&t.expr)),
                 has_default: f.default.is_some(),
             })
             .collect();
         let methods = info
             .methods
             .iter()
-            .map(|(n, m)| {
-                (
-                    *n,
-                    self.signature(m.params.as_deref().unwrap_or(&[]), m.ret.as_ref(), false),
-                )
-            })
+            .map(|(n, m)| (*n, self.proto_signature(m)))
             .collect();
         self.quiet -= 1;
         self.types[id].fields = fields;
@@ -540,16 +553,23 @@ impl Checker<'_> {
         let methods = e
             .methods
             .iter()
-            .map(|(n, m)| {
-                (
-                    *n,
-                    self.signature(m.params.as_deref().unwrap_or(&[]), m.ret.as_ref(), false),
-                )
-            })
+            .map(|(n, m)| (*n, self.proto_signature(m)))
             .collect();
         self.quiet -= 1;
         self.enums[id].methods = methods;
         id
+    }
+
+    /// Signature d'une méthode déjà compilée (à partir de sa déclaration source).
+    fn proto_signature(&mut self, p: &crate::ir::Proto) -> Rc<FnSig> {
+        match &p.decl {
+            Some(d) => self.signature(d.params.as_deref().unwrap_or(&[]), d.ret.as_ref(), false),
+            None => Rc::new(FnSig {
+                params: Vec::new(),
+                ret: RefCell::new(Ty::Any),
+                lenient: true,
+            }),
+        }
     }
 
     // ─── Types des annotations ───────────────────────────────────────────────
@@ -866,6 +886,15 @@ impl Checker<'_> {
                 self.function(f, &sig, None);
                 Ty::Nil
             }
+            StmtKind::Type(_) | StmtKind::Enum(_)
+                if self.scopes.len() > 1 || self.fns.len() > 1 =>
+            {
+                self.error(
+                    "les déclarations `type`, `class`, `annotation` et `enum` se font au niveau principal du script",
+                    s.span,
+                );
+                Ty::Nil
+            }
             StmtKind::Type(t) => {
                 self.type_decl(t);
                 Ty::Nil
@@ -879,7 +908,12 @@ impl Checker<'_> {
 
     fn bind_pattern(&mut self, p: &Pattern, ty: Ty) {
         match p {
-            Pattern::Name(n, _) => self.declare(*n, ty, VarKind::Let),
+            Pattern::Name(n, span) => {
+                if let Some(p) = prim(&ty) {
+                    self.prims.insert(span.start, p);
+                }
+                self.declare(*n, ty, VarKind::Let)
+            }
             Pattern::Tuple(items, span) => {
                 let elems: Vec<Ty> = match &ty {
                     Ty::Tuple(ts) if ts.len() == items.len() => ts.clone(),
@@ -1347,7 +1381,10 @@ impl Checker<'_> {
                 let it = self.expr(x.iter, None);
                 let vars = self.for_vars(&it, x.vars.len(), ast.span(x.iter));
                 self.push_scope();
-                for ((n, _), t) in x.vars.iter().zip(vars) {
+                for ((n, vspan), t) in x.vars.iter().zip(vars) {
+                    if let Some(p) = prim(&t) {
+                        self.prims.insert(vspan.start, p);
+                    }
                     self.declare(*n, t, VarKind::Let);
                 }
                 self.fns.last_mut().unwrap().loops += 1;

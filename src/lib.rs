@@ -11,16 +11,20 @@
 
 pub mod ast;
 pub mod check;
+pub mod compile;
 pub mod diagnostic;
 pub mod engine;
+pub mod globals;
 pub mod intern;
-pub mod interp;
+pub mod ir;
 pub mod lexer;
 pub mod objects;
+pub mod ops;
 pub mod parser;
 pub mod printer;
 pub mod span;
 pub mod value;
+pub mod vm;
 
 pub use diagnostic::{Error, ErrorKind, Errors};
 pub use engine::{Engine, FromValue, IntoValue};

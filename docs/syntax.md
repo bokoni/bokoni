@@ -305,6 +305,10 @@ end
 
 ## Type (données)
 
+Les déclarations `type`, `class`, `annotation` et `enum` se font au niveau principal du
+script (pas dans une fonction ou un bloc). Elles sont visibles dans tout le script, même
+avant leur déclaration.
+
 Un `type` décrit une structure de données : des champs, avec types et valeurs par défaut.
 Un champ par défaut peut dépendre des champs précédents.
 

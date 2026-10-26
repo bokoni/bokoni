@@ -48,8 +48,30 @@ source ─► lexer ─► parseur ─► AST ─► vérificateur de types ─�
 
 ### v0.3 — IR typée
 
-- [ ] Traduction AST vérifié → IR (fonctions, blocs de base, instructions typées)
-- [ ] L'interpréteur exécute l'IR (plus rapide, même format que le JIT)
+- [x] IR à registres en blocs de base (`src/ir.rs`), registres typés `int` / `float` /
+      `bool` / `valeur` ; affichage lisible : `bokoni --ir fichier.bk`
+- [x] Compilation AST → IR (`src/compile.rs`) : analyse des captures (variables
+      capturées dans des cellules, les autres en registres), globales dans des cases
+      résolues à la compilation
+- [x] Registres typés d'après les annotations et les types déduits par le vérificateur ;
+      une valeur dynamique n'y entre que par une garde (typage graduel sûr)
+- [x] Optimisations : écriture directe dans la variable, opérandes immédiats (`i + 1`),
+      comparaison et branchement fusionnés, sauts court-circuités, blocs fusionnés
+- [x] L'interpréteur exécute l'IR (`src/vm.rs`) ; l'interpréteur sur l'AST est retiré
+- [x] `type`, `class`, `enum` : déclarations au niveau principal du script
+
+| Programme (`cargo run --release --example bench_interp`) | AST (v0.2) | IR (v0.3) |
+|-----------------------------------------------------------|-----------:|----------:|
+| `fib(25)` récursif                                         | 57 ms      | 28 ms     |
+| boucle `while`, 1 M tours                                  | 115 ms     | 29 ms     |
+| `for` sur un intervalle, 1 M tours                         | 56 ms      | 20 ms     |
+| listes : `map` / `filter` / `sum` (100 k)                  | 19 ms      | 17 ms     |
+| closures et compteur (300 k appels)                        | 36 ms      | 27 ms     |
+| objets : construction et champs (100 k)                    | 30 ms      | 17 ms     |
+| chaînes : interpolation (100 k)                            | 16 ms      | 12 ms     |
+
+Les programmes dominés par les fonctions intégrées (listes) ou par les appels gagnent peu :
+c'est le travail du JIT (appels directs, valeurs non boxées).
 
 ### v0.4 — JIT Cranelift
 
@@ -95,5 +117,7 @@ optimisations (lexer à la demande, interning des noms courts) n'ont apporté qu
 
 - Cycles de références : une fonction locale qui se capture elle-même n'est jamais libérée
   (les fonctions globales le sont, à la destruction de l'`Engine`).
-- L'interpréteur parcourt l'AST et copie les listes avant un `for` : correct, pas rapide.
-  La vitesse d'exécution est l'objet de la v0.3 (IR) et de la v0.4 (JIT).
+- Une boucle `for` copie la liste parcourue avant de commencer (sûr, mais coûteux pour
+  une très grande liste).
+- Un registre typé n'est utilisé que pour une variable locale ; les globales (niveau
+  principal) restent dynamiques.

@@ -10,11 +10,13 @@ usage :
   bokoni fichier.bk         exécute un fichier
   bokoni -e \"code\"          exécute du code et affiche le résultat
   bokoni --ast fichier.bk   affiche l'arbre syntaxique (S-expressions)
-  bokoni --ast -e \"code\"";
+  bokoni --ir fichier.bk    affiche l'IR (ce qu'exécute l'interpréteur)
+  (--ast et --ir acceptent aussi -e \"code\")";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut ast = false;
+    let mut ir = false;
     let mut code: Option<(String, String)> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -24,6 +26,7 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--ast" => ast = true,
+            "--ir" => ir = true,
             "-e" => match it.next() {
                 Some(src) => code = Some((src.clone(), "<-e>".into())),
                 None => return usage_error("`-e` attend du code"),
@@ -42,7 +45,17 @@ fn main() -> ExitCode {
 
     let mut engine = Engine::new();
     match code {
-        None if ast => usage_error("`--ast` attend un fichier ou `-e`"),
+        None if ast || ir => usage_error("`--ast` / `--ir` attendent un fichier ou `-e`"),
+        Some((src, name)) if ir => match engine.ir(&src) {
+            Ok(s) => {
+                print!("{s}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprint!("{}", e.render(&src, &name));
+                ExitCode::FAILURE
+            }
+        },
         None => repl(&mut engine),
         Some((src, name)) if ast => match engine.ast(&src) {
             Ok(s) => {

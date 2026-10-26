@@ -22,8 +22,9 @@
 
 use crate::diagnostic::{Error, Errors};
 use crate::intern::Interner;
-use crate::interp::{Runtime, Script};
+use crate::ir::{Proto, Script};
 use crate::value::{Function, NativeFn, NativeImpl, Value};
+use crate::vm::{CallArgs, Runtime};
 use crate::{parser, printer};
 use std::fmt::Display;
 use std::rc::Rc;
@@ -97,13 +98,13 @@ impl Engine {
 
     fn define(&mut self, name: &str, v: Value) {
         let sym = self.rt.interner.intern(name);
-        self.rt.globals.declare(sym, v, false);
+        self.rt.globals.define(sym, v, false);
     }
 
     /// Définit (ou remplace) une variable globale modifiable par le script.
     pub fn set_global(&mut self, name: &str, v: impl IntoValue) {
         let sym = self.rt.interner.intern(name);
-        self.rt.globals.declare(sym, v.into_value(), true);
+        self.rt.globals.define(sym, v.into_value(), true);
     }
 
     /// Lit une variable globale.
@@ -122,30 +123,47 @@ impl Engine {
 
     /// Comme [`eval`](Self::eval), en nommant le script pour les messages d'erreur.
     pub fn eval_named(&mut self, src: &str, name: &str) -> Result<Value, Errors> {
-        let src_rc: Rc<str> = src.into();
-        let name_rc: Rc<str> = name.into();
-        let program = parser::parse(src, &mut self.rt.interner).map_err(|mut errs| {
+        let main = self.compile(src, name)?;
+        Ok(self.rt.run(&main)?)
+    }
+
+    /// Analyse, vérifie et compile un script en IR.
+    fn compile(&mut self, src: &str, name: &str) -> Result<Rc<Proto>, Errors> {
+        let script = Rc::new(Script {
+            src: src.into(),
+            name: name.into(),
+        });
+        let with_src = |mut errs: Errors| {
             for e in &mut errs.0 {
-                e.src = Some((name_rc.clone(), src_rc.clone()));
+                e.src = Some((script.name.clone(), script.src.clone()));
             }
             errs
-        })?;
-        if self.static_checks {
-            let errors = crate::check::check(&program, &self.rt.interner, &self.rt.globals);
+        };
+        let program = parser::parse(src, &mut self.rt.interner).map_err(with_src)?;
+        let prims = if self.static_checks {
+            let (errors, prims) =
+                crate::check::check(&program, &self.rt.interner, &self.rt.globals);
             if !errors.is_empty() {
-                let mut errors = Errors::new(errors);
-                for e in &mut errors.0 {
-                    e.src = Some((name_rc.clone(), src_rc.clone()));
-                }
-                return Err(errors);
+                return Err(with_src(Errors::new(errors)));
             }
-        }
-        let script = Rc::new(Script {
-            program,
-            src: src_rc,
-            name: name_rc,
-        });
-        Ok(self.rt.run(&script)?)
+            Some(prims)
+        } else {
+            None
+        };
+        crate::compile::compile(
+            &program,
+            &script,
+            &mut self.rt.interner,
+            &mut self.rt.globals,
+            prims.as_ref(),
+        )
+        .map_err(with_src)
+    }
+
+    /// IR du code (représentation exécutée par l'interpréteur), en texte lisible.
+    pub fn ir(&mut self, src: &str) -> Result<String, Errors> {
+        let main = self.compile(src, "<ir>")?;
+        Ok(main.dump(&self.rt.interner))
     }
 
     /// Exécute du code et convertit le résultat.
@@ -163,19 +181,9 @@ impl Engine {
                 None,
             )
         })?;
-        match self
+        Ok(self
             .rt
-            .call_value(&f, crate::interp::CallArgs::plain(args), Default::default())
-        {
-            Ok(v) | Err(crate::interp::Flow::Return(v)) => Ok(v),
-            Err(crate::interp::Flow::Error(e)) => Err(e.into()),
-            Err(_) => Err(Error::new(
-                crate::ErrorKind::Runtime,
-                "`break` / `next` en dehors d'une boucle",
-                None,
-            )
-            .into()),
-        }
+            .call_value(&f, CallArgs::plain(args), Default::default())?)
     }
 
     /// Appelle une fonction avec des arguments Rust (un tuple) et convertit le résultat.

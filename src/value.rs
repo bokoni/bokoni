@@ -31,11 +31,10 @@ pub enum Value {
     Type(Rc<TypeInfo>),
     /// Un `enum` lui-même (`Protocol.values()`).
     Enum(Rc<EnumInfo>),
-    /// Interne : champ d'une construction en cours (bloc `Server do … end`).
-    /// N'est jamais visible du script : sa lecture donne la valeur du champ.
-    FieldRef(u32, u32),
-    /// Interne : champ d'objet pas encore initialisé (avant la fin de `init`).
+    /// Interne : champ d'objet, variable ou paramètre pas encore initialisé.
     Uninit,
+    /// Interne : itérateur d'une boucle `for`.
+    Iter(Rc<RefCell<crate::vm::IterState>>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,11 +169,11 @@ impl HashMap {
 /// Fonction appelable.
 pub enum Function {
     /// Fonction ou lambda du script.
-    Script(crate::interp::Closure),
+    Script(crate::vm::Closure),
     /// Fonction Rust enregistrée avec [`Engine::register_fn`](crate::Engine::register_fn).
     Native(NativeFn),
     /// Fonction intégrée qui a besoin de l'interpréteur (`print`…).
-    Builtin(crate::interp::Builtin),
+    Builtin(crate::ops::Builtin),
 }
 
 /// Signature commune des fonctions Rust appelables depuis le script.
@@ -188,9 +187,9 @@ pub struct NativeFn {
 impl Function {
     pub fn name(&self) -> &str {
         match self {
-            Function::Script(c) => &c.name,
+            Function::Script(c) => &c.proto.name,
             Function::Native(n) => &n.name,
-            Function::Builtin(b) => crate::interp::Builtin::ALL
+            Function::Builtin(b) => crate::ops::Builtin::ALL
                 .iter()
                 .find(|(_, x)| x == b)
                 .map_or("?", |(n, _)| n),
@@ -228,7 +227,7 @@ impl Value {
             Value::Variant(..) => "variante d'enum",
             Value::Type(_) => "type",
             Value::Enum(_) => "enum",
-            Value::FieldRef(..) | Value::Uninit => "valeur non initialisée",
+            Value::Uninit | Value::Iter(_) => "valeur interne",
         }
     }
 
@@ -434,7 +433,7 @@ impl Value {
             Value::Enum(e) => {
                 let _ = write!(out, "<enum {}>", e.name);
             }
-            Value::FieldRef(..) | Value::Uninit => out.push_str("<non initialisé>"),
+            Value::Uninit | Value::Iter(_) => out.push_str("<interne>"),
         }
     }
 }
