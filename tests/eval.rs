@@ -25,7 +25,8 @@ fn err(src: &str) -> (ErrorKind, String) {
     e.set_output(|_| {});
     match e.eval(src) {
         Ok(v) => panic!("devrait échouer, a donné {}", e.inspect(&v)),
-        Err(err) => (err[0].kind, err[0].message.clone()),
+        // Le type de la première erreur ; les messages de toutes.
+        Err(err) => (err[0].kind, err.to_string()),
     }
 }
 
@@ -254,7 +255,7 @@ fn type_annotations() {
     assert_eq!(run("let t: (int, str) = (1, \"a\")\nt.0"), "=> 1");
     let (kind, msg) = err("let x: int = \"a\"");
     assert_eq!(kind, ErrorKind::Type);
-    assert!(msg.contains("type attendu `int`, reçu str"), "{msg}");
+    assert!(msg.contains("type attendu `int`, reçu `str`"), "{msg}");
     assert!(
         err("let m: \"dev\" | \"prod\" = \"test\"")
             .1
@@ -382,7 +383,7 @@ fn record_literals_convert_to_types() {
             "{ROUTE}def reg(r: Route) = r\nlet x = {{path: \"/\"}}\nreg(x)"
         ))
         .1
-        .contains("type attendu `Route`, reçu record")
+        .contains("type attendu `Route` pour `r`, reçu `{path: str}`")
     );
     assert!(
         err(&format!(
@@ -428,7 +429,7 @@ fn classes() {
     assert!(
         err("class C\n  x: int\nend\nC()")
             .1
-            .contains("`@x` de `C` n'est pas initialisé")
+            .contains("champ `x` obligatoire")
     );
     assert!(err("@x").1.contains("que dans une méthode"));
 }
@@ -468,7 +469,7 @@ fn enums() {
     assert!(
         err("enum E: int\n  A = \"a\"\nend")
             .1
-            .contains("doit être de type `int`")
+            .contains("type attendu `int` pour la variante `A`")
     );
 }
 

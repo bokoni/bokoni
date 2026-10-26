@@ -10,6 +10,7 @@
 //! ```
 
 pub mod ast;
+pub mod check;
 pub mod diagnostic;
 pub mod engine;
 pub mod intern;

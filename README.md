@@ -16,6 +16,20 @@ end
 [1, 2, 3, 4].filter(|n| n % 2 == 0).map(|n| n * n)   # [4, 16]
 ```
 
+Avant l'exécution, tout le programme est vérifié (syntaxe, noms, types) et **toutes** les
+erreurs sont signalées d'un coup, avec suggestions :
+
+```text
+erreur de type: `str` n'a pas de méthode `lenght` (voulez-vous dire `len` ?)
+ --> script.bk:12:1
+   |
+12 | "abc".lenght()
+   | ^^^^^^^^^^^^^^
+```
+
+Typage graduel : seules les erreurs certaines sont signalées, le reste est vérifié à
+l'exécution.
+
 ## Utilisation depuis Rust
 
 ```rust

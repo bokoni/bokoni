@@ -30,6 +30,7 @@ use std::rc::Rc;
 
 pub struct Engine {
     rt: Runtime,
+    static_checks: bool,
 }
 
 impl Default for Engine {
@@ -48,12 +49,21 @@ impl Drop for Engine {
 
 impl Engine {
     pub fn new() -> Self {
-        Engine { rt: Runtime::new() }
+        Engine {
+            rt: Runtime::new(),
+            static_checks: true,
+        }
     }
 
     /// Redirige la sortie de `print` (par défaut : la sortie standard).
     pub fn set_output(&mut self, f: impl FnMut(&str) + 'static) {
         self.rt.output = Box::new(f);
+    }
+
+    /// Active ou désactive la vérification statique des noms et des types avant
+    /// l'exécution (activée par défaut). Les vérifications à l'exécution restent actives.
+    pub fn set_static_checks(&mut self, enabled: bool) {
+        self.static_checks = enabled;
     }
 
     /// Profondeur d'appels maximale avant l'erreur « récursion infinie ? » (défaut : 1000).
@@ -120,6 +130,16 @@ impl Engine {
             }
             errs
         })?;
+        if self.static_checks {
+            let errors = crate::check::check(&program, &self.rt.interner, &self.rt.globals);
+            if !errors.is_empty() {
+                let mut errors = Errors::new(errors);
+                for e in &mut errors.0 {
+                    e.src = Some((name_rc.clone(), src_rc.clone()));
+                }
+                return Err(errors);
+            }
+        }
         let script = Rc::new(Script {
             program,
             src: src_rc,

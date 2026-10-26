@@ -22,6 +22,32 @@ Les annotations sont optionnelles. Quand elles sont présentes, elles sont véri
 
 Une variable garde son type : `let x = 1` puis `x = "a"` est une erreur.
 
+### Vérification statique
+
+Avant l'exécution, le programme est vérifié en entier et **toutes** les erreurs sont
+signalées d'un coup (syntaxe, puis noms et types) :
+
+- noms : variable non définie, utilisée avant sa déclaration, assignée sans `let`,
+  constante ou fonction modifiée, champ inconnu dans un bloc de construction ;
+- types : `let` et réassignations, arguments (nombre, types, noms), retour, opérateurs,
+  champs, méthodes, variantes d'enum, types inconnus dans les annotations ;
+- inférence : type des variables, retour des fonctions non annotées, paramètres des
+  lambdas passés à `map`, `filter`, `each`… (`[1, 2].map(|n| n.upper())` est refusé).
+
+Un nom mal écrit est suggéré : `` `str` n'a pas de méthode `lenght` (voulez-vous dire `len` ?) ``.
+
+**Seules les erreurs certaines sont signalées** (typage graduel) :
+
+- une valeur de type inconnu (`any` : paramètre non annoté, fonction Rust) n'est jamais une
+  erreur ;
+- pour une valeur qui peut avoir plusieurs types (`int?`, `int | str`), une opération n'est
+  refusée que si aucun de ces types ne la permet ;
+- un `str` peut être passé là où `"dev" | "prod"` est attendu : la valeur exacte est
+  vérifiée à l'exécution.
+
+Ce qui n'est pas certain est vérifié à l'exécution. Depuis Rust, la vérification statique
+peut être désactivée (`engine.set_static_checks(false)`).
+
 ### Types
 
 | Type              | Exemple                       |
@@ -263,6 +289,18 @@ end
 
 let p = Protocol::Tcp
 p.value                       # "TCP"
+p.name                        # "Tcp"
+Color::Green.value            # 1 (sans valeur : l'index ; pour un enum `: str`, le nom)
+
+Protocol.values()             # [Protocol::Tcp, Protocol::Udp]
+Protocol.from("UDP")          # Protocol::Udp (nil si aucune variante n'a cette valeur)
+
+enum Level: int
+  Low = 1
+  High = 10
+
+  def is_high: bool = self == Level::High   # méthode, `self` = la variante
+end
 ```
 
 ## Type (données)
@@ -326,7 +364,13 @@ Règles dans un bloc de construction :
 - `champ = valeur` remplit un champ du type.
 - `let x = …` déclare une variable locale au bloc.
 - Un nom non déclaré qui n'est pas un champ est une erreur.
-- Les champs non remplis prennent leur valeur par défaut, calculée après le bloc.
+- Un champ lu dans le bloc (`routes << …`) reçoit d'abord sa valeur par défaut.
+- Les champs jamais touchés prennent leur valeur par défaut **après** le bloc : elle voit
+  les champs remplis par le bloc (`protocol = Protocol::Udp` donne `port = 40`).
+- Une dépendance circulaire entre valeurs par défaut est une erreur.
+
+Les champs d'un `type` sont publics (`s.port`, `s.port = 8080`, avec vérification du type).
+Deux valeurs d'un même `type` sont égales si tous leurs champs le sont.
 
 ## Classe (objets)
 
@@ -353,6 +397,12 @@ print(u.name)
 ```
 
 - `init` est le seul constructeur ; un paramètre `@x` déclare et assigne le champ.
+- Les champs sont privés : lus et modifiés par `@x` dans les méthodes ; de l'extérieur,
+  uniquement par un getter (`def name`) ou un setter (`def name=(v)`).
+- Un champ peut aussi être déclaré dans le corps, avec une valeur par défaut
+  (`count = 0`) ; tout champ doit être initialisé à la fin de `init`.
+- `self` désigne l'instance. `to_s` est utilisé par `print` et l'interpolation.
+- Deux instances ne sont égales que si c'est le même objet.
 - Pas de destructeur.
 
 ## Commentaires

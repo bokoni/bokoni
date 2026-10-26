@@ -31,14 +31,20 @@ source ─► lexer ─► parseur ─► AST ─► vérificateur de types ─�
 - [x] Annotations de type vérifiées à l'exécution (`let`, paramètres, retour)
 - [x] API `Engine` pour Rust : `eval`, `register_fn` avec conversion automatique des types
 - [x] Exécutable : exécuter un fichier, REPL, `--ast` pour afficher l'arbre
-- [ ] Récupération d'erreurs dans le parseur (plusieurs erreurs par passe)
+- [x] Récupération d'erreurs dans le parseur (toutes les erreurs en une passe) — fait en v0.2
 
 ### v0.2 — Typage statique
 
-- [ ] Résolution des noms (portées, `let`, constantes, champs des blocs de construction)
-- [ ] Vérificateur de types : inférence locale, `any`, `T?`, unions, types littéraux
-- [ ] `type`, `enum`, `class` à l'exécution ; blocs `Server do … end`
-- [ ] Conversion record littéral → type nominal
+- [x] Toutes les erreurs signalées en une passe : le lexer et le parseur reprennent après
+      une erreur (saut jusqu'au `end` des constructions ouvertes, sans cascade)
+- [x] Vérification des noms (portées, `let`, constantes, utilisation avant déclaration,
+      champs des blocs de construction), avec suggestions (`len` pour `lenght`)
+- [x] Vérificateur de types : inférence locale, `any`, `T?`, unions, types littéraux ;
+      seules les erreurs certaines sont signalées (typage graduel)
+- [x] Les déclarations des scripts précédents (REPL) sont connues du vérificateur
+- [x] `type`, `enum`, `class` à l'exécution ; blocs `Server do … end`
+- [x] Conversion record littéral → type nominal
+- [ ] Types génériques (`[T]` dans les signatures), héritage / interfaces, modules
 
 ### v0.3 — IR typée
 

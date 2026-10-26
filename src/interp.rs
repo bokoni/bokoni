@@ -83,6 +83,17 @@ impl Env {
         }
     }
 
+    /// Valeur et caractère modifiable d'une variable.
+    pub fn get_binding(&self, name: Symbol) -> Option<(Value, bool)> {
+        let mut scope = &self.0;
+        loop {
+            if let Some(b) = scope.vars.borrow().iter().rev().find(|b| b.name == name) {
+                return Some((b.value.clone(), b.mutable));
+            }
+            scope = &scope.parent.as_ref()?.0;
+        }
+    }
+
     /// Déclare dans cette portée (remplace une déclaration du même nom dans la même portée).
     pub fn declare(&self, name: Symbol, value: Value, mutable: bool) {
         let mut vars = self.0.vars.borrow_mut();
