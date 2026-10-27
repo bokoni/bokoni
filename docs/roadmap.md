@@ -414,10 +414,9 @@ namespaces, `trait` for shared behavior.
       too (a cycle through a closure referenced several times is freed); a value built
       by the host is registered when it reaches the engine (`set_global`, the result of a
       Rust function, `Engine::call`); registered twice, it is counted once
-
-### Next
-
-- Macros: calls without parentheses, named arguments.
+- [x] Macros: calls without parentheses (`getters name, email`, `derive_to_s`: the
+      arguments up to the end of the line), named arguments (`prop(host, kind: str)`),
+      parameters with a default value, parameters after `*rest` given by name
 
 ## Decisions that commit the JIT
 

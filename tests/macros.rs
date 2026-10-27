@@ -229,3 +229,86 @@ fn macro_errors() {
     check("macro m()\n  1\n", "expected `end` to close `macro`");
     check("macro m()\n  m()\nend\nm()", "expansion too deep");
 }
+
+#[test]
+fn calls_without_parentheses() {
+    // As members, as statements, in an expression; arguments up to the end of the line
+    // (a comma continues them on the next one).
+    let src = "macro getters(*names)
+  {% for name in names %}
+    def {{name}} = @{{name}}
+  {% end %}
+end
+macro derive_to_s
+  def to_s: str = {{@type.name.stringify}}
+end
+macro twice(x)
+  {{x}} * 2
+end
+macro log(msg)
+  out << {{msg}}
+end
+class User
+  def init(@name: str, @email: str)
+  end
+  getters name,
+    email
+  derive_to_s
+end
+let out = []
+log \"start\"
+let u = User(\"ann\", \"a@x.org\")
+let n = twice 21
+log u.name
+[u.name, u.email, u.to_s(), n, twice(3) + 1, out]";
+    assert_eq!(
+        run(src),
+        "=> [\"ann\", \"a@x.org\", \"User\", 42, 7, [\"start\", \"ann\"]]"
+    );
+    // Without arguments, followed by an operator: called, then the operation.
+    assert_eq!(
+        run("macro one\n  1\nend\nlet one_more = one + 1\none_more"),
+        "=> 2"
+    );
+}
+
+#[test]
+fn named_arguments_and_defaults() {
+    let src = "macro prop(name, kind = int, default = 0)
+  {{name}}: {{kind}} = {{default}}
+end
+type Config
+  prop port, default: 8080
+  prop(host, kind: str, default: \"localhost\")
+  prop retries
+end
+let c = Config()
+[c.port, c.host, c.retries]";
+    assert_eq!(run(src), "=> [8080, \"localhost\", 0]");
+    // After `*rest`, parameters given by name only.
+    let src = "macro sum_of(*items, scale = 1)
+  ({{items.join(\" + \")}}) * {{scale}}
+end
+[sum_of(1, 2), sum_of(1, 2, scale: 10), sum_of 3, 4, scale: 2]";
+    assert_eq!(run(src), "=> [3, 30, 14]");
+    let check = |src: &str, msg: &str| {
+        let out = run(src);
+        assert!(out.contains(msg), "expected `{msg}` in:\n{out}");
+    };
+    check(
+        "macro m(a, b = 1)\n  {{a}}\nend\nm(1, 2, 3)",
+        "macro `m` expects 1 to 2 arguments, got 3",
+    );
+    check(
+        "macro m(a)\n  {{a}}\nend\nm(b: 1)",
+        "macro `m` has no parameter `b`",
+    );
+    check(
+        "macro m(a, b)\n  {{a}}\nend\nm(1)",
+        "macro `m`: missing argument `b`",
+    );
+    check(
+        "macro m(a)\n  {{a}}\nend\nm(1, a: 2)",
+        "argument `a` given twice",
+    );
+}

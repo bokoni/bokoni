@@ -749,13 +749,16 @@ impl Parser<'_, '_> {
         self.at(T::Macro) || self.at_macro_call()
     }
 
+    /// At a known macro's name: a call, with its arguments in parentheses, without them
+    /// (`getters name, email`: up to the end of the line), or none (`derive_to_s`). Not
+    /// a name assigned (`m = …`).
     fn at_macro_call(&mut self) -> bool {
         self.at(T::Ident)
-            && self.peek2() == T::LParen
             && self
                 .macros
                 .defs
                 .contains_key(self.tok().span.text(self.src))
+            && assign_op(self.peek2()).is_none()
     }
 
     /// At a `macro` declaration (registered: `None`) or a call of a known macro
@@ -768,17 +771,16 @@ impl Parser<'_, '_> {
         let name = self.tok().span.text(self.src).to_string();
         let def = self.macros.defs[&name].clone();
         let start = self.bump().span;
-        let args = self.args()?;
+        let args = if self.at(T::LParen) {
+            self.args()?
+        } else {
+            self.bare_args()?
+        };
         let call = self.span_from(start);
         let mut texts = Vec::new();
         for a in self.ast.get(args).to_vec() {
-            if a.name.is_some() {
-                return self.error_at(
-                    format!("macro `{name}`: named arguments are not supported"),
-                    call,
-                );
-            }
-            texts.push(self.span(a.value).text(self.src).to_string());
+            let name = a.name.map(|n| self.interner.resolve(n).to_string());
+            texts.push((name, self.span(a.value).text(self.src).to_string()));
         }
         if self.macro_depth >= 32 {
             return self.error_at(
@@ -792,7 +794,7 @@ impl Parser<'_, '_> {
             ty,
             def: in_def.as_deref(),
         };
-        match crate::macros::expand(&def, texts, ctx, self.macros.count) {
+        match crate::macros::expand_call(&def, texts, ctx, self.macros.count) {
             Ok(text) => Ok(Some((text, call, name))),
             Err(msg) => self.error_at(format!("macro `{name}`: {msg}"), call),
         }
@@ -805,7 +807,9 @@ impl Parser<'_, '_> {
         let (name, _) = self.ident("after `macro`")?;
         let name = self.interner.resolve(name).to_string();
         let mut params = Vec::new();
+        let mut defaults = Vec::new();
         let mut splat = None;
+        let mut positional = None;
         if self.eat(T::LParen) {
             loop {
                 self.skip_newlines();
@@ -813,12 +817,24 @@ impl Parser<'_, '_> {
                     break;
                 }
                 let star = self.eat(T::Star);
-                let (p, _) = self.ident("(macro parameter)")?;
+                let (p, pspan) = self.ident("(macro parameter)")?;
                 let p = self.interner.resolve(p).to_string();
                 if star {
+                    if splat.is_some() {
+                        return self.error_at("a macro has at most one `*` parameter", pspan);
+                    }
                     splat = Some(p);
+                    positional = Some(params.len());
                 } else {
+                    // A default value: its source code.
+                    let default = if self.eat(T::Eq) {
+                        let e = self.expr()?;
+                        Some(self.span(e).text(self.src).to_string())
+                    } else {
+                        None
+                    };
                     params.push(p);
+                    defaults.push(default);
                 }
                 if !self.eat(T::Comma) {
                     self.expect(T::RParen, "to close the macro parameters")?;
@@ -847,7 +863,9 @@ impl Parser<'_, '_> {
             name.clone(),
             Rc::new(MacroDef {
                 name,
+                positional: positional.unwrap_or(params.len()),
                 params,
+                defaults,
                 splat,
                 body,
             }),
@@ -2205,25 +2223,7 @@ impl Parser<'_, '_> {
             if self.eat(T::RParen) {
                 return Ok(());
             }
-            let name = if self.peek() == T::Ident && self.peek2() == T::Colon {
-                let t = self.bump();
-                self.bump();
-                let name = self.intern(t.span);
-                if self.s_args[base..].iter().any(|a| a.name == Some(name)) {
-                    return self.error_at(
-                        format!("argument `{}` given twice", self.interner.resolve(name)),
-                        t.span,
-                    );
-                }
-                Some(name)
-            } else {
-                if self.s_args[base..].last().is_some_and(|a| a.name.is_some()) {
-                    return self.error_here("positional argument after a named argument");
-                }
-                None
-            };
-            let value = self.expr()?;
-            self.s_args.push(Arg { name, value });
+            self.arg(base)?;
             self.skip_newlines();
             if !self.eat(T::Comma) {
                 self.skip_newlines();
@@ -2231,6 +2231,49 @@ impl Parser<'_, '_> {
                 return Ok(());
             }
         }
+    }
+
+    /// An argument (`name: value` or `value`), after those from `base` in `s_args`.
+    fn arg(&mut self, base: usize) -> Result<()> {
+        let name = if self.peek() == T::Ident && self.peek2() == T::Colon {
+            let t = self.bump();
+            self.bump();
+            let name = self.intern(t.span);
+            if self.s_args[base..].iter().any(|a| a.name == Some(name)) {
+                return self.error_at(
+                    format!("argument `{}` given twice", self.interner.resolve(name)),
+                    t.span,
+                );
+            }
+            Some(name)
+        } else {
+            if self.s_args[base..].last().is_some_and(|a| a.name.is_some()) {
+                return self.error_here("positional argument after a named argument");
+            }
+            None
+        };
+        let value = self.expr()?;
+        self.s_args.push(Arg { name, value });
+        Ok(())
+    }
+
+    /// Arguments of a macro call without parentheses: up to the end of the line (after a
+    /// comma, the next one continues them).
+    fn bare_args(&mut self) -> Result<Slice<Arg>> {
+        let base = self.s_args.len();
+        let mut r = Ok(());
+        if bare_arg_start(self.peek()) {
+            loop {
+                r = self.arg(base);
+                if r.is_err() || !self.eat(T::Comma) {
+                    break;
+                }
+            }
+        }
+        r?;
+        let slice = self.ast.alloc(&self.s_args[base..]);
+        self.s_args.truncate(base);
+        Ok(slice)
     }
 
     fn primary(&mut self) -> Result<ExprId> {
@@ -2881,4 +2924,26 @@ fn unescape(s: &str, offset: u32) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+/// Tokens that start an argument of a macro call without parentheses (not an operator:
+/// `m -x` stays a subtraction).
+fn bare_arg_start(k: TokenKind) -> bool {
+    matches!(
+        k,
+        T::Int
+            | T::Float
+            | T::Str
+            | T::StrHead
+            | T::Ident
+            | T::IVar
+            | T::True
+            | T::False
+            | T::Nil
+            | T::Not
+            | T::SelfKw
+            | T::LBracket
+            | T::LBrace
+            | T::Pipe
+    )
 }

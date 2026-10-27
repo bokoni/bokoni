@@ -957,7 +957,7 @@ class User
   def init(@name: str, @email: str)
   end
 
-  getters(name, email)        # generates: def name = @name / def email = @email
+  getters name, email         # generates: def name = @name / def email = @email
 end
 ```
 
@@ -972,7 +972,7 @@ end
 type Point
   x: int = 0
   y: int = 0
-  derive_to_s()
+  derive_to_s
 end
 
 Point(x: 1).to_s()            # "Point(x=1, y=0)"
@@ -984,12 +984,34 @@ code is a `begin … end` whose value is the last expression).
 
 ### Declaration
 
-- `macro name(a, b, *rest) … end`: `*rest` receives the remaining arguments as a list;
-  the parentheses can be left out when there are no parameters.
+- `macro name(a, b = default, *rest, c = default) … end`: `*rest` receives the
+  remaining positional arguments as a list; a parameter after it is given by name only;
+  a default value is source code, inserted when the argument is not given. The
+  parentheses can be left out when there are no parameters.
 - At the top level or in the body of a type; a macro is known from its declaration on,
   in the rest of the script, in later scripts of the same engine and in the files that
   `require` the file declaring it.
-- A call must have its parentheses (`derive_to_s()`), with positional arguments.
+
+### Calls
+
+- With parentheses, `prop(host, kind: str)`, or without: `prop host, kind: str` takes
+  the arguments up to the end of the line (after a comma, the next line continues
+  them); `derive_to_s` alone has none. Named arguments (`name: code`) come after the
+  positional ones.
+- A known macro's name always calls it (`one + 1` is the expansion of `one`, plus 1):
+  it hides a variable or a function of the same name, except as the target of an
+  assignment.
+
+```ruby
+macro prop(name, kind = int, default = 0)
+  {{name}}: {{kind}} = {{default}}
+end
+
+type Config
+  prop port, default: 8080
+  prop host, kind: str, default: "localhost"
+end
+```
 
 ### Expressions in `{{ }}` and `{% %}`
 

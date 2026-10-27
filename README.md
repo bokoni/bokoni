@@ -64,7 +64,7 @@ class User
   def init(@name: str, @email: str)
   end
 
-  getters(name, email)
+  getters name, email
 end
 ```
 

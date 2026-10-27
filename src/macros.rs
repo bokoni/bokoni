@@ -19,6 +19,9 @@
 //!   source), `.name` / `.type` (of a field), `.map(|v| …)`, `.join(sep)`, `.size`,
 //!   `.first`, `.last`, `.empty?`, `.upper`, `.lower`, `.capitalize`.
 //! - `@type`, in a type body: `.name`, `.fields` (with `.name`, `.type`), `.methods`.
+//! - Calls: `m(a, b: x)`, or `m a, b: x` (arguments up to the end of the line), or `m`;
+//!   parameters may have a default (`macro m(a, b = 1)`), those after `*rest` are given
+//!   by name only.
 //! - Hygiene: a variable declared with `let` in the macro's own text is renamed, so it
 //!   does not clash with the caller's variables.
 //!
@@ -32,8 +35,12 @@ use std::rc::Rc;
 pub struct MacroDef {
     pub name: String,
     pub params: Vec<String>,
+    /// Default value of each parameter, as written (`macro m(a, b = 1)`), if any.
+    pub defaults: Vec<Option<String>>,
     /// `*rest`: the remaining arguments, as a list.
     pub splat: Option<String>,
+    /// Parameters before `*rest` (those after it are given by name only).
+    pub positional: usize,
     /// Text of the body (between the signature and `end`).
     pub body: String,
 }
@@ -164,25 +171,29 @@ impl MVal {
     }
 }
 
-/// Expands macro `def` called with `args` (source code of each argument), at `ctx`: the
-/// generated source, or an error message.
+/// Expands macro `def` called with the positional arguments `args` (source code of
+/// each), at `ctx`: the generated source, or an error message.
+#[cfg(test)]
 pub fn expand(def: &MacroDef, args: Vec<String>, ctx: Ctx, count: u32) -> Result<String, String> {
-    if args.len() < def.params.len() || (def.splat.is_none() && args.len() > def.params.len()) {
-        return Err(format!(
-            "macro `{}` expects {} argument{}, got {}",
-            def.name,
-            def.params.len(),
-            if def.params.len() == 1 { "" } else { "s" },
-            args.len()
-        ));
-    }
+    expand_call(
+        def,
+        args.into_iter().map(|a| (None, a)).collect(),
+        ctx,
+        count,
+    )
+}
+
+/// Expands macro `def` called with `args` (name if named, source code), at `ctx`: the
+/// generated source, or an error message.
+pub fn expand_call(
+    def: &MacroDef,
+    args: Vec<(Option<String>, String)>,
+    ctx: Ctx,
+    count: u32,
+) -> Result<String, String> {
     let mut env: HashMap<String, MVal> = HashMap::new();
-    let mut args = args.into_iter();
-    for p in &def.params {
-        env.insert(p.clone(), MVal::Node(args.next().unwrap()));
-    }
-    if let Some(s) = &def.splat {
-        env.insert(s.clone(), MVal::List(args.map(MVal::Node).collect()));
+    for (p, v) in def.params.iter().chain(&def.splat).zip(bind(def, args)?) {
+        env.insert(p.clone(), v);
     }
     if let Some(t) = ctx.ty {
         env.insert("@type".into(), MVal::Type(Rc::new(t.clone())));
@@ -194,6 +205,67 @@ pub fn expand(def: &MacroDef, args: Vec<String>, ctx: Ctx, count: u32) -> Result
     let mut out = Vec::new();
     run(&nodes, &mut vec![env], &mut out)?;
     Ok(hygiene(out, count))
+}
+
+/// Values of the parameters of `def` (the last one: `*rest`, if declared) for `args`:
+/// positional ones in order, named ones by name, the others their default.
+fn bind(def: &MacroDef, args: Vec<(Option<String>, String)>) -> Result<Vec<MVal>, String> {
+    let n = def.params.len();
+    let np = def.positional;
+    let mut bound: Vec<Option<String>> = vec![None; n];
+    let mut rest = Vec::new();
+    let mut k = 0;
+    let positional = args.iter().filter(|(name, _)| name.is_none()).count();
+    for (name, text) in args {
+        match name {
+            None if k < np => {
+                bound[k] = Some(text);
+                k += 1;
+            }
+            None if def.splat.is_some() => rest.push(MVal::Node(text)),
+            None => {
+                let required = def.defaults[..np].iter().filter(|d| d.is_none()).count();
+                let expected = if required == np {
+                    format!("{np}")
+                } else {
+                    format!("{required} to {np}")
+                };
+                return Err(format!(
+                    "macro `{}` expects {expected} argument{}, got {positional}",
+                    def.name,
+                    if np == 1 { "" } else { "s" },
+                ));
+            }
+            Some(name) => {
+                let i = def
+                    .params
+                    .iter()
+                    .position(|p| *p == name)
+                    .ok_or_else(|| format!("macro `{}` has no parameter `{name}`", def.name))?;
+                if bound[i].is_some() {
+                    return Err(format!("argument `{name}` given twice"));
+                }
+                bound[i] = Some(text);
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(n + 1);
+    for (i, b) in bound.into_iter().enumerate() {
+        let text = match b.or_else(|| def.defaults.get(i).cloned().flatten()) {
+            Some(t) => t,
+            None => {
+                return Err(format!(
+                    "macro `{}`: missing argument `{}`",
+                    def.name, def.params[i]
+                ));
+            }
+        };
+        out.push(MVal::Node(text));
+    }
+    if def.splat.is_some() {
+        out.push(MVal::List(rest));
+    }
+    Ok(out)
 }
 
 // ─── Template ───────────────────────────────────────────────────────────────
@@ -1095,7 +1167,9 @@ mod tests {
         MacroDef {
             name: "m".into(),
             params: params.iter().map(|s| s.to_string()).collect(),
+            defaults: vec![None; params.len()],
             splat: splat.map(str::to_string),
+            positional: params.len(),
             body: body.into(),
         }
     }
@@ -1185,7 +1259,7 @@ mod tests {
         assert!(
             expand(&def(&["a"], None, ""), vec![], Ctx::default(), 1)
                 .unwrap_err()
-                .contains("expects 1 argument")
+                .contains("missing argument `a`")
         );
     }
 }
