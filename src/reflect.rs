@@ -1,4 +1,4 @@
-//! Introspection depuis Rust : déclarations du script et leurs annotations.
+//! Introspection from Rust: the script's declarations and their annotations.
 //!
 //! ```
 //! use bokoni::Engine;
@@ -16,8 +16,8 @@
 //! assert_eq!(v.get::<Option<i64>>("max").unwrap(), Some(65535));
 //! ```
 //!
-//! Les descriptions sont des copies : elles ne gardent aucun lien avec le moteur. Les
-//! arguments des annotations sont évalués au moment de la lecture.
+//! Descriptions are copies: they keep no link to the engine. Annotation arguments are
+//! evaluated when read.
 
 use crate::engine::FromValue;
 use crate::ir::{Annotations, Proto};
@@ -27,7 +27,7 @@ use crate::value::Value;
 use crate::vm::{CallArgs, Runtime};
 use std::rc::Rc;
 
-/// Annotation appliquée (`@[Validate(min: 1)]`) : son nom et la valeur de ses champs.
+/// An applied annotation (`@[Validate(min: 1)]`): its name and the values of its fields.
 #[derive(Clone, Debug)]
 pub struct Annotation {
     name: String,
@@ -39,49 +39,48 @@ impl Annotation {
         &self.name
     }
 
-    /// Champs de l'annotation, dans l'ordre de sa déclaration (valeurs par défaut
-    /// comprises).
+    /// The annotation's fields, in declaration order (default values included).
     pub fn fields(&self) -> &[(String, Value)] {
         &self.fields
     }
 
-    /// Valeur d'un champ.
+    /// Value of a field.
     pub fn value(&self, field: &str) -> Option<&Value> {
         self.fields.iter().find(|(n, _)| n == field).map(|(_, v)| v)
     }
 
-    /// Valeur d'un champ, convertie (`v.get::<Option<i64>>("min")`).
+    /// Value of a field, converted (`v.get::<Option<i64>>("min")`).
     pub fn get<T: FromValue>(&self, field: &str) -> Result<T, String> {
         match self.value(field) {
-            Some(v) => T::from_value(v).map_err(|e| format!("`{}.{field}` : {e}", self.name)),
+            Some(v) => T::from_value(v).map_err(|e| format!("`{}.{field}`: {e}", self.name)),
             None => Err(format!(
-                "l'annotation `{}` n'a pas de champ `{field}`",
+                "annotation `{}` has no field `{field}`",
                 self.name
             )),
         }
     }
 }
 
-/// Méthodes communes aux déclarations annotées.
+/// Methods shared by annotated declarations.
 macro_rules! annotated {
     ($($t:ty),*) => {$(
         impl $t {
-            /// Toutes les annotations, dans l'ordre d'écriture.
+            /// All annotations, in source order.
             pub fn all_annotations(&self) -> &[Annotation] {
                 &self.annotations
             }
 
-            /// La dernière annotation `name` (ou `None`).
+            /// The last `name` annotation (or `None`).
             pub fn annotation(&self, name: &str) -> Option<&Annotation> {
                 self.annotations.iter().rev().find(|a| a.name == name)
             }
 
-            /// Toutes les annotations `name`.
+            /// All `name` annotations.
             pub fn annotations<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Annotation> {
                 self.annotations.iter().filter(move |a| a.name == name)
             }
 
-            /// Texte de `@[Doc("…")]`.
+            /// Text of `@[Doc("…")]`.
             pub fn doc(&self) -> Option<&str> {
                 match self.annotation("Doc")?.value("text")? {
                     Value::Str(s) => Some(s),
@@ -89,7 +88,7 @@ macro_rules! annotated {
                 }
             }
 
-            /// `@[Deprecated(message?)]` : `Some(message)` si la déclaration est obsolète.
+            /// `@[Deprecated(message?)]`: `Some(message)` if the declaration is deprecated.
             pub fn deprecated(&self) -> Option<Option<&str>> {
                 let a = self.annotation("Deprecated")?;
                 Some(match a.value("message") {
@@ -101,7 +100,7 @@ macro_rules! annotated {
     )*};
 }
 
-/// Sorte de déclaration de [`TypeDesc`].
+/// Kind of declaration of a [`TypeDesc`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeclKind {
     Type,
@@ -109,13 +108,13 @@ pub enum DeclKind {
     Annotation,
 }
 
-/// `type`, `class` ou `annotation` déclaré.
+/// A declared `type`, `class` or `annotation`.
 #[derive(Clone, Debug)]
 pub struct TypeDesc {
     pub name: String,
     pub kind: DeclKind,
     pub fields: Vec<FieldDesc>,
-    /// Méthodes, dans l'ordre de leur déclaration.
+    /// Methods, in declaration order.
     pub methods: Vec<FnDesc>,
     annotations: Vec<Annotation>,
 }
@@ -138,17 +137,17 @@ impl TypeDesc {
     }
 }
 
-/// Champ d'un `type` / d'une `class`.
+/// Field of a `type` / `class`.
 #[derive(Clone, Debug)]
 pub struct FieldDesc {
     pub name: String,
-    /// Annotation de type telle qu'écrite (`int`, `[Route]`…).
+    /// Type annotation as written (`int`, `[Route]`…).
     pub ty: Option<String>,
     pub has_default: bool,
     annotations: Vec<Annotation>,
 }
 
-/// Fonction ou méthode.
+/// Function or method.
 #[derive(Clone, Debug)]
 pub struct FnDesc {
     pub name: String,
@@ -163,7 +162,7 @@ impl FnDesc {
     }
 }
 
-/// Paramètre d'une fonction.
+/// Function parameter.
 #[derive(Clone, Debug)]
 pub struct ParamDesc {
     pub name: String,
@@ -172,7 +171,7 @@ pub struct ParamDesc {
     annotations: Vec<Annotation>,
 }
 
-/// `enum` déclaré.
+/// A declared `enum`.
 #[derive(Clone, Debug)]
 pub struct EnumDesc {
     pub name: String,
@@ -187,7 +186,7 @@ impl EnumDesc {
     }
 }
 
-/// Variante d'un `enum`.
+/// Variant of an `enum`.
 #[derive(Clone, Debug)]
 pub struct VariantDesc {
     pub name: String,
@@ -205,7 +204,7 @@ annotated!(
 );
 
 impl Runtime {
-    /// Construit les annotations (évalue leurs arguments).
+    /// Builds the annotations (evaluates their arguments).
     pub(crate) fn eval_annotations(&mut self, anns: &Annotations) -> R<Vec<Annotation>> {
         let mut out = Vec::with_capacity(anns.len());
         for a in anns.iter() {
@@ -220,7 +219,7 @@ impl Runtime {
             )?;
             let Value::Object(o) = &v else {
                 return type_err(
-                    format!("`{}` n'est pas une annotation", self.name(a.name)),
+                    format!("`{}` is not an annotation", self.name(a.name)),
                     a.span,
                 );
             };
@@ -258,7 +257,7 @@ impl Runtime {
         })
     }
 
-    /// Méthodes, dans l'ordre de leur déclaration.
+    /// Methods, in declaration order.
     fn methods_desc(
         &mut self,
         methods: &crate::intern::FxHashMap<crate::intern::Symbol, Rc<Proto>>,

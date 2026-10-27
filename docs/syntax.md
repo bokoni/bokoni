@@ -1,200 +1,199 @@
-# Syntaxe
+# Syntax
 
-Langage de script intégré à Rust, à la syntaxe inspirée de Ruby / Crystal, avec un typage graduel.
+A scripting language embedded in Rust, with syntax inspired by Ruby / Crystal and gradual typing.
 
-## Principes
+## Principles
 
-- Syntaxe proche de Ruby : blocs `… end`, `#` pour les commentaires, pas d'accolades pour les blocs.
-- Tout est une expression : la dernière valeur d'un bloc est sa valeur.
-- Les appels de fonction prennent toujours des parenthèses : `print(x)`, pas `print x`.
-- Fin de ligne = fin d'instruction. Une ligne qui se termine par un opérateur, `,` ou `(` continue sur la suivante.
+- Syntax close to Ruby: `… end` blocks, `#` for comments, no braces for blocks.
+- Everything is an expression: the last value of a block is its value.
+- Function calls always take parentheses: `print(x)`, not `print x`.
+- End of line = end of statement. A line ending with an operator, `,` or `(` continues on the next one.
 
-## Typage graduel
+## Gradual typing
 
-Les annotations sont optionnelles. Quand elles sont présentes, elles sont vérifiées.
+Annotations are optional. When present, they are checked.
 
-| Cas                          | Type                                  |
+| Case                         | Type                                  |
 |------------------------------|---------------------------------------|
-| `let x: int = 1`             | `int` (annoté)                        |
-| `let x = 1`                  | `int` (déduit de la valeur)           |
-| paramètre `a: int`           | `int`                                 |
-| paramètre `a` sans type      | `any` (dynamique, vérifié à l'exécution) |
+| `let x: int = 1`             | `int` (annotated)                     |
+| `let x = 1`                  | `int` (inferred from the value)       |
+| parameter `a: int`           | `int`                                 |
+| parameter `a` without a type | `any` (dynamic, checked at run time)  |
 
-Une variable garde son type : `let x = 1` puis `x = "a"` est une erreur.
+A variable keeps its type: `let x = 1` followed by `x = "a"` is an error.
 
-### Vérification statique
+### Static checking
 
-Avant l'exécution, le programme est vérifié en entier et **toutes** les erreurs sont
-signalées d'un coup (syntaxe, puis noms et types) :
+Before running, the whole program is checked and **all** errors are reported at once
+(syntax, then names and types):
 
-- noms : variable non définie, utilisée avant sa déclaration, assignée sans `let`,
-  constante ou fonction modifiée, champ inconnu dans un bloc de construction ;
-- types : `let` et réassignations, arguments (nombre, types, noms), retour, opérateurs,
-  champs, méthodes, variantes d'enum, types inconnus dans les annotations ;
-- inférence : type des variables, retour des fonctions non annotées, paramètres des
-  lambdas passés à `map`, `filter`, `each`… (`[1, 2].map(|n| n.upper())` est refusé).
+- names: undefined variable, used before its declaration, assigned without `let`,
+  constant or function modified, unknown field in a construction block;
+- types: `let` and reassignments, arguments (count, types, names), return, operators,
+  fields, methods, enum variants, unknown types in annotations;
+- inference: variable types, return type of unannotated functions, parameters of lambdas
+  passed to `map`, `filter`, `each`… (`[1, 2].map(|n| n.upper())` is rejected).
 
-Un nom mal écrit est suggéré : `` `str` n'a pas de méthode `lenght` (voulez-vous dire `len` ?) ``.
+A misspelled name gets a suggestion: `` `str` has no method `lenght` (did you mean `len`?) ``.
 
-**Seules les erreurs certaines sont signalées** (typage graduel) :
+**Only certain errors are reported** (gradual typing):
 
-- une valeur de type inconnu (`any` : paramètre non annoté, fonction Rust) n'est jamais une
-  erreur ;
-- pour une valeur qui peut avoir plusieurs types (`int?`, `int | str`), une opération n'est
-  refusée que si aucun de ces types ne la permet ;
-- un `str` peut être passé là où `"dev" | "prod"` est attendu : la valeur exacte est
-  vérifiée à l'exécution.
+- a value of unknown type (`any`: unannotated parameter, Rust function) is never an
+  error;
+- for a value that may have several types (`int?`, `int | str`), an operation is rejected
+  only if none of those types allows it;
+- a `str` may be passed where `"dev" | "prod"` is expected: the exact value is checked at
+  run time.
 
-Ce qui n'est pas certain est vérifié à l'exécution. Depuis Rust, la vérification statique
-peut être désactivée (`engine.set_static_checks(false)`).
+Whatever is not certain is checked at run time. From Rust, static checking can be
+disabled (`engine.set_static_checks(false)`).
 
 ### Types
 
-| Type              | Exemple                       |
+| Type              | Example                       |
 |-------------------|-------------------------------|
 | `int`             | `42`, `-1`, `1_000`           |
 | `float`           | `3.14`, `1e300`, `2.5e-8`     |
 | `str`             | `"hello #{name}"`             |
 | `bool`            | `true`, `false`               |
 | `nil`             | `nil`                         |
-| `any`             | n'importe quelle valeur       |
+| `any`             | any value                     |
 | `[T]`             | `[1, 2, 3]`                   |
-| `{K => V}`        | hash : `{"a" => 1}`           |
-| `{a: T, b: U}`    | record : `{a: 1, b: "x"}`     |
-| `(A, B)`          | tuple : `(1, "x")`            |
+| `{K => V}`        | hash: `{"a" => 1}`            |
+| `{a: T, b: U}`    | record: `{a: 1, b: "x"}`      |
+| `(A, B)`          | tuple: `(1, "x")`             |
 | `T?`              | `str?` = `str \| nil`         |
 | `A \| B`          | `int \| str`                  |
-| littéraux         | `"dev" \| "prod"`, `2 \| 4`   |
-| `(A, B): R`       | type d'une fonction / lambda  |
+| literals          | `"dev" \| "prod"`, `2 \| 4`   |
+| `(A, B): R`       | type of a function / lambda   |
 
-Un décimal s'affiche avec l'écriture la plus courte qui redonne exactement sa valeur :
-`3.0`, `0.1`, `1e300`, `5e-324`, `1.2345678901234568e17` (notation scientifique pour les
-très grands et très petits nombres), `inf`, `-inf`, `NaN`. Cette écriture se relit comme
-littéral.
+A float is displayed with the shortest form that gives back exactly its value: `3.0`,
+`0.1`, `1e300`, `5e-324`, `1.2345678901234568e17` (scientific notation for very large and
+very small numbers), `inf`, `-inf`, `NaN`. That form reads back as a literal.
 
-Les types primitifs sont en minuscules, les types utilisateur commencent par une majuscule.
+Primitive types are lowercase; user types start with an uppercase letter.
 
 ## Variables
 
 ```ruby
-let name = "Vincent"          # déclaration (type déduit : str)
-let age: int = 42             # déclaration annotée
-age = 43                      # réassignation d'une variable existante
-MAX_PORT = 65535              # constante (MAJUSCULES, non réassignable)
+let name = "Vincent"          # declaration (inferred type: str)
+let age: int = 42             # annotated declaration
+age = 43                      # reassignment of an existing variable
+MAX_PORT = 65535              # constant (UPPERCASE, cannot be reassigned)
 
-total = 1                     # erreur : "total" n'est pas déclaré
+total = 1                     # error: "total" is not declared
 ```
 
-- `let` déclare, `=` seul réassigne.
-- Assigner une variable non déclarée est une erreur (évite les fautes de frappe silencieuses).
-- Opérateurs composés : `+=`, `-=`, `*=`, `/=`, `<<` (ajout à une liste).
+- `let` declares, `=` alone reassigns.
+- Assigning an undeclared variable is an error (avoids silent typos).
+- Compound operators: `+=`, `-=`, `*=`, `/=`, `<<` (append to a list).
 
-## Collections et structures
+## Collections and structures
 
-### Liste
+### List
 
 ```ruby
 let nums = [1, 2, 3]          # [int]
 let empty: [str] = []
 
 nums[0]                       # 1
-nums[-1]                      # 3 (depuis la fin)
-nums << 4                     # ajout
+nums[-1]                      # 3 (from the end)
+nums << 4                     # append
 nums.len()                    # 4
 ```
 
-### Hash (clés dynamiques)
+### Hash (dynamic keys)
 
-Un hash associe des clés à des valeurs, toutes du même type. Les clés sont des expressions, séparées par `=>`.
+A hash maps keys to values, all of the same type. Keys are expressions, separated by `=>`.
 
 ```ruby
 let ages = {"alice" => 30, "bob" => 25}     # {str => int}
-let names = {1 => "un", 2 => "deux"}        # {int => str}
+let names = {1 => "one", 2 => "two"}        # {int => str}
 let key = "carol"
 let scores: {str => int} = {}
 
-ages["alice"]                 # 30 : type int? (nil si la clé est absente)
-ages["dave"] = 41             # ajout / modification
+ages["alice"]                 # 30: type int? (nil if the key is missing)
+ages["dave"] = 41             # insert / update
 ages.has("bob")               # true
 ages.delete("bob")
 ages.keys()                   # ["alice", "dave"]
-scores[key] = 10              # clé calculée
+scores[key] = 10              # computed key
 
 for name, age in ages
-  print("#{name} a #{age} ans")
+  print("#{name} is #{age}")
 end
 ```
 
-### Record (structure anonyme)
+### Record (anonymous structure)
 
-Un record a un ensemble fixe de champs, chacun avec son propre type. Les noms de champs sont écrits directement, suivis de `:`.
+A record has a fixed set of fields, each with its own type. Field names are written directly, followed by `:`.
 
 ```ruby
 let point = {x: 1, y: 2}                    # {x: int, y: int}
 let user = {name: "Vincent", age: 42, tags: ["admin"]}
 
 point.x                       # 1
-point.x = 5                   # modification d'un champ existant
-point.z = 3                   # erreur : le record n'a pas de champ "z"
+point.x = 5                   # update of an existing field
+point.z = 3                   # error: the record has no field "z"
 
 let x = 10
-let p2 = {x, y: 20}           # raccourci : {x: x, y: 20}
+let p2 = {x, y: 20}           # shorthand: {x: x, y: 20}
 
 def dist(p: {x: int, y: int}): float
   (p.x * p.x + p.y * p.y).sqrt()
 end
 ```
 
-Un `type` est un record nommé, avec des valeurs par défaut. Un record anonyme sert pour les valeurs ponctuelles (retours multiples, options, données passées à une fonction).
+A `type` is a named record, with default values. An anonymous record is for one-off values (multiple returns, options, data passed to a function).
 
-### Compatibilité record / type
+### Record / type compatibility
 
-Les `type` et les `class` sont **nominaux** : deux types différents ne sont jamais interchangeables, même s'ils ont les mêmes champs.
+`type` and `class` are **nominal**: two different types are never interchangeable, even if they have the same fields.
 
 ```ruby
 type Euro
-  montant: float
+  amount: float
 end
 
 type Dollar
-  montant: float
+  amount: float
 end
 
-def payer(e: Euro) … end
+def pay(e: Euro) … end
 
-payer(Dollar(montant: 10.0))  # erreur : Dollar n'est pas Euro
+pay(Dollar(amount: 10.0))     # error: Dollar is not Euro
 ```
 
-Exception : un **record littéral** écrit directement là où un type est attendu est converti vers ce type. Les champs sont vérifiés, et les valeurs par défaut s'appliquent.
+Exception: a **record literal** written directly where a type is expected is converted to that type. Fields are checked, and default values apply.
 
 ```ruby
 def register(r: Route) … end
 
-register({path: "/users"})               # OK : converti en Route (methods = ["GET"])
-let s: Server = {host: "api", port: 443} # OK : idem pour une annotation
-register({path: "/x", verb: "GET"})      # erreur : Route n'a pas de champ "verb"
+register({path: "/users"})               # OK: converted to Route (methods = ["GET"])
+let s: Server = {host: "api", port: 443} # OK: same for an annotation
+register({path: "/x", verb: "GET"})      # error: Route has no field "verb"
 
 let r = {path: "/users"}
-register(r)                              # erreur : r est un record, pas un Route
+register(r)                              # error: r is a record, not a Route
 register(Route(path: r.path))            # OK
 ```
 
-La conversion a lieu partout où le type attendu est connu : argument de fonction, `let x: T = …`, valeur de retour d'une fonction `: T`, élément d'une liste `[T]`.
+The conversion happens wherever the expected type is known: function argument, `let x: T = …`, return value of a `: T` function, element of a `[T]` list.
 
-### Hash ou record ?
+### Hash or record?
 
 |                   | Hash `{k => v}`                    | Record `{k: v}`                  |
 |-------------------|------------------------------------|----------------------------------|
-| clés              | n'importe quelle expression        | noms fixes, connus à l'écriture  |
-| types des valeurs | tous identiques (`V`)              | un type par champ                |
-| accès             | `h["clé"]` (peut être `nil`)       | `r.champ` (vérifié)              |
-| ajout de clé      | oui                                | non                              |
-| usage             | dictionnaire, index, cache         | structure, configuration         |
+| keys              | any expression                     | fixed names, known when written  |
+| value types       | all the same (`V`)                 | one type per field               |
+| access            | `h["key"]` (may be `nil`)          | `r.field` (checked)              |
+| adding a key      | yes                                | no                               |
+| use               | dictionary, index, cache           | structure, configuration         |
 
-### Tuple et déstructuration
+### Tuple and destructuring
 
 ```ruby
-let pair = (1, "un")          # (int, str)
+let pair = (1, "one")         # (int, str)
 pair.0                        # 1
 
 def min_max(nums: [int]): (int, int)
@@ -202,31 +201,31 @@ def min_max(nums: [int]): (int, int)
 end
 
 let (lo, hi) = min_max([3, 1, 4])
-let {x, y} = point            # déstructuration d'un record
-let [first, ...rest] = nums   # déstructuration d'une liste
+let {x, y} = point            # destructuring a record
+let [first, ...rest] = nums   # destructuring a list
 ```
 
-## Fonctions
+## Functions
 
 ```ruby
 def add(a: int, b: int = 0): int
   a + b
 end
 
-def greet(who)                # paramètre non typé → any, retour déduit
-  print("Bonjour #{who}")
+def greet(who)                # untyped parameter → any, inferred return
+  print("Hello #{who}")
 end
 
-def double(x: int): int = x * 2   # forme courte sur une ligne
+def double(x: int): int = x * 2   # short one-line form
 
 add(1, 2)
-add(a: 1, b: 2)               # arguments nommés
+add(a: 1, b: 2)               # named arguments
 ```
 
-- Le type de retour s'écrit `: type` après les paramètres.
-- `return` existe pour sortir plus tôt ; sinon la dernière expression est retournée.
+- The return type is written `: type` after the parameters.
+- `return` exists to exit early; otherwise the last expression is returned.
 
-## Lambdas et blocs
+## Lambdas and blocks
 
 ```ruby
 let inc = |x| x + 1
@@ -240,25 +239,25 @@ let hello = || print("hello")
 end
 ```
 
-`do |params| … end` passe un bloc en dernier argument à l'appel qui le précède.
+`do |params| … end` passes a block as the last argument of the call before it.
 
-## Contrôle
+## Control flow
 
 ```ruby
 let level = if age >= 18
-  "adulte"
+  "adult"
 elsif age >= 12
-  "ado"
+  "teen"
 else
-  "enfant"
+  "child"
 end
 
-let short = if ok then "oui" else "non" end
+let short = if ok then "yes" else "no" end
 
 let kind = case port
   when 80, 443 then "web"
   when 8000..8999 then "dev"
-  else "autre"
+  else "other"
 end
 
 while age < 50
@@ -269,14 +268,14 @@ for t in tags
   print(t)
 end
 
-for i in 0..10                # 0..10 inclusif, 0...10 exclusif
+for i in 0..10                # 0..10 inclusive, 0...10 exclusive
   next if i % 2 == 0
   break if i > 7
   print(i)
 end
 ```
 
-Modificateurs en fin de ligne : `expr if cond`, `expr unless cond`.
+End-of-line modifiers: `expr if cond`, `expr unless cond`.
 
 ## Enum
 
@@ -295,27 +294,27 @@ end
 let p = Protocol::Tcp
 p.value                       # "TCP"
 p.name                        # "Tcp"
-Color::Green.value            # 1 (sans valeur : l'index ; pour un enum `: str`, le nom)
+Color::Green.value            # 1 (without a value: the index; for a `: str` enum, the name)
 
 Protocol.values()             # [Protocol::Tcp, Protocol::Udp]
-Protocol.from("UDP")          # Protocol::Udp (nil si aucune variante n'a cette valeur)
+Protocol.from("UDP")          # Protocol::Udp (nil if no variant has that value)
 
 enum Level: int
   Low = 1
   High = 10
 
-  def is_high: bool = self == Level::High   # méthode, `self` = la variante
+  def is_high: bool = self == Level::High   # method, `self` = the variant
 end
 ```
 
-## Type (données)
+## Type (data)
 
-Les déclarations `type`, `class`, `annotation` et `enum` se font au niveau principal du
-script (pas dans une fonction ou un bloc). Elles sont visibles dans tout le script, même
-avant leur déclaration.
+`type`, `class`, `annotation` and `enum` declarations are made at the top level of the
+script (not inside a function or a block). They are visible in the whole script, even
+before their declaration.
 
-Un `type` décrit une structure de données : des champs, avec types et valeurs par défaut.
-Un champ par défaut peut dépendre des champs précédents.
+A `type` describes a data structure: fields, with types and default values. A field's
+default may depend on the previous fields.
 
 ```ruby
 type Route
@@ -333,25 +332,25 @@ type Server
 end
 ```
 
-Un champ sans valeur par défaut (`path: str`) est obligatoire à la construction.
+A field without a default value (`path: str`) is required at construction.
 
 ### Construction
 
-Forme courte, avec des arguments nommés :
+Short form, with named arguments:
 
 ```ruby
 let r = Route(path: "/health")
 ```
 
-Forme bloc, pour la configuration :
+Block form, for configuration:
 
 ```ruby
 let env = "prod"
 
 let s = Server do
-  let base = 8000             # variable locale au bloc
-  host = "api.example.com"    # remplit le champ "host"
-  mode = env                  # lit une variable extérieure
+  let base = 8000             # variable local to the block
+  host = "api.example.com"    # fills the "host" field
+  mode = env                  # reads an outer variable
   port = if mode == "prod" then 443 else base + 80 end
   debug = mode == "dev"
 
@@ -364,30 +363,30 @@ let s = Server do
     routes << Route(path: p)
   end
 
-  prot = 443                  # erreur : Server n'a pas de champ "prot"
+  prot = 443                  # error: Server has no field "prot"
 end
 ```
 
-Règles dans un bloc de construction :
+Rules in a construction block:
 
-- `champ = valeur` remplit un champ du type.
-- `let x = …` déclare une variable locale au bloc.
-- Un nom non déclaré qui n'est pas un champ est une erreur.
-- Un champ lu dans le bloc (`routes << …`) reçoit d'abord sa valeur par défaut.
-- Les champs jamais touchés prennent leur valeur par défaut **après** le bloc : elle voit
-  les champs remplis par le bloc (`protocol = Protocol::Udp` donne `port = 40`).
-- Une dépendance circulaire entre valeurs par défaut est une erreur.
+- `field = value` fills a field of the type.
+- `let x = …` declares a variable local to the block.
+- An undeclared name that is not a field is an error.
+- A field read in the block (`routes << …`) first receives its default value.
+- Fields never touched take their default value **after** the block: it sees the fields
+  filled by the block (`protocol = Protocol::Udp` gives `port = 40`).
+- A circular dependency between default values is an error.
 
-Les champs d'un `type` sont publics (`s.port`, `s.port = 8080`, avec vérification du type).
-Deux valeurs d'un même `type` sont égales si tous leurs champs le sont.
+The fields of a `type` are public (`s.port`, `s.port = 8080`, with type checking). Two
+values of the same `type` are equal if all their fields are.
 
-## Classe (objets)
+## Class (objects)
 
-Une `class` porte un état et des méthodes. `@champ` désigne un attribut de l'instance.
+A `class` carries state and methods. `@field` denotes an attribute of the instance.
 
 ```ruby
 class User
-  # @name et @email sont déclarés et assignés directement par le constructeur
+  # @name and @email are declared and assigned directly by the constructor
   def init(@name: str, @email: str? = nil)
   end
 
@@ -401,34 +400,34 @@ class User
 end
 
 let u = User("vincent")
-u.name = "bob"                           # appelle name=
+u.name = "bob"                           # calls name=
 print(u.name)
 ```
 
-- `init` est le seul constructeur ; un paramètre `@x` déclare et assigne le champ.
-- Les champs sont privés : lus et modifiés par `@x` dans les méthodes ; de l'extérieur,
-  uniquement par un getter (`def name`) ou un setter (`def name=(v)`).
-- Un champ peut aussi être déclaré dans le corps, avec une valeur par défaut
-  (`count = 0`) ; tout champ doit être initialisé à la fin de `init`.
-- `self` désigne l'instance. `to_s` est utilisé par `print` et l'interpolation.
-- Deux instances ne sont égales que si c'est le même objet.
-- Pas de destructeur.
+- `init` is the only constructor; an `@x` parameter declares and assigns the field.
+- Fields are private: read and modified through `@x` in methods; from outside, only
+  through a getter (`def name`) or a setter (`def name=(v)`).
+- A field may also be declared in the body, with a default value (`count = 0`); every
+  field must be initialized by the end of `init`.
+- `self` denotes the instance. `to_s` is used by `print` and interpolation.
+- Two instances are equal only if they are the same object.
+- No destructor.
 
-## Commentaires
+## Comments
 
 ```ruby
-# commentaire sur une ligne
+# single-line comment
 ```
 
 ## Annotations
 
-> Inspiré de [Crystal](https://crystal-lang.org/reference/1.22/syntax_and_semantics/annotations/index.html).
+> Inspired by [Crystal](https://crystal-lang.org/reference/1.22/syntax_and_semantics/annotations/index.html).
 
-Une annotation attache des métadonnées à une déclaration. Elle ne change rien à l'exécution par elle-même : elle est lue par le code Rust hôte (et, plus tard, par les macros).
+An annotation attaches metadata to a declaration. By itself it changes nothing at run time: it is read by the host Rust code (and, later, by macros).
 
-### Déclaration
+### Declaration
 
-Une annotation se déclare comme un `type` : ses arguments sont donc typés et vérifiés.
+An annotation is declared like a `type`: its arguments are therefore typed and checked.
 
 ```ruby
 annotation Validate
@@ -441,13 +440,13 @@ annotation Column
   primary: bool = false
 end
 
-annotation Tag                # sans argument
+annotation Tag                # no argument
 end
 ```
 
 ### Application
 
-`@[Nom]` ou `@[Nom(args)]`, placé avant la déclaration. Aucun conflit avec `@champ` : `@[` est un jeton distinct.
+`@[Name]` or `@[Name(args)]`, placed before the declaration. No conflict with `@field`: `@[` is a distinct token.
 
 ```ruby
 @[Tag]
@@ -456,11 +455,11 @@ type Server
   port: int = 80
 
   @[Column(name: "host_name")]
-  @[Deprecated("utiliser address")]
+  @[Deprecated("use address")]
   host: str = "localhost"
 end
 
-@[Deprecated("utiliser add")]
+@[Deprecated("use add")]
 def plus(a: int, b: int): int = a + b
 
 def connect(@[Validate(min: 0)] timeout: int)
@@ -473,18 +472,17 @@ enum Protocol: str
 end
 ```
 
-- Cibles : `type`, `class`, `enum`, variante d'enum, champ, méthode, fonction, paramètre.
-- Arguments nommés (`min: 1`) ou positionnels dans l'ordre des champs (`Validate(1, 65535)`).
-- Plusieurs annotations, y compris du même type, sur une même cible.
-- Les arguments sont vérifiés avant l'exécution, comme une construction : annotation
-  inconnue, champ inexistant, type d'argument, champ obligatoire manquant.
-- Ils sont évalués **à la lecture** (depuis Rust), pas à la déclaration ; ce sont des
-  constantes : ils peuvent utiliser des globales (`@[Limit(MAX + 2)]`), pas des variables
-  locales.
+- Targets: `type`, `class`, `enum`, enum variant, field, method, function, parameter.
+- Named arguments (`min: 1`) or positional ones in field order (`Validate(1, 65535)`).
+- Several annotations, including of the same type, on the same target.
+- Arguments are checked before running, like a construction: unknown annotation,
+  nonexistent field, argument type, missing required field.
+- They are evaluated **when read** (from Rust), not at declaration; they are constants:
+  they may use globals (`@[Limit(MAX + 2)]`), not local variables.
 
-### Lecture
+### Reading
 
-Dans une macro (prévu : version 3) :
+In a macro (planned: version 3):
 
 ```ruby
 macro validate_fields
@@ -502,61 +500,60 @@ macro validate_fields
 end
 ```
 
-- `x.annotation(A)` : la dernière annotation `A` (ou `nil`).
-- `x.annotations(A)` / `x.annotations()` : toutes les annotations `A` / toutes.
-- Les arguments se lisent comme des champs : `v.min`, `v.max`.
+- `x.annotation(A)`: the last `A` annotation (or `nil`).
+- `x.annotations(A)` / `x.annotations()`: all `A` annotations / all of them.
+- Arguments are read like fields: `v.min`, `v.max`.
 
-Depuis Rust :
+From Rust:
 
 ```rust
-let ty = engine.type_info("Server")?;          // aussi : function_info, enum_info
+let ty = engine.type_info("Server")?;          // also: function_info, enum_info
 for field in ty.fields() {
     if let Some(v) = field.annotation("Validate") {
         let min: Option<i64> = v.get("min")?;
     }
 }
-let doc = ty.doc();                              // texte de @[Doc("…")]
-let obsolete = ty.field("host").unwrap().deprecated(); // Some(Some("utiliser address"))
+let doc = ty.doc();                              // text of @[Doc("…")]
+let deprecated = ty.field("host").unwrap().deprecated(); // Some(Some("use address"))
 ```
 
-`type_info`, `function_info` et `enum_info` renvoient une description (champs avec leur
-type, méthodes, paramètres, variantes avec leur valeur) qui ne dépend plus du moteur. Sur
-chaque élément : `annotation(nom)` (la dernière), `annotations(nom)`, `all_annotations()`,
-`doc()`, `deprecated()` ; sur une annotation : `name()`, `fields()`, `get::<T>(champ)`.
+`type_info`, `function_info` and `enum_info` return a description (fields with their type,
+methods, parameters, variants with their value) that no longer depends on the engine. On
+each element: `annotation(name)` (the last one), `annotations(name)`, `all_annotations()`,
+`doc()`, `deprecated()`; on an annotation: `name()`, `fields()`, `get::<T>(field)`.
 
-### Annotations intégrées
+### Built-in annotations
 
-| Annotation             | Effet                                                   |
+| Annotation             | Effect                                                  |
 |------------------------|---------------------------------------------------------|
-| `@[Deprecated(msg?)]`  | avertissement à chaque utilisation                      |
-| `@[Doc("…")]`          | documentation (alternative aux commentaires)            |
+| `@[Deprecated(msg?)]`  | warning on every use                                    |
+| `@[Doc("…")]`          | documentation (alternative to comments)                 |
 
-Elles sont déclarées par le moteur comme des annotations ordinaires
+They are declared by the engine as ordinary annotations
 (`Deprecated(message: str? = nil)`, `Doc(text: str)`).
 
-L'avertissement de `Deprecated` est émis par la vérification, avant l'exécution, à chaque
-utilisation : appel ou mention d'une fonction, d'un type, d'un enum, d'une variante
-(`Protocol::Ftp`), lecture ou passage par nom d'un champ, appel d'une méthode, argument
-passé à un paramètre obsolète — y compris
-depuis un script suivant. Depuis Rust : `engine.take_warnings()` ou
-`engine.set_warning_handler(…)` ; l'exécutable les affiche sur la sortie d'erreur.
+The `Deprecated` warning is emitted by the checker, before running, on every use: call or
+mention of a function, a type, an enum, a variant (`Protocol::Ftp`), read of a field or
+passing it by name, method call, argument passed to a deprecated parameter — including
+from a later script. From Rust: `engine.take_warnings()` or
+`engine.set_warning_handler(…)`; the command line prints them on standard error.
 
 ```text
-avertissement: `plus` est obsolète : utiliser add
+warning: `plus` is deprecated: use add
  --> script.bk:17:7
    |
 17 | print(plus(1, 2))
    |       ^^^^
 ```
 
-## Macros (prévu : version 3)
+## Macros (planned: version 3)
 
-> Inspiré de [Crystal](https://crystal-lang.org/reference/1.22/syntax_and_semantics/macros/index.html).
+> Inspired by [Crystal](https://crystal-lang.org/reference/1.22/syntax_and_semantics/macros/index.html).
 
-Une macro s'exécute **à la compilation** : elle reçoit des nœuds de l'AST (pas des valeurs) et génère du code qui est inséré à sa place.
+A macro runs **at compile time**: it receives AST nodes (not values) and generates code that is inserted in its place.
 
-- `{{ expr }}` : insère un nœud / une valeur dans le code généré.
-- `{% … %}` : logique exécutée à la compilation (`if`, `for`, `let`).
+- `{{ expr }}`: inserts a node / a value into the generated code.
+- `{% … %}`: logic run at compile time (`if`, `for`, `let`).
 
 ```ruby
 macro getters(*names)
@@ -569,7 +566,7 @@ class User
   def init(@name: str, @email: str)
   end
 
-  getters(name, email)        # génère : def name = @name / def email = @email
+  getters(name, email)        # generates: def name = @name / def email = @email
 end
 ```
 
@@ -590,37 +587,37 @@ end
 Point(x: 1).to_s()            # "Point(x=1, y=0)"
 ```
 
-### Contexte disponible dans une macro
+### Context available in a macro
 
-| Variable     | Contenu                                               |
+| Variable     | Content                                               |
 |--------------|-------------------------------------------------------|
-| `@type`      | le type courant : `name`, `fields`, `methods`, `annotation(…)` |
-| `@def`       | la méthode courante : `name`, `params`, `return_type`, `annotation(…)` |
-| `name.id`    | un nœud converti en identifiant                       |
-| `node.stringify` | le code source d'un nœud, en `str`               |
+| `@type`      | the current type: `name`, `fields`, `methods`, `annotation(…)` |
+| `@def`       | the current method: `name`, `params`, `return_type`, `annotation(…)` |
+| `name.id`    | a node converted to an identifier                     |
+| `node.stringify` | the source code of a node, as a `str`             |
 
-### Règles
+### Rules
 
-- Le code généré doit être valide à lui seul (pas de `when` isolé hors d'un `case`).
-- Hygiène : les variables déclarées par `let` dans le code généré ne fuient pas chez l'appelant (renommage automatique).
-- Les erreurs pointent à la fois vers l'appel de la macro et vers la ligne générée fautive.
-- Une macro est visible dans le fichier / le type où elle est définie, et dans ses descendants.
+- The generated code must be valid on its own (no lone `when` outside a `case`).
+- Hygiene: variables declared with `let` in the generated code do not leak into the caller (automatic renaming).
+- Errors point both to the macro call and to the faulty generated line.
+- A macro is visible in the file / type where it is defined, and in its descendants.
 
-### Prérequis dès la version 1
+### Prerequisites from version 1
 
-- AST complet avec positions source (fichier, ligne, colonne) sur chaque nœud.
-- AST sérialisable et affichable en code source (`stringify`).
-- Le parseur accepte et conserve `@[…]` (fait : les annotations sont lues depuis Rust).
+- Complete AST with source positions (file, line, column) on every node.
+- AST that can be serialized and printed back as source code (`stringify`).
+- The parser accepts and keeps `@[…]` (done: annotations are read from Rust).
 
-## Mots réservés
+## Reserved words
 
 `let def end if elsif else unless then case when while for in do break next return
 type class enum annotation macro true false nil and or not`
 
-## Points encore ouverts
+## Open questions
 
-- Héritage / interfaces pour `class` (et `type` ?).
-- Modules / import entre fichiers.
-- Gestion des erreurs (`raise` / `rescue` ou `Result`).
-- Méthodes sur `type` (autorisées, ou réservées à `class`).
-- Généricité (`[T]`, `fn<T>`).
+- Inheritance / interfaces for `class` (and `type`?).
+- Modules / imports between files.
+- Error handling (`raise` / `rescue` or `Result`).
+- Methods on `type` (allowed, or reserved for `class`).
+- Generics (`[T]`, `fn<T>`).

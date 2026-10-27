@@ -1,26 +1,26 @@
-//! Parseur écrit à la main : descente récursive, et Pratt pour les opérateurs.
+//! Hand-written parser: recursive descent, and Pratt parsing for operators.
 //!
-//! - Les jetons sont lus à la demande (un seul jeton d'avance), jamais de retour en
-//!   arrière : chaque jeton est lu une fois.
-//! - Les expressions sont ajoutées à l'[`Ast`] compact ; les listes (arguments,
-//!   éléments…) sont accumulées sur des piles temporaires réutilisées, puis copiées d'un
-//!   bloc dans les réserves de l'AST : aucune allocation par liste.
+//! - Tokens are read on demand (a single token of lookahead), never backtracking: each
+//!   token is read once.
+//! - Expressions are appended to the compact [`Ast`]; lists (arguments, elements…) are
+//!   accumulated on reused temporary stacks, then copied in one go into the AST pools:
+//!   no allocation per list.
 //!
-//! Précédence (de la plus faible à la plus forte) :
+//! Precedence (from lowest to highest):
 //!
-//! | niveau | opérateurs                     | associativité |
-//! |--------|--------------------------------|---------------|
-//! | 1      | `=` `+=` `-=` …                | droite        |
-//! | 2      | `or`                           | gauche        |
-//! | 3      | `and`                          | gauche        |
-//! | 4      | `not` (préfixe)                |               |
-//! | 5      | `==` `!=` `<` `<=` `>` `>=`    | aucune        |
-//! | 6      | `..` `...`                     | aucune        |
-//! | 7      | `<<`                           | gauche        |
-//! | 8      | `+` `-`                        | gauche        |
-//! | 9      | `*` `/` `%`                    | gauche        |
-//! | 10     | `-` (préfixe)                  |               |
-//! | 11     | `f()` `x.y` `x[i]` `A::B` `do` | gauche        |
+//! | level | operators                      | associativity |
+//! |-------|--------------------------------|---------------|
+//! | 1     | `=` `+=` `-=` …                | right         |
+//! | 2     | `or`                           | left          |
+//! | 3     | `and`                          | left          |
+//! | 4     | `not` (prefix)                 |               |
+//! | 5     | `==` `!=` `<` `<=` `>` `>=`    | none          |
+//! | 6     | `..` `...`                     | none          |
+//! | 7     | `<<`                           | left          |
+//! | 8     | `+` `-`                        | left          |
+//! | 9     | `*` `/` `%`                    | left          |
+//! | 10    | `-` (prefix)                   |               |
+//! | 11    | `f()` `x.y` `x[i]` `A::B` `do` | left          |
 
 use crate::ast::*;
 use crate::diagnostic::{Error, Errors, Result};
@@ -30,20 +30,20 @@ use crate::span::{Span, line_col};
 
 use TokenKind as T;
 
-/// Profondeur maximale d'imbrication.
+/// Maximum nesting depth.
 const MAX_DEPTH: u32 = 1000;
 
-/// Si la pile restante descend sous `RED_ZONE`, la récursion continue sur une nouvelle
-/// pile de `STACK_GROW` allouée sur le tas : aucune imbrication ne peut faire déborder
-/// la pile du thread appelant.
+/// When the remaining stack drops below `RED_ZONE`, recursion continues on a new
+/// heap-allocated stack of `STACK_GROW`: no nesting can overflow the calling thread's
+/// stack.
 const RED_ZONE: usize = 128 * 1024;
 const STACK_GROW: usize = 2 * 1024 * 1024;
 
-/// Nombre maximal d'erreurs signalées en une passe.
+/// Maximum number of errors reported in one pass.
 const MAX_ERRORS: usize = 50;
 
-/// Analyse un programme. En cas d'erreur, l'analyse reprend à l'instruction suivante :
-/// toutes les erreurs du fichier sont renvoyées, triées par position.
+/// Parses a program. On error, parsing resumes at the next statement: all the errors in
+/// the file are returned, sorted by position.
 pub fn parse(src: &str, interner: &mut Interner) -> std::result::Result<Program, Errors> {
     let mut lexer = Lexer::new(src);
     let cur = lexer.next_token();
@@ -65,11 +65,11 @@ pub fn parse(src: &str, interner: &mut Interner) -> std::result::Result<Program,
         errors: Vec::new(),
         abort: false,
     };
-    // En cas d'abandon (`Err`), l'erreur est déjà dans `p.errors`.
+    // When parsing is aborted (`Err`), the error is already in `p.errors`.
     let body = p.block(&[]).ok();
     let mut errors = std::mem::take(&mut p.errors);
-    // Une erreur du parseur qui suit, sur la même ligne, une erreur du lexer en est la
-    // conséquence (le caractère fautif a été sauté) : elle n'est pas affichée.
+    // A parser error that follows a lexer error on the same line is a consequence of it
+    // (the offending character was skipped): it is not shown.
     let lexer_errors = std::mem::take(&mut p.lexer.errors);
     let line_of = |e: &Error| e.span.map(|s| line_col(src, s.start).0);
     errors.retain(|e| {
@@ -78,8 +78,8 @@ pub fn parse(src: &str, interner: &mut Interner) -> std::result::Result<Program,
             .any(|l| line_of(l) == line_of(e) && l.span.map(|s| s.start) < e.span.map(|s| s.start))
     });
     errors.extend(lexer_errors);
-    // Après une erreur fatale du lexer (chaîne non fermée…), le parseur n'a vu qu'un `Eof` :
-    // ses erreurs situées plus loin n'ont pas de sens.
+    // After a fatal lexer error (unclosed string…), the parser only saw an `Eof`: its
+    // errors located further on are meaningless.
     if let Some(fatal) = p.lexer.error.take() {
         let at = fatal.span.map_or(0, |s| s.start);
         errors.retain(|e| !e.incomplete && e.span.is_some_and(|s| s.start < at));
@@ -93,39 +93,39 @@ pub fn parse(src: &str, interner: &mut Interner) -> std::result::Result<Program,
 
 struct Parser<'s, 'i> {
     src: &'s str,
-    /// Jetons lus à la demande : seuls le jeton courant et un jeton d'avance existent.
+    /// Tokens read on demand: only the current token and one lookahead token exist.
     lexer: Lexer<'s>,
     cur: Token,
     ahead: Option<Token>,
-    /// Fin du dernier jeton consommé.
+    /// End of the last consumed token.
     prev_end: u32,
     interner: &'i mut Interner,
     ast: Ast,
-    // Piles temporaires pour les listes en cours de construction (imbrication : chaque
-    // liste note la hauteur de départ et ne retire que ses propres éléments).
+    // Temporary stacks for lists under construction (nesting: each list records its
+    // starting height and only removes its own elements).
     s_exprs: Vec<ExprId>,
     s_args: Vec<Arg>,
     s_fields: Vec<(Symbol, ExprId)>,
     s_entries: Vec<(ExprId, ExprId)>,
     s_parts: Vec<StrPart>,
     depth: u32,
-    /// Dans l'en-tête d'un `while` / `for`, un `do` ne s'attache pas à l'expression.
+    /// In a `while` / `for` header, a `do` does not attach to the expression.
     no_do: bool,
-    /// Erreurs signalées ; l'analyse continue après chacune.
+    /// Reported errors; parsing goes on after each one.
     errors: Vec<Error>,
-    /// Arrêt de l'analyse (fin de source prématurée, trop d'erreurs).
+    /// Parsing stopped (premature end of source, too many errors).
     abort: bool,
 }
 
-/// État à restaurer quand une instruction échoue.
+/// State to restore when a statement fails.
 struct Snapshot {
     depth: u32,
     no_do: bool,
     lens: [usize; 5],
 }
 
-/// Suit les constructions ouvertes (`if`, `def`, `do`… jusqu'à leur `end`) dans une suite
-/// de jetons : sert à sauter proprement une instruction erronée.
+/// Tracks open constructs (`if`, `def`, `do`… up to their `end`) in a token stream: used
+/// to cleanly skip an erroneous statement.
 #[derive(Default)]
 struct Tracker {
     stack: Vec<Frame>,
@@ -135,14 +135,14 @@ struct Tracker {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Frame {
-    /// Construction fermée par `end`.
+    /// Construct closed by `end`.
     Block,
-    /// Signature d'un `def` : devient `Block`, ou `Endless` (`def f = …`, sans `end`).
+    /// Signature of a `def`: becomes `Block`, or `Endless` (`def f = …`, without `end`).
     DefSig {
         name_end: Option<u32>,
         brackets: i32,
     },
-    /// `def f = …` : se termine à la fin de ligne.
+    /// `def f = …`: ends at the line end.
     Endless { brackets: i32 },
 }
 
@@ -151,8 +151,8 @@ impl Tracker {
         self.stack.len()
     }
 
-    /// `if` / `unless` / `while` ouvrent une construction, sauf en modificateur
-    /// (`x = 0 if c`), c'est-à-dire après un jeton qui termine une expression.
+    /// `if` / `unless` / `while` open a construct, except as modifiers (`x = 0 if c`),
+    /// that is after a token that ends an expression.
     fn opens(&self, kind: TokenKind) -> bool {
         match kind {
             T::Def
@@ -209,8 +209,8 @@ impl Tracker {
                 }
                 _ => {}
             },
-            // `=` dans la signature d'un `def` : corps sur une ligne, pas de `end`
-            // (sauf le `=` collé au nom d'un setter, `def nom=(v)`).
+            // `=` in a `def` signature: one-line body, no `end` (except the `=` attached
+            // to a setter name, `def name=(v)`).
             T::Eq => {
                 if let Some(Frame::DefSig { name_end, brackets }) = top
                     && brackets == self.brackets
@@ -226,7 +226,7 @@ impl Tracker {
             k if self.opens(k) => self.stack.push(Frame::Block),
             _ => {}
         }
-        // Nom du `def` : le jeton qui suit `def`.
+        // Name of the `def`: the token after `def`.
         if self.prev.is_some_and(|p| p.kind == T::Def)
             && let Some(Frame::DefSig { name_end, .. }) = self.stack.last_mut()
         {
@@ -242,7 +242,7 @@ enum Infix {
     Range(bool),
 }
 
-/// Puissance de liaison des opérateurs binaires : (gauche, droite).
+/// Binding power of binary operators: (left, right).
 #[inline]
 fn infix_bp(kind: TokenKind) -> Option<(u8, u8, Infix)> {
     use Infix::*;
@@ -287,7 +287,7 @@ fn is_comparison(kind: TokenKind) -> bool {
     matches!(kind, T::EqEq | T::NotEq | T::Lt | T::Le | T::Gt | T::Ge)
 }
 
-/// Jetons qui ne peuvent pas commencer une expression : `return` sans valeur avant eux.
+/// Tokens that cannot start an expression: `return` without a value before them.
 fn ends_expr(kind: TokenKind) -> bool {
     matches!(
         kind,
@@ -309,7 +309,7 @@ fn ends_expr(kind: TokenKind) -> bool {
     )
 }
 
-/// Mots-clés acceptés comme nom de méthode ou de champ après `.` (`x.type`, `x.class`).
+/// Keywords accepted as method or field names after `.` (`x.type`, `x.class`).
 fn is_keyword(kind: TokenKind) -> bool {
     matches!(
         kind,
@@ -345,7 +345,7 @@ fn is_keyword(kind: TokenKind) -> bool {
     )
 }
 
-/// Bloc d'une seule instruction-expression.
+/// Block made of a single expression statement.
 fn expr_block(e: ExprId, span: Span) -> Block {
     Block {
         span,
@@ -357,14 +357,14 @@ fn expr_block(e: ExprId, span: Span) -> Block {
 }
 
 impl Parser<'_, '_> {
-    // ─── Jetons ──────────────────────────────────────────────────────────────
+    // ─── Tokens ──────────────────────────────────────────────────────────────
 
     #[inline]
     fn peek(&self) -> TokenKind {
         self.cur.kind
     }
 
-    /// Type du jeton qui suit le jeton courant.
+    /// Kind of the token after the current one.
     #[inline]
     fn peek2(&mut self) -> TokenKind {
         match self.ahead {
@@ -391,7 +391,7 @@ impl Parser<'_, '_> {
     fn bump(&mut self) -> Token {
         let t = self.cur;
         if t.kind != T::Eof {
-            // Les fins de ligne ne comptent pas : `prev_end` reste sur le dernier jeton utile.
+            // Line ends do not count: `prev_end` stays on the last meaningful token.
             if !matches!(t.kind, T::Newline | T::Semi) {
                 self.prev_end = t.span.end;
             }
@@ -434,7 +434,7 @@ impl Parser<'_, '_> {
         }
     }
 
-    // ─── Erreurs ─────────────────────────────────────────────────────────────
+    // ─── Errors ──────────────────────────────────────────────────────────────
 
     fn found(&self) -> String {
         let t = self.tok();
@@ -449,8 +449,8 @@ impl Parser<'_, '_> {
     }
 
     fn error_here<R>(&self, msg: impl Into<String>) -> Result<R> {
-        // En fin de source, l'erreur est placée juste après le dernier jeton lu
-        // (là où il manque quelque chose) plutôt que sur la dernière ligne, souvent vide.
+        // At the end of the source, the error is placed right after the last token read
+        // (where something is missing) rather than on the last line, often empty.
         let span = if self.at(T::Eof) {
             Span::new(self.prev_end, self.prev_end)
         } else {
@@ -461,26 +461,26 @@ impl Parser<'_, '_> {
         Err(e)
     }
 
-    /// Consomme un jeton du type attendu, ou produit « X attendu `contexte`, trouvé Y ».
+    /// Consumes a token of the expected kind, or produces "expected X `context`, found Y".
     fn expect(&mut self, kind: TokenKind, context: &str) -> Result<Token> {
         if self.at(kind) {
             return Ok(self.bump());
         }
         let sep = if context.is_empty() { "" } else { " " };
         self.error_here(format!(
-            "{} attendu{sep}{context}, trouvé {}",
+            "expected {}{sep}{context}, found {}",
             kind.describe(),
             self.found()
         ))
     }
 
-    /// Le jeton courant est sur une autre ligne que le précédent alors qu'une expression
-    /// était attendue : la ligne précédente se termine par un opérateur (ou `,`, `(`…).
+    /// The current token is on another line than the previous one while an expression
+    /// was expected: the previous line ends with an operator (or `,`, `(`…).
     fn continuation_hint(&self) -> &'static str {
         let gap = &self.src[(self.prev_end as usize).min(self.cur.span.start as usize)
             ..self.cur.span.start as usize];
         if self.prev_end > 0 && gap.contains('\n') {
-            " (la ligne précédente se termine par un opérateur : l'expression continue sur cette ligne)"
+            " (the previous line ends with an operator: the expression continues on this line)"
         } else {
             ""
         }
@@ -489,15 +489,15 @@ impl Parser<'_, '_> {
     fn unclosed<R>(&self, opener: &str, opener_span: Span) -> Result<R> {
         let (line, _) = line_col(self.src, opener_span.start);
         self.error_here(format!(
-            "`end` attendu pour fermer `{opener}` (ligne {line}), trouvé {}",
+            "expected `end` to close `{opener}` (line {line}), found {}",
             self.found()
         ))
     }
 
-    // ─── Reprise après erreur ────────────────────────────────────────────────
+    // ─── Error recovery ──────────────────────────────────────────────────────
 
-    /// Range une erreur. Renvoie `Err` (et arrête l'analyse) si elle vient d'une fin de
-    /// source prématurée ou s'il y en a trop.
+    /// Records an error. Returns `Err` (and stops parsing) if it comes from a premature
+    /// end of source or if there are too many.
     fn report(&mut self, e: Error) -> Result<()> {
         if e.incomplete || self.errors.len() + 1 >= MAX_ERRORS {
             self.abort = true;
@@ -508,9 +508,9 @@ impl Parser<'_, '_> {
         Ok(())
     }
 
-    /// Analyse un élément (instruction, membre…) avec `f`. En cas d'erreur, la signale et
-    /// saute jusqu'à la fin de l'élément : `Ok(None)`, l'analyse continue. `Err` seulement
-    /// si l'analyse doit s'arrêter (fin de source prématurée, trop d'erreurs).
+    /// Parses an item (statement, member…) with `f`. On error, reports it and skips to the
+    /// end of the item: `Ok(None)`, parsing goes on. `Err` only when parsing must stop
+    /// (premature end of source, too many errors).
     fn recovering<V>(
         &mut self,
         terminators: &[TokenKind],
@@ -525,7 +525,7 @@ impl Parser<'_, '_> {
                 if !matches!(k, T::Newline | T::Semi | T::Eof) && !terminators.contains(&k) {
                     let e = Error::syntax(
                         format!(
-                            "fin de ligne attendue après {what}, trouvé {}",
+                            "expected a line end after {what}, found {}",
                             self.found()
                         ),
                         self.tok().span,
@@ -571,11 +571,11 @@ impl Parser<'_, '_> {
         self.s_parts.truncate(s.lens[4]);
     }
 
-    /// Saute la fin d'une instruction erronée commencée à `stmt_start` : jusqu'à la fin
-    /// de ligne, ou jusqu'au `end` des constructions qu'elle a ouvertes, ou jusqu'à un
-    /// terminateur du bloc courant (`end`, `else`…).
+    /// Skips the rest of an erroneous statement started at `stmt_start`: up to the line
+    /// end, or up to the `end` of the constructs it opened, or up to a terminator of the
+    /// current block (`end`, `else`…).
     fn recover(&mut self, stmt_start: u32, terminators: &[TokenKind]) {
-        // Constructions ouvertes dans la partie déjà lue : on la relit.
+        // Constructs opened in the part already read: lex it again.
         let mut tracker = Tracker::default();
         let consumed =
             &self.src[stmt_start as usize..(self.cur.span.start as usize).max(stmt_start as usize)];
@@ -587,7 +587,7 @@ impl Parser<'_, '_> {
             }
             tracker.feed(t);
         }
-        // Une parenthèse restée ouverte dans la partie cassée ne doit pas tout avaler.
+        // A parenthesis left open in the broken part must not swallow everything.
         tracker.brackets = 0;
         for f in &mut tracker.stack {
             match f {
@@ -612,7 +612,7 @@ impl Parser<'_, '_> {
             let before = tracker.depth();
             tracker.feed(t);
             self.bump();
-            // Une construction sur une ligne (`def f = …`) vient de se fermer.
+            // A one-line construct (`def f = …`) has just closed.
             if before > 0 && tracker.depth() == 0 && matches!(t.kind, T::Newline | T::Semi) {
                 return;
             }
@@ -622,12 +622,12 @@ impl Parser<'_, '_> {
     fn enter(&mut self) -> Result<()> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
-            return self.error_here("imbrication trop profonde");
+            return self.error_here("nesting too deep");
         }
         Ok(())
     }
 
-    // ─── Noms ────────────────────────────────────────────────────────────────
+    // ─── Names ───────────────────────────────────────────────────────────────
 
     #[inline]
     fn intern(&mut self, span: Span) -> Symbol {
@@ -640,9 +640,9 @@ impl Parser<'_, '_> {
         Ok((self.intern(t.span), t.span))
     }
 
-    // ─── Blocs et instructions ───────────────────────────────────────────────
+    // ─── Blocks and statements ───────────────────────────────────────────────
 
-    /// Suite d'instructions jusqu'à l'un des `terminators` (non consommé) ou la fin.
+    /// Sequence of statements up to one of the `terminators` (not consumed) or the end.
     fn block(&mut self, terminators: &[TokenKind]) -> Result<Block> {
         stacker::maybe_grow(RED_ZONE, STACK_GROW, || self.block_inner(terminators))
     }
@@ -657,7 +657,7 @@ impl Parser<'_, '_> {
             if k == T::Eof || terminators.contains(&k) {
                 break;
             }
-            if let Some(stmt) = self.recovering(terminators, "l'instruction", Self::stmt)? {
+            if let Some(stmt) = self.recovering(terminators, "the statement", Self::stmt)? {
                 stmts.push(stmt);
             }
         }
@@ -669,7 +669,7 @@ impl Parser<'_, '_> {
         Ok(Block { stmts, span })
     }
 
-    /// Bloc terminé par `end` (consommé).
+    /// Block ended by `end` (consumed).
     fn block_end(&mut self, opener: &str, opener_span: Span) -> Result<Block> {
         let body = self.block(&[T::End])?;
         self.end(opener, opener_span)?;
@@ -699,11 +699,11 @@ impl Parser<'_, '_> {
             T::Enum => StmtKind::Enum(Box::new(self.enum_decl(annotations)?)),
             T::Macro => {
                 return self
-                    .error_here("les macros ne sont pas encore supportées (prévu : version 3)");
+                    .error_here("macros are not supported yet (planned: version 3)");
             }
             _ if !annotations.is_empty() => {
                 return self.error_here(format!(
-                    "une annotation doit précéder une déclaration (`def`, `type`, `class`, `enum`, champ), trouvé {}",
+                    "an annotation must precede a declaration (`def`, `type`, `class`, `enum`, field), found {}",
                     self.found()
                 ));
             }
@@ -716,7 +716,7 @@ impl Parser<'_, '_> {
         })
     }
 
-    /// Expression suivie d'éventuels modificateurs : `expr if cond`, `expr unless cond`.
+    /// Expression followed by optional modifiers: `expr if cond`, `expr unless cond`.
     fn expr_stmt(&mut self) -> Result<ExprId> {
         let mut e = self.expr()?;
         while matches!(self.peek(), T::If | T::Unless) {
@@ -746,7 +746,7 @@ impl Parser<'_, '_> {
         } else {
             None
         };
-        self.expect(T::Eq, "après la déclaration `let`")?;
+        self.expect(T::Eq, "after the `let` declaration")?;
         let value = self.expr()?;
         Ok(Let { pattern, ty, value })
     }
@@ -767,19 +767,19 @@ impl Parser<'_, '_> {
                         break;
                     }
                 }
-                self.expect(T::RParen, "pour fermer le motif")?;
+                self.expect(T::RParen, "to close the pattern")?;
                 Ok(Pattern::Tuple(items, self.span_from(start)))
             }
             T::LBrace => {
                 self.bump();
                 let mut names = Vec::new();
                 while !self.at(T::RBrace) {
-                    names.push(self.ident("dans le motif `{…}`")?);
+                    names.push(self.ident("in the `{…}` pattern")?);
                     if !self.eat(T::Comma) {
                         break;
                     }
                 }
-                self.expect(T::RBrace, "pour fermer le motif")?;
+                self.expect(T::RBrace, "to close the pattern")?;
                 Ok(Pattern::Record(names, self.span_from(start)))
             }
             T::LBracket => {
@@ -788,7 +788,7 @@ impl Parser<'_, '_> {
                 let mut rest = None;
                 while !self.at(T::RBracket) {
                     if self.eat(T::DotDotDot) {
-                        rest = Some(self.ident("après `...`")?);
+                        rest = Some(self.ident("after `...`")?);
                         break;
                     }
                     items.push(self.pattern()?);
@@ -796,7 +796,7 @@ impl Parser<'_, '_> {
                         break;
                     }
                 }
-                self.expect(T::RBracket, "pour fermer le motif")?;
+                self.expect(T::RBracket, "to close the pattern")?;
                 Ok(Pattern::List {
                     items,
                     rest,
@@ -804,7 +804,7 @@ impl Parser<'_, '_> {
                 })
             }
             _ => self.error_here(format!(
-                "nom de variable attendu après `let`, trouvé {}",
+                "expected a variable name after `let`, found {}",
                 self.found()
             )),
         }
@@ -814,16 +814,16 @@ impl Parser<'_, '_> {
         let mut out = Vec::new();
         while self.at(T::AtLBracket) {
             let start = self.bump().span;
-            let mut path = vec![self.ident("après `@[`")?.0];
+            let mut path = vec![self.ident("after `@[`")?.0];
             while self.eat(T::ColonColon) {
-                path.push(self.ident("après `::`")?.0);
+                path.push(self.ident("after `::`")?.0);
             }
             let args = if self.at(T::LParen) {
                 self.args()?
             } else {
                 Slice::EMPTY
             };
-            self.expect(T::RBracket, "pour fermer l'annotation")?;
+            self.expect(T::RBracket, "to close the annotation")?;
             out.push(AnnotationUse {
                 path,
                 args,
@@ -834,20 +834,20 @@ impl Parser<'_, '_> {
         Ok(out)
     }
 
-    // ─── Déclarations ────────────────────────────────────────────────────────
+    // ─── Declarations ────────────────────────────────────────────────────────
 
     fn def(&mut self, annotations: Vec<AnnotationUse>) -> Result<FnDecl> {
         let start = self.bump().span;
         let name_tok = self.tok();
         if name_tok.kind != T::Ident && !is_keyword(name_tok.kind) {
             return self.error_here(format!(
-                "nom de fonction attendu après `def`, trouvé {}",
+                "expected a function name after `def`, found {}",
                 self.found()
             ));
         }
         self.bump();
         let mut name_span = name_tok.span;
-        // Setter : `def nom=(valeur)`, le `=` collé au nom.
+        // Setter: `def name=(value)`, the `=` attached to the name.
         if self.at(T::Eq) && self.tok().span.start == name_tok.span.end && self.peek2() == T::LParen
         {
             name_span = name_span.to(self.bump().span);
@@ -869,7 +869,7 @@ impl Parser<'_, '_> {
         } else {
             if !matches!(self.peek(), T::Newline | T::Semi) {
                 return self.error_here(format!(
-                    "fin de ligne ou `=` attendu après la signature de `{}`, trouvé {}",
+                    "expected a line end or `=` after the signature of `{}`, found {}",
                     self.interner.resolve(name),
                     self.found()
                 ));
@@ -887,7 +887,7 @@ impl Parser<'_, '_> {
         })
     }
 
-    /// Paramètres entre `open` et `close` : `(a: int, b = 0)` ou `|x, y|`.
+    /// Parameters between `open` and `close`: `(a: int, b = 0)` or `|x, y|`.
     fn params(&mut self, open: TokenKind, close: TokenKind) -> Result<Vec<Param>> {
         self.expect(open, "")?;
         let in_lambda = close == T::Pipe;
@@ -904,20 +904,20 @@ impl Parser<'_, '_> {
                 T::IVar if !in_lambda => (self.intern(Span::new(start.start + 1, start.end)), true),
                 _ => {
                     return self
-                        .error_here(format!("nom de paramètre attendu, trouvé {}", self.found()));
+                        .error_here(format!("expected a parameter name, found {}", self.found()));
                 }
             };
             self.bump();
             if params.iter().any(|p| p.name == name) {
                 return self.error_at(
                     format!(
-                        "paramètre `{}` déclaré deux fois",
+                        "parameter `{}` declared twice",
                         self.interner.resolve(name)
                     ),
                     start,
                 );
             }
-            // Dans `|…|`, une union doit être entre parenthèses : `|x: (int | str)|`.
+            // In `|…|`, a union must be parenthesized: `|x: (int | str)|`.
             let ty = if self.eat(T::Colon) {
                 Some(self.type_expr(!in_lambda)?)
             } else {
@@ -939,7 +939,7 @@ impl Parser<'_, '_> {
             self.skip_newlines();
             if !self.eat(T::Comma) {
                 self.skip_newlines();
-                self.expect(close, "pour fermer les paramètres")?;
+                self.expect(close, "to close the parameters")?;
                 break;
             }
         }
@@ -953,14 +953,14 @@ impl Parser<'_, '_> {
             T::Class => (TypeDeclKind::Class, "class"),
             _ => (TypeDeclKind::Annotation, "annotation"),
         };
-        let (name, name_span) = self.ident(&format!("après `{opener}`"))?;
+        let (name, name_span) = self.ident(&format!("after `{opener}`"))?;
         let mut members: Vec<Member> = Vec::new();
         loop {
             self.skip_newlines();
             if matches!(self.peek(), T::End | T::Eof) {
                 break;
             }
-            if let Some(m) = self.recovering(&[T::End], "le membre", |p| p.type_member(&members))? {
+            if let Some(m) = self.recovering(&[T::End], "the member", |p| p.type_member(&members))? {
                 members.push(m);
             }
         }
@@ -975,7 +975,7 @@ impl Parser<'_, '_> {
         })
     }
 
-    /// Membre d'un `type` / `class` : champ, méthode ou autre instruction.
+    /// Member of a `type` / `class`: field, method or other statement.
     fn type_member(&mut self, members: &[Member]) -> Result<Member> {
         let annotations = self.annotations()?;
         let start = self.tok().span;
@@ -999,7 +999,7 @@ impl Parser<'_, '_> {
                     .any(|m| matches!(m, Member::Field(g) if g.name == name));
                 if dup {
                     return self.error_at(
-                        format!("champ `{}` déclaré deux fois", self.interner.resolve(name)),
+                        format!("field `{}` declared twice", self.interner.resolve(name)),
                         span,
                     );
                 }
@@ -1017,7 +1017,7 @@ impl Parser<'_, '_> {
 
     fn enum_decl(&mut self, annotations: Vec<AnnotationUse>) -> Result<EnumDecl> {
         let kw = self.bump();
-        let (name, name_span) = self.ident("après `enum`")?;
+        let (name, name_span) = self.ident("after `enum`")?;
         let repr = if self.eat(T::Colon) {
             Some(self.type_expr(true)?)
         } else {
@@ -1030,7 +1030,7 @@ impl Parser<'_, '_> {
             if matches!(self.peek(), T::End | T::Eof) {
                 break;
             }
-            match self.recovering(&[T::End], "la variante", |p| p.enum_member(&variants))? {
+            match self.recovering(&[T::End], "the variant", |p| p.enum_member(&variants))? {
                 Some(Ok(v)) => variants.push(v),
                 Some(Err(m)) => methods.push(m),
                 None => {}
@@ -1048,7 +1048,7 @@ impl Parser<'_, '_> {
         })
     }
 
-    /// Variante (`Ok`) ou méthode (`Err`) d'un `enum`.
+    /// Variant (`Ok`) or method (`Err`) of an `enum`.
     fn enum_member(
         &mut self,
         variants: &[Variant],
@@ -1057,11 +1057,11 @@ impl Parser<'_, '_> {
         if self.at(T::Def) {
             return Ok(Err(self.def(annotations)?));
         }
-        let (vname, start) = self.ident("(variante de l'enum)")?;
+        let (vname, start) = self.ident("(enum variant)")?;
         if variants.iter().any(|v| v.name == vname) {
             return self.error_at(
                 format!(
-                    "variante `{}` déclarée deux fois",
+                    "variant `{}` declared twice",
                     self.interner.resolve(vname)
                 ),
                 start,
@@ -1082,7 +1082,7 @@ impl Parser<'_, '_> {
 
     // ─── Types ───────────────────────────────────────────────────────────────
 
-    /// `allow_union` est faux dans `|…|` où `|` fermerait la liste.
+    /// `allow_union` is false in `|…|`, where `|` would close the list.
     fn type_expr(&mut self, allow_union: bool) -> Result<TypeExpr> {
         stacker::maybe_grow(RED_ZONE, STACK_GROW, || self.type_expr_inner(allow_union))
     }
@@ -1126,7 +1126,7 @@ impl Parser<'_, '_> {
             T::Ident => {
                 let mut path = vec![self.ident("")?.0];
                 while self.eat(T::ColonColon) {
-                    path.push(self.ident("après `::`")?.0);
+                    path.push(self.ident("after `::`")?.0);
                 }
                 TypeKind::Named(path)
             }
@@ -1140,13 +1140,13 @@ impl Parser<'_, '_> {
             }
             T::Int | T::Minus => {
                 let neg = self.eat(T::Minus);
-                let t = self.expect(T::Int, "après `-`")?;
+                let t = self.expect(T::Int, "after `-`")?;
                 TypeKind::LitInt(self.int_value(t, neg)?)
             }
             T::LBracket => {
                 self.bump();
                 let inner = self.type_expr(true)?;
-                self.expect(T::RBracket, "pour fermer le type liste `[T]`")?;
+                self.expect(T::RBracket, "to close the list type `[T]`")?;
                 TypeKind::List(Box::new(inner))
             }
             T::LBrace => {
@@ -1158,8 +1158,8 @@ impl Parser<'_, '_> {
                         if self.at(T::RBrace) {
                             break;
                         }
-                        let (name, _) = self.ident("(champ du record)")?;
-                        self.expect(T::Colon, "après le nom du champ")?;
+                        let (name, _) = self.ident("(record field)")?;
+                        self.expect(T::Colon, "after the field name")?;
                         fields.push((name, self.type_expr(true)?));
                         self.skip_newlines();
                         if !self.eat(T::Comma) {
@@ -1167,16 +1167,16 @@ impl Parser<'_, '_> {
                         }
                     }
                     self.skip_newlines();
-                    self.expect(T::RBrace, "pour fermer le type record")?;
+                    self.expect(T::RBrace, "to close the record type")?;
                     TypeKind::Record(fields)
                 } else {
                     let k = self.type_expr(true)?;
                     self.expect(
                         T::FatArrow,
-                        "dans le type hash `{K => V}` (pour un record : `{nom: T}`)",
+                        "in the hash type `{K => V}` (for a record: `{name: T}`)",
                     )?;
                     let v = self.type_expr(true)?;
-                    self.expect(T::RBrace, "pour fermer le type hash")?;
+                    self.expect(T::RBrace, "to close the hash type")?;
                     TypeKind::Hash(Box::new(k), Box::new(v))
                 }
             }
@@ -1191,18 +1191,18 @@ impl Parser<'_, '_> {
                         break;
                     }
                 }
-                self.expect(T::RParen, "pour fermer le type")?;
+                self.expect(T::RParen, "to close the type")?;
                 if self.eat(T::Colon) {
                     let ret = self.type_postfix()?;
                     TypeKind::Fn(items, Box::new(ret))
                 } else if items.len() == 1 && !trailing_comma {
-                    // Simple parenthésage : `(int | str)?`
+                    // Plain parenthesizing: `(int | str)?`
                     return Ok(items.pop().unwrap());
                 } else {
                     TypeKind::Tuple(items)
                 }
             }
-            _ => return self.error_here(format!("type attendu, trouvé {}", self.found())),
+            _ => return self.error_here(format!("expected a type, found {}", self.found())),
         };
         Ok(TypeExpr {
             kind,
@@ -1223,7 +1223,7 @@ impl Parser<'_, '_> {
             Some(op) => {
                 if !self.ast.is_assignable(lhs) {
                     return self
-                        .error_at("on ne peut pas assigner à cette expression", self.span(lhs));
+                        .error_at("cannot assign to this expression", self.span(lhs));
                 }
                 self.bump();
                 let value = self.expr()?;
@@ -1244,7 +1244,7 @@ impl Parser<'_, '_> {
     }
 
     fn binary(&mut self, min_bp: u8) -> Result<ExprId> {
-        // Opérateurs préfixes imbriqués (`- - - x`) : récursion sans passer par `expr`.
+        // Nested prefix operators (`- - - x`): recursion that does not go through `expr`.
         stacker::maybe_grow(RED_ZONE, STACK_GROW, || self.binary_inner(min_bp))
     }
 
@@ -1270,7 +1270,7 @@ impl Parser<'_, '_> {
                 },
             };
             lhs = self.mk(node, span);
-            // Comparaisons et intervalles ne s'enchaînent pas : `a < b < c` est refusé.
+            // Comparisons and ranges do not chain: `a < b < c` is rejected.
             let next = self.peek();
             let chained = (is_comparison(kind) && is_comparison(next))
                 || (matches!(kind, T::DotDot | T::DotDotDot)
@@ -1278,7 +1278,7 @@ impl Parser<'_, '_> {
             if chained {
                 return self.error_at(
                     format!(
-                        "{} ne peut pas suivre directement {} : ajouter des parenthèses",
+                        "{} cannot directly follow {}: add parentheses",
                         next.describe(),
                         kind.describe()
                     ),
@@ -1294,7 +1294,7 @@ impl Parser<'_, '_> {
         match self.peek() {
             T::Minus => {
                 self.bump();
-                // `-5` est un littéral (permet i64::MIN), sauf `-5.abs()` = `-(5.abs())`.
+                // `-5` is a literal (allows i64::MIN), except `-5.abs()` = `-(5.abs())`.
                 if self.at(T::Int) && !matches!(self.peek2(), T::Dot | T::LBracket | T::LParen) {
                     let t = self.bump();
                     let n = self.int_value(t, true)?;
@@ -1336,7 +1336,7 @@ impl Parser<'_, '_> {
                     let args = self.args()?;
                     let span = self.span_from(self.span(e));
                     match self.ast.kind(e) {
-                        // `recv.nom(args)` : le champ devient un appel de méthode.
+                        // `recv.name(args)`: the field becomes a method call.
                         ExprKind::Field(recv, name) => {
                             *self.ast.expr_mut(e) = Expr {
                                 kind: ExprKind::MethodCall {
@@ -1371,7 +1371,7 @@ impl Parser<'_, '_> {
                             .text(self.src)
                             .replace('_', "")
                             .parse()
-                            .map_err(|_| Error::syntax("index de tuple invalide", t.span))?;
+                            .map_err(|_| Error::syntax("invalid tuple index", t.span))?;
                         e = self.mk(ExprKind::TupleIndex(e, idx), span);
                     } else if t.kind == T::Ident || is_keyword(t.kind) {
                         self.bump();
@@ -1379,18 +1379,18 @@ impl Parser<'_, '_> {
                         e = self.mk(ExprKind::Field(e, name), span);
                     } else {
                         return self.error_here(format!(
-                            "nom de méthode ou de champ attendu après `.`, trouvé {}",
+                            "expected a method or field name after `.`, found {}",
                             self.found()
                         ));
                     }
                 }
                 T::ColonColon => {
                     let ExprKind::Ident(first) = self.ast.kind(e) else {
-                        return self.error_at("`::` doit suivre un nom de type", self.span(e));
+                        return self.error_at("`::` must follow a type name", self.span(e));
                     };
                     let mut path = vec![first];
                     while self.eat(T::ColonColon) {
-                        path.push(self.ident("après `::`")?.0);
+                        path.push(self.ident("after `::`")?.0);
                     }
                     let span = self.span_from(self.span(e));
                     let path = self.ast.alloc(&path);
@@ -1404,7 +1404,7 @@ impl Parser<'_, '_> {
                     self.skip_newlines();
                     let index = self.expr()?;
                     self.skip_newlines();
-                    self.expect(T::RBracket, "pour fermer l'index")?;
+                    self.expect(T::RBracket, "to close the index")?;
                     let span = self.span_from(self.span(e));
                     e = self.mk(ExprKind::Index(e, index), span);
                 }
@@ -1453,7 +1453,7 @@ impl Parser<'_, '_> {
                         }
                         _ => {
                             return self.error_at(
-                                "un bloc `do` doit suivre un appel de fonction ou de méthode",
+                                "a `do` block must follow a function or method call",
                                 do_span,
                             );
                         }
@@ -1483,7 +1483,7 @@ impl Parser<'_, '_> {
         })
     }
 
-    /// `(a, nom: b)`
+    /// `(a, name: b)`
     fn args(&mut self) -> Result<Slice<Arg>> {
         self.bump();
         let saved = std::mem::replace(&mut self.no_do, false);
@@ -1508,14 +1508,14 @@ impl Parser<'_, '_> {
                 let name = self.intern(t.span);
                 if self.s_args[base..].iter().any(|a| a.name == Some(name)) {
                     return self.error_at(
-                        format!("argument `{}` donné deux fois", self.interner.resolve(name)),
+                        format!("argument `{}` given twice", self.interner.resolve(name)),
                         t.span,
                     );
                 }
                 Some(name)
             } else {
                 if self.s_args[base..].last().is_some_and(|a| a.name.is_some()) {
-                    return self.error_here("argument positionnel après un argument nommé");
+                    return self.error_here("positional argument after a named argument");
                 }
                 None
             };
@@ -1524,7 +1524,7 @@ impl Parser<'_, '_> {
             self.skip_newlines();
             if !self.eat(T::Comma) {
                 self.skip_newlines();
-                self.expect(T::RParen, "pour fermer les arguments")?;
+                self.expect(T::RParen, "to close the arguments")?;
                 return Ok(());
             }
         }
@@ -1542,7 +1542,7 @@ impl Parser<'_, '_> {
                 let text = t.span.text(self.src).replace('_', "");
                 ExprKind::Float(
                     text.parse()
-                        .map_err(|_| Error::syntax("nombre décimal invalide", t.span))?,
+                        .map_err(|_| Error::syntax("invalid float", t.span))?,
                 )
             }
             T::Str => {
@@ -1578,7 +1578,7 @@ impl Parser<'_, '_> {
             T::LBracket => {
                 self.bump();
                 let saved = std::mem::replace(&mut self.no_do, false);
-                let items = self.comma_list(T::RBracket, "pour fermer la liste");
+                let items = self.comma_list(T::RBracket, "to close the list");
                 self.no_do = saved;
                 ExprKind::List(items?)
             }
@@ -1607,18 +1607,18 @@ impl Parser<'_, '_> {
             }
             T::Do if self.no_do => {
                 return self.error_here(
-                    "`do` n'est pas utilisé ici : passer à la ligne après la condition",
+                    "`do` is not used here: start a new line after the condition",
                 );
             }
             T::Let => {
                 return self.error_here(format!(
-                    "`let` est une instruction : il ne peut pas être dans une expression{}",
+                    "`let` is a statement: it cannot appear inside an expression{}",
                     self.continuation_hint()
                 ));
             }
             _ => {
                 return self.error_here(format!(
-                    "expression attendue, trouvé {}{}",
+                    "expected an expression, found {}{}",
                     self.found(),
                     self.continuation_hint()
                 ));
@@ -1628,14 +1628,14 @@ impl Parser<'_, '_> {
         Ok(self.mk(kind, span))
     }
 
-    /// Éléments séparés par des virgules jusqu'à `close` (virgule finale permise).
+    /// Comma-separated elements up to `close` (trailing comma allowed).
     fn comma_list(&mut self, close: TokenKind, context: &str) -> Result<Slice<ExprId>> {
         let base = self.s_exprs.len();
         self.comma_items(close, context)?;
         Ok(self.take_exprs(base))
     }
 
-    /// Empile les éléments sur `s_exprs` jusqu'à `close` (consommé).
+    /// Pushes the elements onto `s_exprs` up to `close` (consumed).
     fn comma_items(&mut self, close: TokenKind, context: &str) -> Result<()> {
         loop {
             self.skip_newlines();
@@ -1653,7 +1653,7 @@ impl Parser<'_, '_> {
         }
     }
 
-    /// Retire de `s_exprs` les éléments empilés depuis `base` et les range dans l'AST.
+    /// Pops the elements pushed onto `s_exprs` since `base` and stores them in the AST.
     fn take_exprs(&mut self, base: usize) -> Slice<ExprId> {
         let slice = self.ast.alloc(&self.s_exprs[base..]);
         self.s_exprs.truncate(base);
@@ -1678,19 +1678,19 @@ impl Parser<'_, '_> {
         let first = self.expr()?;
         self.skip_newlines();
         if self.eat(T::Comma) {
-            // `(a, b, …)` : `first` est déjà lu, le reste s'empile à sa suite.
+            // `(a, b, …)`: `first` is already read, the rest is pushed after it.
             let base = self.s_exprs.len();
             self.s_exprs.push(first);
-            self.comma_items(T::RParen, "pour fermer le tuple")?;
+            self.comma_items(T::RParen, "to close the tuple")?;
             let items = self.take_exprs(base);
             let span = self.span_from(start);
             return Ok(self.mk(ExprKind::Tuple(items), span));
         }
-        self.expect(T::RParen, "pour fermer la parenthèse")?;
+        self.expect(T::RParen, "to close the parenthesis")?;
         Ok(first)
     }
 
-    /// `{}` (hash vide), `{k => v}` (hash) ou `{nom: v, autre}` (record).
+    /// `{}` (empty hash), `{k => v}` (hash) or `{name: v, other}` (record).
     fn brace(&mut self) -> Result<ExprId> {
         let start = self.bump().span;
         let saved = std::mem::replace(&mut self.no_do, false);
@@ -1714,24 +1714,24 @@ impl Parser<'_, '_> {
                 if self.eat(T::RBrace) {
                     break;
                 }
-                let (name, span) = self.ident("(champ du record)")?;
+                let (name, span) = self.ident("(record field)")?;
                 if self.s_fields[base..].iter().any(|(n, _)| *n == name) {
                     return self.error_at(
-                        format!("champ `{}` donné deux fois", self.interner.resolve(name)),
+                        format!("field `{}` given twice", self.interner.resolve(name)),
                         span,
                     );
                 }
                 let value = if self.eat(T::Colon) {
                     self.expr()?
                 } else {
-                    // Raccourci `{x}` = `{x: x}`
+                    // Shorthand `{x}` = `{x: x}`
                     self.mk(ExprKind::Ident(name), span)
                 };
                 self.s_fields.push((name, value));
                 self.skip_newlines();
                 if !self.eat(T::Comma) {
                     self.skip_newlines();
-                    self.expect(T::RBrace, "pour fermer le record")?;
+                    self.expect(T::RBrace, "to close the record")?;
                     break;
                 }
             }
@@ -1749,14 +1749,14 @@ impl Parser<'_, '_> {
             let key = self.expr()?;
             self.expect(
                 T::FatArrow,
-                "entre la clé et la valeur (pour un record : `{nom: valeur}`)",
+                "between the key and the value (for a record: `{name: value}`)",
             )?;
             let value = self.expr()?;
             self.s_entries.push((key, value));
             self.skip_newlines();
             if !self.eat(T::Comma) {
                 self.skip_newlines();
-                self.expect(T::RBrace, "pour fermer le hash")?;
+                self.expect(T::RBrace, "to close the hash")?;
                 break;
             }
         }
@@ -1793,7 +1793,7 @@ impl Parser<'_, '_> {
             let t = self.tok();
             if !matches!(t.kind, T::StrMid | T::StrTail) {
                 return self.error_here(format!(
-                    "`}}` attendu pour fermer l'interpolation, trouvé {}",
+                    "expected `}}` to close the interpolation, found {}",
                     self.found()
                 ));
             }
@@ -1814,7 +1814,7 @@ impl Parser<'_, '_> {
         self.if_tail(start, "if")
     }
 
-    /// Suite d'un `if` / `elsif` après le mot-clé.
+    /// Rest of an `if` / `elsif` after the keyword.
     fn if_tail(&mut self, start: Span, opener: &str) -> Result<ExprId> {
         let cond = self.condition(opener)?;
         let then = self.block(&[T::Elsif, T::Else, T::End])?;
@@ -1839,12 +1839,12 @@ impl Parser<'_, '_> {
             .push_control(Control::If(If { cond, then, else_ }), span))
     }
 
-    /// Condition suivie de `then` ou d'une fin de ligne.
+    /// Condition followed by `then` or a line end.
     fn condition(&mut self, opener: &str) -> Result<ExprId> {
         let cond = self.expr()?;
         if !self.eat(T::Then) && !matches!(self.peek(), T::Newline | T::Semi) {
             return self.error_here(format!(
-                "`then` ou fin de ligne attendu après la condition du `{opener}`, trouvé {}",
+                "expected `then` or a line end after the `{opener}` condition, found {}",
                 self.found()
             ));
         }
@@ -1887,7 +1887,7 @@ impl Parser<'_, '_> {
             let patterns = self.take_exprs(base);
             if !self.eat(T::Then) && !matches!(self.peek(), T::Newline | T::Semi) {
                 return self.error_here(format!(
-                    "`then` ou fin de ligne attendu après `when`, trouvé {}",
+                    "expected `then` or a line end after `when`, found {}",
                     self.found()
                 ));
             }
@@ -1900,7 +1900,7 @@ impl Parser<'_, '_> {
         }
         if arms.is_empty() {
             return self.error_here(format!(
-                "`when` attendu après `case`, trouvé {}",
+                "expected `when` after `case`, found {}",
                 self.found()
             ));
         }
@@ -1921,7 +1921,7 @@ impl Parser<'_, '_> {
         ))
     }
 
-    /// Expression d'en-tête de boucle : `do` interdit, fin de ligne obligatoire.
+    /// Loop header expression: `do` forbidden, line end required.
     fn loop_head(&mut self, opener: &str) -> Result<ExprId> {
         let saved = std::mem::replace(&mut self.no_do, true);
         let e = self.expr();
@@ -1929,12 +1929,12 @@ impl Parser<'_, '_> {
         let e = e?;
         if self.at(T::Do) {
             return self.error_here(format!(
-                "`do` n'est pas utilisé après `{opener}` : passer à la ligne"
+                "`do` is not used after `{opener}`: start a new line"
             ));
         }
         if !matches!(self.peek(), T::Newline | T::Semi) {
             return self.error_here(format!(
-                "fin de ligne attendue après l'en-tête du `{opener}`, trouvé {}",
+                "expected a line end after the `{opener}` header, found {}",
                 self.found()
             ));
         }
@@ -1953,11 +1953,11 @@ impl Parser<'_, '_> {
 
     fn for_expr(&mut self) -> Result<ExprId> {
         let start = self.bump().span;
-        let mut vars = vec![self.ident("après `for`")?];
+        let mut vars = vec![self.ident("after `for`")?];
         while self.eat(T::Comma) {
-            vars.push(self.ident("après `,`")?);
+            vars.push(self.ident("after `,`")?);
         }
-        self.expect(T::In, "après les variables du `for`")?;
+        self.expect(T::In, "after the `for` variables")?;
         let iter = self.loop_head("for")?;
         let body = self.block_end("for", start)?;
         let span = self.span_from(start);
@@ -1966,10 +1966,10 @@ impl Parser<'_, '_> {
             .push_control(Control::For(For { vars, iter, body }), span))
     }
 
-    // ─── Littéraux ───────────────────────────────────────────────────────────
+    // ─── Literals ────────────────────────────────────────────────────────────
 
     fn int_value(&self, t: Token, negative: bool) -> Result<i64> {
-        let too_big = || Error::syntax("entier trop grand (64 bits max)", t.span);
+        let too_big = || Error::syntax("integer too large (64 bits max)", t.span);
         let mut n: u64 = 0;
         for b in t.span.text(self.src).bytes() {
             if b != b'_' {
@@ -1989,7 +1989,7 @@ impl Parser<'_, '_> {
         }
     }
 
-    /// Intervalle du contenu d'un jeton de chaîne, sans délimiteurs.
+    /// Range of a string token's content, without delimiters.
     fn str_inner(t: Token) -> Span {
         let (skip_start, skip_end) = match t.kind {
             T::Str | T::StrTail => (1, 1),
@@ -1999,13 +1999,13 @@ impl Parser<'_, '_> {
         Span::new(t.span.start + skip_start, t.span.end - skip_end)
     }
 
-    /// Contenu d'un jeton de chaîne, échappements traités.
+    /// Content of a string token, with escapes processed.
     fn str_content(&self, t: Token) -> Result<String> {
         let inner = Self::str_inner(t);
         unescape(inner.text(self.src), inner.start)
     }
 
-    /// Chaîne littérale internée ; sans échappement, aucune allocation.
+    /// Interned string literal; without escapes, no allocation.
     fn str_symbol(&mut self, t: Token) -> Result<Symbol> {
         let inner = Self::str_inner(t);
         let src = self.src;
@@ -2019,7 +2019,7 @@ impl Parser<'_, '_> {
     }
 }
 
-/// Traite `\n \t \r \0 \\ \" \# \u{…}`. `offset` sert aux messages d'erreur.
+/// Processes `\n \t \r \0 \\ \" \# \u{…}`. `offset` is used for error messages.
 fn unescape(s: &str, offset: u32) -> Result<String> {
     if !s.contains('\\') {
         return Ok(s.to_string());
@@ -2040,17 +2040,17 @@ fn unescape(s: &str, offset: u32) -> Result<String> {
             Some((_, '\\')) => out.push('\\'),
             Some((_, '"')) => out.push('"'),
             Some((_, '#')) => out.push('#'),
-            Some((_, '\n')) => {} // `\` en fin de ligne : la chaîne continue sans saut de ligne
+            Some((_, '\n')) => {} // `\` at the end of a line: the string continues without a line break
             Some((_, 'u')) => {
                 let rest = &s[i + 2..];
                 let Some(close) = rest.strip_prefix('{').and_then(|r| r.find('}')) else {
-                    return Err(Error::syntax("`\\u{…}` attendu", at(2)));
+                    return Err(Error::syntax("expected `\\u{…}`", at(2)));
                 };
                 let hex = &rest[1..close + 1];
                 let c = u32::from_str_radix(hex, 16)
                     .ok()
                     .and_then(char::from_u32)
-                    .ok_or_else(|| Error::syntax("code Unicode invalide", at(close + 4)))?;
+                    .ok_or_else(|| Error::syntax("invalid Unicode code point", at(close + 4)))?;
                 out.push(c);
                 for _ in 0..close + 2 {
                     chars.next();
@@ -2058,11 +2058,11 @@ fn unescape(s: &str, offset: u32) -> Result<String> {
             }
             Some((_, other)) => {
                 return Err(Error::syntax(
-                    format!("échappement inconnu `\\{other}`"),
+                    format!("unknown escape `\\{other}`"),
                     at(1 + other.len_utf8()),
                 ));
             }
-            None => return Err(Error::syntax("`\\` en fin de chaîne", at(1))),
+            None => return Err(Error::syntax("`\\` at the end of a string", at(1))),
         }
     }
     Ok(out)

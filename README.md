@@ -1,7 +1,7 @@
 # Bokoni
 
-Langage de script intégré à Rust : syntaxe à la Ruby, typage graduel (annotations
-optionnelles), objectif final un JIT Cranelift pour le code typé.
+A scripting language embedded in Rust: Ruby-like syntax, gradual typing (optional
+annotations), with a Cranelift JIT for typed code as the end goal.
 
 ```ruby
 def fib(n: int): int
@@ -10,31 +10,31 @@ end
 
 let ages = {"alice" => 30, "bob" => 25}
 for name, age in ages
-  print("#{name.capitalize()} a #{age} ans")
+  print("#{name.capitalize()} is #{age}")
 end
 
 [1, 2, 3, 4].filter(|n| n % 2 == 0).map(|n| n * n)   # [4, 16]
 ```
 
-Avant l'exécution, tout le programme est vérifié (syntaxe, noms, types) et **toutes** les
-erreurs sont signalées d'un coup, avec suggestions :
+Before running, the whole program is checked (syntax, names, types) and **all** errors
+are reported at once, with suggestions:
 
 ```text
-erreur de type: `str` n'a pas de méthode `lenght` (voulez-vous dire `len` ?)
+type error: `str` has no method `lenght` (did you mean `len`?)
  --> script.bk:12:1
    |
 12 | "abc".lenght()
    | ^^^^^^^^^^^^^^
 ```
 
-Typage graduel : seules les erreurs certaines sont signalées, le reste est vérifié à
-l'exécution.
+Gradual typing: only certain errors are reported; everything else is checked at run
+time.
 
-Les fonctions entièrement typées sont compilées en code natif (JIT Cranelift) à leur
-premier appel : `fib(25)` passe de 28 ms (interprété) à 0,5 ms. Le reste est interprété,
-avec exactement le même résultat.
+Fully typed functions are compiled to native code (Cranelift JIT) on their first call:
+`fib(25)` goes from 28 ms (interpreted) to 0.5 ms. Everything else is interpreted, with
+exactly the same result.
 
-## Utilisation depuis Rust
+## Using it from Rust
 
 ```rust
 use bokoni::Engine;
@@ -47,10 +47,10 @@ engine.eval("def square(x: int): int = x * x")?;
 let s: i64 = engine.call_as("square", (7,))?;        // 49
 ```
 
-Les arguments et retours sont convertis automatiquement (`i64`, `f64`, `bool`, `String`,
-`Vec<T>`, `Option<T>`, `Value`…) ; une fonction peut renvoyer `Result<T, E: Display>`.
+Arguments and return values are converted automatically (`i64`, `f64`, `bool`, `String`,
+`Vec<T>`, `Option<T>`, `Value`…); a function may return `Result<T, E: Display>`.
 
-Les déclarations du script et leurs annotations se lisent depuis Rust :
+The script's declarations and their annotations can be read from Rust:
 
 ```rust
 engine.eval("annotation Column\n  name: str\nend\n\
@@ -60,27 +60,27 @@ let col = ty.field("name").unwrap().annotation("Column").unwrap();
 let column: String = col.get("name")?;               // "user_name"
 ```
 
-## Exécutable
+## Command line
 
 ```sh
 cargo run                         # REPL
-cargo run -- script.bk            # exécute un fichier
+cargo run -- script.bk            # run a file
 cargo run -- -e '1 + 2'           # => 3
 cargo run -- --ast -e '1 + 2 * 3' # (+ 1 (* 2 3))
-cargo run -- --ir script.bk       # IR exécutée (registres typés, blocs de base)
-cargo run -- --no-jit script.bk   # sans compilation native
+cargo run -- --ir script.bk       # IR being executed (typed registers, basic blocks)
+cargo run -- --no-jit script.bk   # without native compilation
 ```
 
 ## Documentation
 
-- [docs/syntax.md](docs/syntax.md) — la syntaxe (spécification)
-- [docs/roadmap.md](docs/roadmap.md) — feuille de route vers le JIT, état d'avancement, performances
+- [docs/syntax.md](docs/syntax.md) — the syntax (specification)
+- [docs/roadmap.md](docs/roadmap.md) — roadmap to the JIT, progress, performance
 
-## Développement
+## Development
 
 ```sh
-cargo test                                       # tests (dont tous les exemples de syntax.md)
-cargo run --release --example bench_parser       # parseur vs peg
-cargo run --release --example bench_interp       # vitesse d'exécution (avec / sans JIT)
-cargo build --no-default-features                # sans le JIT (plateformes sans Cranelift)
+cargo test                                       # tests (including every example in syntax.md)
+cargo run --release --example bench_parser       # parser vs peg
+cargo run --release --example bench_interp       # execution speed (with / without JIT)
+cargo build --no-default-features                # without the JIT (platforms without Cranelift)
 ```

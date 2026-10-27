@@ -1,20 +1,20 @@
-//! API d'intégration dans Rust.
+//! Embedding API for Rust.
 //!
 //! ```
 //! use bokoni::Engine;
 //!
 //! let mut engine = Engine::new();
 //!
-//! // Fonctions Rust : arguments et retour convertis automatiquement.
-//! engine.register_fn("greet", |name: String| format!("Bonjour {name}"));
+//! // Rust functions: arguments and return value are converted automatically.
+//! engine.register_fn("greet", |name: String| format!("Hello {name}"));
 //! engine.register_fn("div", |a: i64, b: i64| {
-//!     if b == 0 { Err("division par zéro") } else { Ok(a / b) }
+//!     if b == 0 { Err("division by zero") } else { Ok(a / b) }
 //! });
 //!
 //! let s: String = engine.eval_as(r#"greet("Vincent")"#).unwrap();
-//! assert_eq!(s, "Bonjour Vincent");
+//! assert_eq!(s, "Hello Vincent");
 //!
-//! // Les définitions restent disponibles d'un appel à l'autre.
+//! // Definitions remain available from one call to the next.
 //! engine.eval("def square(x: int): int = x * x").unwrap();
 //! let v: i64 = engine.call_as("square", (7,)).unwrap();
 //! assert_eq!(v, 49);
@@ -32,9 +32,9 @@ use std::rc::Rc;
 pub struct Engine {
     rt: Runtime,
     static_checks: bool,
-    /// Avertissements de la vérification statique, en attente de lecture.
+    /// Static-check warnings waiting to be read.
     warnings: Vec<Error>,
-    /// Gestionnaire des avertissements (sinon, gardés pour `take_warnings`).
+    /// Warning handler (otherwise warnings are kept for `take_warnings`).
     on_warning: Option<WarningHandler>,
 }
 
@@ -48,13 +48,13 @@ impl Default for Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        // Les fonctions globales capturent la portée globale qui les contient :
-        // on casse ce cycle pour libérer la mémoire.
+        // Global functions capture the global scope that contains them:
+        // break that cycle to free the memory.
         self.rt.globals.clear();
     }
 }
 
-/// Déclarations intégrées : les annotations `Deprecated` et `Doc`.
+/// Built-in declarations: the `Deprecated` and `Doc` annotations.
 const PRELUDE: &str = "annotation Deprecated\n  message: str? = nil\nend\n\
                        annotation Doc\n  text: str\nend\n";
 
@@ -66,50 +66,50 @@ impl Engine {
             warnings: Vec::new(),
             on_warning: None,
         };
-        e.eval_named(PRELUDE, "<prélude>")
-            .expect("le prélude se compile");
+        e.eval_named(PRELUDE, "<prelude>")
+            .expect("the prelude compiles");
         e
     }
 
-    /// Redirige la sortie de `print` (par défaut : la sortie standard).
+    /// Redirects the output of `print` (default: standard output).
     pub fn set_output(&mut self, f: impl FnMut(&str) + 'static) {
         self.rt.output = Box::new(f);
     }
 
-    /// Avertissements de la vérification statique depuis le dernier appel (utilisation
-    /// d'une déclaration `@[Deprecated]`…) : ils n'empêchent pas l'exécution.
+    /// Static-check warnings since the last call (use of a `@[Deprecated]`
+    /// declaration…): they do not prevent execution.
     pub fn take_warnings(&mut self) -> Vec<Error> {
         std::mem::take(&mut self.warnings)
     }
 
-    /// Reçoit chaque avertissement dès la vérification, avant l'exécution du script
-    /// (au lieu de les garder pour [`take_warnings`](Self::take_warnings)).
+    /// Receives each warning as soon as checking produces it, before the script runs
+    /// (instead of keeping them for [`take_warnings`](Self::take_warnings)).
     pub fn set_warning_handler(&mut self, f: impl FnMut(&Error) + 'static) {
         self.on_warning = Some(Box::new(f));
     }
 
-    /// Active ou désactive la vérification statique des noms et des types avant
-    /// l'exécution (activée par défaut). Les vérifications à l'exécution restent actives.
+    /// Enables or disables static checking of names and types before execution
+    /// (enabled by default). Runtime checks stay active.
     pub fn set_static_checks(&mut self, enabled: bool) {
         self.static_checks = enabled;
     }
 
-    /// Active ou désactive la compilation native (JIT) des fonctions typées (activée par
-    /// défaut quand la fonctionnalité `jit` est compilée). Le résultat est le même ; seule
-    /// la vitesse change.
+    /// Enables or disables native (JIT) compilation of typed functions (enabled by
+    /// default when the `jit` feature is compiled in). The result is the same; only
+    /// the speed changes.
     pub fn set_jit(&mut self, enabled: bool) {
         self.rt.jit_enabled = enabled && cfg!(feature = "jit");
     }
 
-    /// Compile chaque fonction dès son premier appel (au lieu du deuxième) : sert aux
-    /// tests d'équivalence entre code natif et interpréteur.
+    /// Compiles each function on its first call (instead of the second): used by the
+    /// equivalence tests between native code and the interpreter.
     #[doc(hidden)]
     pub fn set_jit_eager(&mut self, eager: bool) {
         self.rt.jit_eager = eager;
     }
 
-    /// La fonction globale `name` a-t-elle été compilée en code natif (après au moins un
-    /// appel) ?
+    /// Whether the global function `name` was compiled to native code (after at least one
+    /// call).
     pub fn is_native(&self, name: &str) -> bool {
         match self.get_global(name).as_ref() {
             Some(Value::Function(f)) => match &**f {
@@ -122,13 +122,13 @@ impl Engine {
         }
     }
 
-    /// Profondeur d'appels maximale avant l'erreur « récursion infinie ? » (défaut : 1000).
+    /// Maximum call depth before the "infinite recursion?" error (default: 1000).
     pub fn set_max_call_depth(&mut self, depth: usize) {
         self.rt.max_depth = depth;
     }
 
-    /// Enregistre une fonction Rust. Ses arguments (jusqu'à 6) et sa valeur de retour
-    /// sont convertis automatiquement ; elle peut renvoyer `Result<T, E: Display>`.
+    /// Registers a Rust function. Its arguments (up to 6) and its return value are
+    /// converted automatically; it may return `Result<T, E: Display>`.
     pub fn register_fn<Args>(&mut self, name: &str, f: impl IntoNative<Args>) {
         let name: Rc<str> = name.into();
         let native = NativeFn {
@@ -138,7 +138,7 @@ impl Engine {
         self.define(&name, Value::Function(Rc::new(Function::Native(native))));
     }
 
-    /// Enregistre une fonction Rust qui reçoit les valeurs brutes.
+    /// Registers a Rust function that receives the raw values.
     pub fn register_raw(
         &mut self,
         name: &str,
@@ -156,13 +156,13 @@ impl Engine {
         self.rt.globals.define(sym, v, false);
     }
 
-    /// Définit (ou remplace) une variable globale modifiable par le script.
+    /// Defines (or replaces) a global variable the script can modify.
     pub fn set_global(&mut self, name: &str, v: impl IntoValue) {
         let sym = self.rt.interner.intern(name);
         self.rt.globals.define(sym, v.into_value(), true);
     }
 
-    /// Lit une variable globale.
+    /// Reads a global variable.
     pub fn get_global(&self, name: &str) -> Option<Value> {
         let sym = self.rt.interner.get(name)?;
         self.rt.globals.get(sym)
@@ -173,22 +173,22 @@ impl Engine {
     fn not_found(name: &str, what: &str) -> Errors {
         Error::new(
             crate::ErrorKind::Runtime,
-            format!("`{name}` n'est pas {what}"),
+            format!("`{name}` is not {what}"),
             None,
         )
         .into()
     }
 
-    /// Description d'un `type`, d'une `class` ou d'une `annotation` : champs, méthodes,
-    /// annotations (leurs arguments sont évalués maintenant).
+    /// Description of a `type`, `class` or `annotation`: fields, methods,
+    /// annotations (their arguments are evaluated now).
     pub fn type_info(&mut self, name: &str) -> Result<crate::reflect::TypeDesc, Errors> {
         match self.get_global(name).as_ref() {
             Some(Value::Type(info)) => Ok(self.rt.type_desc(info)?),
-            _ => Err(Self::not_found(name, "un type déclaré")),
+            _ => Err(Self::not_found(name, "a declared type")),
         }
     }
 
-    /// Description d'une fonction du script : paramètres, retour, annotations.
+    /// Description of a script function: parameters, return type, annotations.
     pub fn function_info(&mut self, name: &str) -> Result<crate::reflect::FnDesc, Errors> {
         match self.get_global(name).as_ref() {
             Some(Value::Function(f)) => match &**f {
@@ -196,35 +196,35 @@ impl Engine {
                     let p = c.proto.clone();
                     Ok(self.rt.fn_desc(name, &p)?)
                 }
-                _ => Err(Self::not_found(name, "une fonction du script")),
+                _ => Err(Self::not_found(name, "a script function")),
             },
-            _ => Err(Self::not_found(name, "une fonction du script")),
+            _ => Err(Self::not_found(name, "a script function")),
         }
     }
 
-    /// Description d'un `enum` : variantes, méthodes, annotations.
+    /// Description of an `enum`: variants, methods, annotations.
     pub fn enum_info(&mut self, name: &str) -> Result<crate::reflect::EnumDesc, Errors> {
         match self.get_global(name).as_ref() {
             Some(Value::Enum(info)) => Ok(self.rt.enum_desc(info)?),
-            _ => Err(Self::not_found(name, "un enum déclaré")),
+            _ => Err(Self::not_found(name, "a declared enum")),
         }
     }
 
-    /// Exécute du code. Ses `let` et `def` restent visibles pour les appels suivants.
+    /// Runs code. Its `let`s and `def`s stay visible to later calls.
     ///
-    /// Les erreurs de syntaxe sont toutes signalées en une fois (`Errors`) ; une erreur
-    /// d'exécution arrête le script et est seule.
+    /// Syntax errors are all reported at once (`Errors`); a runtime error stops the
+    /// script and is reported alone.
     pub fn eval(&mut self, src: &str) -> Result<Value, Errors> {
         self.eval_named(src, "<eval>")
     }
 
-    /// Comme [`eval`](Self::eval), en nommant le script pour les messages d'erreur.
+    /// Like [`eval`](Self::eval), naming the script for error messages.
     pub fn eval_named(&mut self, src: &str, name: &str) -> Result<Value, Errors> {
         let main = self.compile(src, name)?;
         Ok(self.rt.run(&main)?)
     }
 
-    /// Analyse, vérifie et compile un script en IR.
+    /// Parses, checks and compiles a script to IR.
     fn compile(&mut self, src: &str, name: &str) -> Result<Rc<Proto>, Errors> {
         let script = Rc::new(Script {
             src: src.into(),
@@ -264,24 +264,24 @@ impl Engine {
         .map_err(with_src)
     }
 
-    /// IR du code (représentation exécutée par l'interpréteur), en texte lisible.
+    /// IR of the code (the representation the interpreter runs), as readable text.
     pub fn ir(&mut self, src: &str) -> Result<String, Errors> {
         let main = self.compile(src, "<ir>")?;
         Ok(main.dump(&self.rt.interner))
     }
 
-    /// Exécute du code et convertit le résultat.
+    /// Runs code and converts the result.
     pub fn eval_as<T: FromValue>(&mut self, src: &str) -> Result<T, Errors> {
         let v = self.eval(src)?;
         T::from_value(&v).map_err(|msg| Error::new(crate::ErrorKind::Type, msg, None).into())
     }
 
-    /// Appelle une fonction du script (ou enregistrée) par son nom.
+    /// Calls a script (or registered) function by name.
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, Errors> {
         let f = self.get_global(name).ok_or_else(|| {
             Error::new(
                 crate::ErrorKind::Runtime,
-                format!("`{name}` n'est pas défini"),
+                format!("`{name}` is not defined"),
                 None,
             )
         })?;
@@ -290,24 +290,24 @@ impl Engine {
             .call_value(&f, CallArgs::plain(args), Default::default())?)
     }
 
-    /// Appelle une fonction avec des arguments Rust (un tuple) et convertit le résultat.
+    /// Calls a function with Rust arguments (a tuple) and converts the result.
     pub fn call_as<T: FromValue>(&mut self, name: &str, args: impl IntoArgs) -> Result<T, Errors> {
         let v = self.call(name, args.into_args())?;
         T::from_value(&v).map_err(|msg| Error::new(crate::ErrorKind::Type, msg, None).into())
     }
 
-    /// AST du code, en S-expressions (pour déboguer le parseur).
+    /// AST of the code, as S-expressions (to debug the parser).
     pub fn ast(&mut self, src: &str) -> Result<String, Errors> {
         let program = parser::parse(src, &mut self.rt.interner)?;
         Ok(printer::program(&program, &self.rt.interner))
     }
 
-    /// Représentation d'une valeur en code source (`"a"`, `[1, 2]`, `{x: 1}`).
+    /// Source-code representation of a value (`"a"`, `[1, 2]`, `{x: 1}`).
     pub fn inspect(&self, v: &Value) -> String {
         v.inspect(&self.rt.interner)
     }
 
-    /// Texte d'une valeur tel que l'afficherait `print`.
+    /// Text of a value as `print` would show it.
     pub fn display(&self, v: &Value) -> String {
         v.to_display(&self.rt.interner)
     }
@@ -317,20 +317,20 @@ impl Engine {
     }
 }
 
-// ─── Conversions Rust ⇄ script ──────────────────────────────────────────────
+// ─── Rust ⇄ script conversions ──────────────────────────────────────────────
 
-/// Conversion d'une valeur du script vers un type Rust.
+/// Conversion from a script value to a Rust type.
 pub trait FromValue: Sized {
     fn from_value(v: &Value) -> Result<Self, String>;
 }
 
-/// Conversion d'un type Rust vers une valeur du script.
+/// Conversion from a Rust type to a script value.
 pub trait IntoValue {
     fn into_value(self) -> Value;
 }
 
 fn mismatch(expected: &str, v: &Value) -> String {
-    format!("{expected} attendu, reçu {}", v.type_name())
+    format!("expected {expected}, got {}", v.type_name())
 }
 
 impl FromValue for Value {
@@ -351,14 +351,14 @@ macro_rules! int_conv {
             fn from_value(v: &Value) -> Result<Self, String> {
                 match v {
                     Value::Int(i) => <$t>::try_from(*i)
-                        .map_err(|_| format!("{i} ne tient pas dans un {}", stringify!($t))),
+                        .map_err(|_| format!("{i} does not fit in {}", stringify!($t))),
                     _ => Err(mismatch("int", v)),
                 }
             }
         }
         impl IntoValue for $t {
             fn into_value(self) -> Value {
-                // Les entiers plus grands que i64 sont saturés.
+                // Integers larger than i64 are saturated.
                 Value::Int(i64::try_from(self).unwrap_or(i64::MAX))
             }
         }
@@ -482,9 +482,9 @@ impl<T: FromValue> FromValue for Vec<T> {
                 .borrow()
                 .iter()
                 .enumerate()
-                .map(|(i, x)| T::from_value(x).map_err(|e| format!("élément {i} : {e}")))
+                .map(|(i, x)| T::from_value(x).map_err(|e| format!("element {i}: {e}")))
                 .collect(),
-            _ => Err(mismatch("liste", v)),
+            _ => Err(mismatch("list", v)),
         }
     }
 }
@@ -495,7 +495,7 @@ impl<T: IntoValue> IntoValue for Vec<T> {
     }
 }
 
-/// Valeur de retour d'une fonction Rust : `T` ou `Result<T, E>`.
+/// Return value of a Rust function: `T` or `Result<T, E>`.
 pub trait NativeReturn {
     fn into_result(self) -> Result<Value, String>;
 }
@@ -512,12 +512,12 @@ impl<T: IntoValue, E: Display> NativeReturn for Result<T, E> {
     }
 }
 
-/// Fonction Rust convertible en fonction du script. `Args` est le tuple des arguments.
+/// Rust function convertible into a script function. `Args` is the argument tuple.
 pub trait IntoNative<Args> {
     fn into_native(self, name: Rc<str>) -> Box<NativeImpl>;
 }
 
-/// Arguments Rust passés à [`Engine::call_as`] : un tuple de valeurs convertibles.
+/// Rust arguments passed to [`Engine::call_as`]: a tuple of convertible values.
 pub trait IntoArgs {
     fn into_args(self) -> Vec<Value>;
 }
@@ -534,9 +534,9 @@ macro_rules! native {
                 Box::new(move |args: &[Value]| {
                     if args.len() != $n {
                         return Err(format!(
-                            "`{name}` attend {} argument{}, reçu {}",
+                            "`{name}` expects {} argument{}, got {}",
                             $n,
-                            if $n > 1 { "s" } else { "" },
+                            if $n == 1 { "" } else { "s" },
                             args.len()
                         ));
                     }
@@ -545,7 +545,7 @@ macro_rules! native {
                     $(
                         let (i, a) = it.next().unwrap();
                         let $v = $t::from_value(a)
-                            .map_err(|e| format!("argument {} de `{name}` : {e}", i + 1))?;
+                            .map_err(|e| format!("argument {} of `{name}`: {e}", i + 1))?;
                     )*
                     (self)($($v),*).into_result()
                 })

@@ -2,7 +2,7 @@
 name = "bokoni"
 version = "0.1.0"
 edition = "2024"
-description = "Langage de script intégré à Rust, syntaxe à la Ruby, typage graduel"
+description = "Scripting language embedded in Rust, Ruby-like syntax, gradual typing"
 
 [lib]
 path = "src/lib.rs"
@@ -27,7 +27,7 @@ peg = "0.8"
 
 [features]
 default = ["jit"]
-# Compilation native des fonctions typées (Cranelift).
+# Native compilation of typed functions (Cranelift).
 jit = [
     "dep:cranelift-codegen",
     "dep:cranelift-frontend",

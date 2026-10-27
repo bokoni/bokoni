@@ -1,15 +1,15 @@
-//! Compilation de l'AST vers l'IR ([`crate::ir`]).
+//! Compilation from the AST to the IR ([`crate::ir`]).
 //!
-//! Deux passes :
-//! 1. Analyse ([`Resolver`]) : quelles variables sont capturées par une closure (elles iront
-//!    dans des cellules, les autres dans des registres), et quelles expressions contiennent
-//!    une assignation (pour préserver l'ordre d'évaluation de `x + (x = 2)`).
-//! 2. Traduction ([`Compiler`]) : une fonction IR par fonction, lambda, méthode et valeur
-//!    par défaut de champ ; le programme principal est la fonction `<main>`.
+//! Two passes:
+//! 1. Analysis ([`Resolver`]): which variables are captured by a closure (they go into
+//!    cells, the others into registers), and which expressions contain an assignment
+//!    (to preserve the evaluation order of `x + (x = 2)`).
+//! 2. Translation ([`Compiler`]): one IR function per function, lambda, method and field
+//!    default value; the main program is the `<main>` function.
 //!
-//! Registres typés : une variable est `int` / `float` / `bool` si son annotation le dit ou
-//! si le vérificateur l'a déduit ; les temporaires suivent les règles des opérations
-//! (`int + int` : `int`). Une valeur dynamique n'y entre que par une garde.
+//! Typed registers: a variable is `int` / `float` / `bool` if its annotation says so or
+//! if the checker inferred it; temporaries follow the rules of the operations
+//! (`int + int`: `int`). A dynamic value only enters them through a guard.
 
 use crate::ast::*;
 use crate::diagnostic::{Error, Errors};
@@ -27,7 +27,7 @@ use std::rc::Rc;
 
 type FxHashSet<T> = HashSet<T, FxBuild>;
 
-/// Nom réservé de `self` dans les portées.
+/// Reserved name of `self` in scopes.
 const SELF: Symbol = Symbol(u32::MAX);
 
 pub use crate::check::Prims;
@@ -67,7 +67,7 @@ pub fn compile(
     }
 }
 
-// ─── Analyse : captures et assignations ─────────────────────────────────────
+// ─── Analysis: captures and assignments ─────────────────────────────────────
 
 struct RScope {
     names: Vec<(Symbol, u32)>,
@@ -78,15 +78,15 @@ struct RScope {
 struct Resolver<'a> {
     ast: &'a Ast,
     scopes: Vec<RScope>,
-    /// Profondeur de fonction courante.
+    /// Current function depth.
     depth: usize,
-    /// Déclarations (position) capturées par une fonction imbriquée.
+    /// Declarations (by position) captured by a nested function.
     captured: FxHashSet<u32>,
-    /// Expression contenant une assignation.
+    /// Expressions containing an assignment.
     assign: Vec<bool>,
 }
 
-/// Noms déclarés par un bloc (visibles dans tout le bloc) : `let`, `def`, types.
+/// Names declared by a block (visible in the whole block): `let`, `def`, types.
 fn block_decls(b: &Block) -> Vec<(Symbol, u32)> {
     let mut out = Vec::new();
     for s in &b.stmts {
@@ -242,7 +242,7 @@ impl Resolver<'_> {
         a
     }
 
-    /// Analyse une expression ; vrai si elle contient une assignation.
+    /// Analyzes an expression; true if it contains an assignment.
     fn expr(&mut self, e: ExprId) -> bool {
         stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || self.expr_inner(e))
     }
@@ -392,7 +392,7 @@ impl Resolver<'_> {
     }
 }
 
-// ─── Traduction ─────────────────────────────────────────────────────────────
+// ─── Translation ────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Store {
@@ -406,16 +406,16 @@ enum Store {
 struct Var {
     name: Symbol,
     store: Store,
-    /// Type du registre (`Store::Reg`), `Value` sinon.
+    /// Type of the register (`Store::Reg`), `Value` otherwise.
     ty: RegTy,
     mutable: bool,
-    /// Type imposé aux valeurs rangées dans la variable (cellules comprises).
+    /// Type enforced on values stored in the variable (cells included).
     guard: Option<RegTy>,
 }
 
 struct Scope {
     vars: Vec<Var>,
-    /// Portée principale : ses variables sont des globales.
+    /// Main scope: its variables are globals.
     global: bool,
 }
 
@@ -432,8 +432,8 @@ struct Fn_ {
     is_var: Vec<bool>,
     ncells: u32,
     captures: Vec<Capture>,
-    /// Nom → (upvalue, variable, fonction de déclaration). Une variable extérieure donnée
-    /// a un seul nom visible ici.
+    /// Name → (upvalue, variable, declaring function). A given outer variable has a
+    /// single visible name here.
     upvals: Vec<(Symbol, u32, Var, usize)>,
     blocks: Vec<BB>,
     cur: BlockId,
@@ -446,19 +446,19 @@ struct Fn_ {
     children: Vec<Rc<Proto>>,
     decls: Vec<Decl>,
     scopes: Vec<Scope>,
-    /// (cible de `next`, cible de `break`)
+    /// (target of `next`, target of `break`)
     loops: Vec<(BlockId, BlockId)>,
     free: [Vec<Reg>; 4],
     temps: Vec<Reg>,
     params: Vec<ParamProto>,
     ret: Option<TypeRef>,
-    /// Champs de `self` (méthode d'un `type` / d'une `class`, et ses lambdas).
+    /// Fields of `self` (method of a `type` / `class`, and its lambdas).
     this: Option<Rc<[Symbol]>>,
-    /// Le registre 0 est `self`.
+    /// Register 0 is `self`.
     has_self: bool,
-    /// Champs du type dont on calcule une valeur par défaut.
+    /// Fields of the type whose default value is being computed.
     ctx_fields: Option<Rc<[Symbol]>>,
-    /// Index de la fonction bloc `do` englobante la plus proche (noms → champs).
+    /// Index of the nearest enclosing `do` block function (names → fields).
     region: Option<usize>,
     decl: Option<Rc<FnDecl>>,
     annotations: Annotations,
@@ -488,7 +488,7 @@ struct Compiler<'a> {
 type Op = (Reg, RegTy);
 
 impl Compiler<'_> {
-    // ─── Fonctions en construction ───────────────────────────────────────────
+    // ─── Functions under construction ────────────────────────────────────────
 
     fn f(&mut self) -> &mut Fn_ {
         self.fns.last_mut().unwrap()
@@ -554,7 +554,7 @@ impl Compiler<'_> {
         let reachable = compact(&mut f.blocks);
         f.blocks = reachable;
         let plain_params = f.params.iter().all(|p| p.ty.is_none());
-        // Boucle : un saut vers un bloc qui ne vient pas après.
+        // Loop: a jump to a block that does not come later.
         let has_loop = f.blocks.iter().enumerate().any(|(i, b)| {
             b.term.as_ref().is_some_and(|(t, _)| {
                 let mut t = t.clone();
@@ -622,7 +622,7 @@ impl Compiler<'_> {
         if b.term.is_some() {
             return;
         }
-        // `r = a <i b` suivi de `si r` : comparaison et branchement fusionnés.
+        // `r = a <i b` followed by `if r`: comparison and branch fused.
         let t = match t {
             Term::Branch { cond, then, else_ } if !f.is_var[cond as usize] => match b.instrs.last()
             {
@@ -680,7 +680,7 @@ impl Compiler<'_> {
         self.f().cur
     }
 
-    // ─── Registres ───────────────────────────────────────────────────────────
+    // ─── Registers ───────────────────────────────────────────────────────────
 
     fn new_reg(&mut self, ty: RegTy, var: bool) -> Reg {
         let f = self.f();
@@ -689,7 +689,7 @@ impl Compiler<'_> {
         (f.regs.len() - 1) as Reg
     }
 
-    /// Temporaire (réutilisé après l'instruction en cours).
+    /// Temporary (reused after the current instruction).
     fn tmp(&mut self, ty: RegTy) -> Reg {
         let r = match self.f().free[ty_index(ty)].pop() {
             Some(r) => r,
@@ -699,7 +699,7 @@ impl Compiler<'_> {
         r
     }
 
-    /// `n` temporaires consécutifs (`valeur`).
+    /// `n` consecutive temporaries (`value`).
     fn range(&mut self, n: u32) -> Reg {
         let start = self.f().regs.len() as Reg;
         for _ in 0..n {
@@ -742,7 +742,7 @@ impl Compiler<'_> {
         c
     }
 
-    /// Erreur à l'exécution (le vérificateur l'a déjà signalée, s'il est actif).
+    /// Runtime error (the checker already reported it, if enabled).
     fn fail(&mut self, msg: impl Into<String>, span: Span) -> Op {
         let c = self.konst(Value::Str(msg.into().into()));
         self.emit(Instr::Fail(c), span);
@@ -750,15 +750,15 @@ impl Compiler<'_> {
         (r, RegTy::Value)
     }
 
-    /// Opérande en registre `valeur` (pour une liste, un appel…).
+    /// Operand in a `value` register (for a list, a call…).
     fn boxed(&mut self, op: Op, _span: Span) -> Reg {
         op.0
     }
 
-    /// Copie dans `dst` en convertissant si besoin (`int` → `float`, garde vers typé).
+    /// Copies into `dst`, converting if needed (`int` → `float`, guard into typed).
     ///
-    /// Si `src` est un temporaire produit par l'instruction précédente, celle-ci écrit
-    /// directement dans `dst` : `s += i` donne `r0 = r0 +i r7` et non deux instructions.
+    /// If `src` is a temporary produced by the previous instruction, that instruction
+    /// writes directly into `dst`: `s += i` gives `r0 = r0 +i r7`, not two instructions.
     fn store_to(&mut self, dst: Reg, src: Op, span: Span) {
         let dty = self.f().regs[dst as usize];
         if dst == src.0 {
@@ -785,7 +785,7 @@ impl Compiler<'_> {
         self.emit(ins, span);
     }
 
-    /// Valeur conforme au type imposé `guard` (pour une cellule ou une globale).
+    /// Value conforming to the enforced type `guard` (for a cell or a global).
     fn guarded(&mut self, src: Op, guard: Option<RegTy>, span: Span) -> Op {
         match guard {
             Some(g) if g != src.1 => {
@@ -810,7 +810,7 @@ impl Compiler<'_> {
         self.f().scopes.pop();
     }
 
-    /// Type d'une variable : annotation, sinon déduction du vérificateur.
+    /// Type of a variable: its annotation, otherwise the checker's inference.
     fn var_prim(&self, key: u32, ann: Option<&TypeExpr>) -> Option<RegTy> {
         if let Some(t) = ann {
             return prim_of(t, self.i);
@@ -818,7 +818,7 @@ impl Compiler<'_> {
         self.prims.vars.get(&key).copied()
     }
 
-    /// Déclare une variable locale dans la portée courante.
+    /// Declares a local variable in the current scope.
     fn declare_local(
         &mut self,
         name: Symbol,
@@ -866,8 +866,8 @@ impl Compiler<'_> {
         var
     }
 
-    /// Cherche `name` dans la fonction `fi` et ses englobantes. Renvoie la variable vue
-    /// depuis `fi` et l'index de la fonction où elle est déclarée.
+    /// Looks up `name` in function `fi` and its enclosing functions. Returns the variable
+    /// as seen from `fi` and the index of the function that declares it.
     fn resolve_in(&mut self, fi: usize, name: Symbol) -> Option<(Var, usize)> {
         for s in self.fns[fi].scopes.iter().rev() {
             if let Some(v) = s.vars.iter().rev().find(|v| v.name == name) {
@@ -886,10 +886,10 @@ impl Compiler<'_> {
             Store::Cell(c) => Capture::Cell(c),
             Store::Up(u) => Capture::Up(u),
             Store::Reg(_) => {
-                // L'analyse aurait dû mettre cette variable dans une cellule.
+                // The analysis should have put this variable in a cell.
                 let n = self.i.resolve(name).to_string();
                 self.errors.push(Error::syntax(
-                    format!("erreur interne du compilateur : capture de `{n}`"),
+                    format!("internal compiler error: capture of `{n}`"),
                     Span::default(),
                 ));
                 return None;
@@ -912,7 +912,7 @@ impl Compiler<'_> {
         self.resolve_in(fi, name)
     }
 
-    /// Le nom doit-il être résolu dynamiquement (champ d'une construction en cours) ?
+    /// Must the name be resolved dynamically (field of a construction in progress)?
     fn named_access(&self, name: Symbol, origin: Option<usize>, store: Option<Store>) -> bool {
         if name == SELF {
             return false;
@@ -935,7 +935,7 @@ impl Compiler<'_> {
         }
     }
 
-    /// Champ du type dont on calcule une valeur par défaut ?
+    /// Field of the type whose default value is being computed?
     fn ctx_field(&self, name: Symbol) -> Option<u32> {
         let fields = self.fns.last()?.ctx_fields.as_ref()?;
         fields.iter().position(|f| *f == name).map(|i| i as u32)
@@ -1003,8 +1003,8 @@ impl Compiler<'_> {
         }
     }
 
-    /// Range une valeur dans une variable existante (`init` : première valeur d'un `let`,
-    /// permise même si la variable est constante).
+    /// Stores a value in an existing variable (`init`: first value of a `let`,
+    /// allowed even if the variable is constant).
     fn write(&mut self, v: Var, src: Op, init: bool, span: Span) {
         match v.store {
             Store::Reg(r) => self.store_to(r, src, span),
@@ -1035,7 +1035,7 @@ impl Compiler<'_> {
             let fallback = match found {
                 Some((v, _)) if v.mutable => Self::fallback(v.store),
                 Some(_) => Fallback::None,
-                // Globale définie par un script précédent (REPL).
+                // Global defined by a previous script (REPL).
                 None if self.globals.get(name).is_some() => {
                     Fallback::Global(self.globals.slot(name))
                 }
@@ -1056,7 +1056,7 @@ impl Compiler<'_> {
             Some((v, _)) if !v.mutable => {
                 let n = self.i.resolve(name).to_string();
                 self.fail(
-                    format!("`{n}` ne peut pas être modifié (constante, fonction ou type)"),
+                    format!("`{n}` cannot be modified (constant, function or type)"),
                     span,
                 );
             }
@@ -1065,7 +1065,7 @@ impl Compiler<'_> {
                 let n = self.i.resolve(name).to_string();
                 let defined = self.globals.get(name).is_some();
                 if n.starts_with(|c: char| c.is_ascii_uppercase()) && !defined {
-                    // `NOM = valeur` : constante.
+                    // `NAME = value`: constant.
                     let global = self.f().scopes.last().is_some_and(|s| s.global);
                     let v = if global {
                         self.declare_global(name, false)
@@ -1074,7 +1074,7 @@ impl Compiler<'_> {
                     };
                     self.write(v, src, true, span);
                 } else {
-                    // Globale (d'un script précédent) ; l'exécution vérifie qu'elle existe.
+                    // Global (from a previous script); execution checks that it exists.
                     let g = self.globals.slot(name);
                     self.emit(Instr::SetGlobal(g, src.0), span);
                 }
@@ -1082,7 +1082,7 @@ impl Compiler<'_> {
         }
     }
 
-    // ─── Types et formes littérales ──────────────────────────────────────────
+    // ─── Types and literal shapes ────────────────────────────────────────────
 
     fn type_ref(&mut self, t: &TypeExpr) -> TypeRef {
         let ty = self.rt_type(t);
@@ -1150,7 +1150,7 @@ impl Compiler<'_> {
         }
     }
 
-    /// Index de la forme littérale de `e` dans la fonction courante.
+    /// Index of the literal shape of `e` in the current function.
     fn shape(&mut self, e: ExprId) -> Option<u32> {
         let s = self.shape_rc(e)?;
         let f = self.f();
@@ -1158,7 +1158,7 @@ impl Compiler<'_> {
         Some((f.shapes.len() - 1) as u32)
     }
 
-    // ─── Programme, blocs, instructions ──────────────────────────────────────
+    // ─── Program, blocks, statements ─────────────────────────────────────────
 
     fn main(&mut self, body: &Block) -> Rc<Proto> {
         self.begin(ProtoKind::Main, "<main>".into());
@@ -1168,7 +1168,7 @@ impl Compiler<'_> {
         self.finish(v, None, span)
     }
 
-    /// Instructions d'un bloc dans la portée courante (déclarations remontées en tête).
+    /// Statements of a block in the current scope (declarations hoisted to the top).
     fn block_body(&mut self, b: &Block, top: bool) -> Op {
         self.hoist(b, top);
         let n = b.stmts.len();
@@ -1177,7 +1177,7 @@ impl Compiler<'_> {
             let mark = self.temps_mark();
             let v = self.stmt(s);
             if k + 1 == n {
-                // La valeur de la dernière instruction reste vivante pour l'appelant.
+                // The value of the last statement stays alive for the caller.
                 last = v;
             } else {
                 self.release(mark);
@@ -1202,7 +1202,7 @@ impl Compiler<'_> {
         (r, RegTy::Value)
     }
 
-    /// Déclare les `let` (variables), types, enums et `def` (closures) du bloc.
+    /// Declares the block's `let`s (variables), types, enums and `def`s (closures).
     fn hoist(&mut self, b: &Block, top: bool) {
         let mut let_count: FxHashMap<Symbol, u32> = FxHashMap::default();
         for s in &b.stmts {
@@ -1214,7 +1214,7 @@ impl Compiler<'_> {
                 }
             }
         }
-        // 1. Variables des `let`.
+        // 1. Variables of the `let`s.
         for s in &b.stmts {
             if let StmtKind::Let(l) = &s.kind {
                 let mut names = Vec::new();
@@ -1238,7 +1238,7 @@ impl Compiler<'_> {
                     if top {
                         self.declare_global(n, true);
                     } else {
-                        // Plusieurs `let` du même nom : type libre.
+                        // Several `let`s with the same name: untyped.
                         let prim = if let_count[&n] == 1 {
                             self.var_prim(key, ann)
                         } else {
@@ -1249,19 +1249,19 @@ impl Compiler<'_> {
                 }
             }
         }
-        // 2. Types et enums (programme principal uniquement).
+        // 2. Types and enums (main program only).
         for s in &b.stmts {
             match &s.kind {
                 StmtKind::Type(t) if top => self.type_decl(t),
                 StmtKind::Enum(e) if top => self.enum_decl(e),
                 StmtKind::Type(_) | StmtKind::Enum(_) => self.errors.push(Error::syntax(
-                    "les déclarations `type`, `class`, `annotation` et `enum` se font au niveau principal du script",
+                    "`type`, `class`, `annotation` and `enum` declarations must be at the top level of the script",
                     s.span,
                 )),
                 _ => {}
             }
         }
-        // 3. Fonctions : toutes déclarées, puis leurs closures créées.
+        // 3. Functions: all declared, then their closures created.
         let mut defs = Vec::new();
         for s in &b.stmts {
             if let StmtKind::Def(f) = &s.kind {
@@ -1290,7 +1290,7 @@ impl Compiler<'_> {
         }
     }
 
-    /// Instruction ; sa valeur (`None` pour une déclaration : elle vaut `nil`).
+    /// Statement; returns its value (`None` for a declaration: it evaluates to `nil`).
     fn stmt(&mut self, s: &Stmt) -> Option<Op> {
         match &s.kind {
             StmtKind::Expr(e) => Some(self.expr(*e)),
@@ -1315,12 +1315,12 @@ impl Compiler<'_> {
                 self.bind(&l.pattern, v, span);
                 None
             }
-            // Déclarés en tête de bloc.
+            // Declared at the top of the block.
             StmtKind::Def(_) | StmtKind::Type(_) | StmtKind::Enum(_) => None,
         }
     }
 
-    /// Range une valeur dans les variables d'un motif `let`.
+    /// Stores a value into the variables of a `let` pattern.
     fn bind(&mut self, p: &Pattern, v: Op, span: Span) {
         match p {
             Pattern::Name(n, _) => {
@@ -1388,9 +1388,9 @@ impl Compiler<'_> {
         }
     }
 
-    // ─── Fonctions ───────────────────────────────────────────────────────────
+    // ─── Functions ───────────────────────────────────────────────────────────
 
-    /// Compile une fonction imbriquée ; renvoie son index dans la fonction courante.
+    /// Compiles a nested function; returns its index in the current function.
     #[allow(clippy::too_many_arguments)]
     fn function(
         &mut self,
@@ -1459,7 +1459,7 @@ impl Compiler<'_> {
                 });
             }
         }
-        // Paramètres : registres consécutifs.
+        // Parameters: consecutive registers.
         let mut regs = Vec::new();
         for (p, annotations) in params.iter().zip(param_annotations) {
             let prim = p.ty.as_ref().and_then(|t| prim_of(t, self.i));
@@ -1472,7 +1472,7 @@ impl Compiler<'_> {
                     Some(i) => Some(i as u32),
                     None => {
                         self.fail(
-                            "un paramètre `@champ` ne s'utilise que dans une méthode",
+                            "an `@field` parameter can only be used inside a method",
                             p.span,
                         );
                         None
@@ -1491,7 +1491,7 @@ impl Compiler<'_> {
                 annotations,
             });
         }
-        // Variables des paramètres (registre, ou cellule si capturé).
+        // Parameter variables (register, or cell if captured).
         let mut vars = Vec::new();
         for (p, &(r, prim)) in params.iter().zip(&regs) {
             let v = Var {
@@ -1504,7 +1504,7 @@ impl Compiler<'_> {
             self.f().scopes.last_mut().unwrap().vars.push(v);
             vars.push(v);
         }
-        // Valeurs par défaut des paramètres non fournis.
+        // Default values of parameters not provided.
         for (k, p) in params.iter().enumerate() {
             let Some(d) = p.default else { continue };
             let (r, prim) = regs[k];
@@ -1544,7 +1544,7 @@ impl Compiler<'_> {
             self.switch(bnext);
             self.release(mark);
         }
-        // Champs `@x` de `init`, paramètres capturés.
+        // `@x` fields of `init`, captured parameters.
         for (k, p) in params.iter().enumerate() {
             let r = regs[k].0;
             if let Some(idx) = self.f().params[k].field {
@@ -1583,7 +1583,7 @@ impl Compiler<'_> {
     fn lambda(&mut self, id: LambdaId, kind: ProtoKind) -> u32 {
         let l = self.ast.lambda(id);
         let name: Rc<str> = if kind == ProtoKind::DoBlock {
-            "bloc".into()
+            "block".into()
         } else {
             "lambda".into()
         };
@@ -1592,10 +1592,9 @@ impl Compiler<'_> {
 
     // ─── Annotations ─────────────────────────────────────────────────────────
 
-    /// Compile `@[Nom(args)]` : une fonction sans paramètre qui construit l'annotation.
-    /// Elle est compilée à part, sans fonction englobante : ses noms désignent des
-    /// globales (les arguments d'une annotation sont des constantes, pas des variables
-    /// locales).
+    /// Compiles `@[Name(args)]`: a parameterless function that builds the annotation.
+    /// It is compiled separately, without an enclosing function: its names refer to
+    /// globals (an annotation's arguments are constants, not local variables).
     fn annotations_ir(&mut self, uses: &[AnnotationUse]) -> Annotations {
         if uses.is_empty() {
             return Rc::new([]);
@@ -1605,7 +1604,7 @@ impl Compiler<'_> {
         for u in uses {
             let [name] = u.path.as_slice() else {
                 self.errors.push(Error::syntax(
-                    "nom d'annotation attendu : `@[Nom]` ou `@[Nom(…)]`",
+                    "expected an annotation name: `@[Name]` or `@[Name(…)]`",
                     u.span,
                 ));
                 continue;
@@ -1638,9 +1637,9 @@ impl Compiler<'_> {
         out.into()
     }
 
-    // ─── Déclarations de types ───────────────────────────────────────────────
+    // ─── Type declarations ───────────────────────────────────────────────────
 
-    /// Champs : (nom, type, défaut, annotations).
+    /// Fields: (name, type, default, annotations).
     #[allow(clippy::type_complexity)]
     fn type_fields(
         &self,
@@ -1679,7 +1678,7 @@ impl Compiler<'_> {
                 let span = self.ast.span(d);
                 self.begin(
                     ProtoKind::FieldDefault,
-                    format!("défaut de {}", self.i.resolve(*name)).into(),
+                    format!("default of {}", self.i.resolve(*name)).into(),
                 );
                 self.f().ctx_fields = Some(names.clone());
                 self.push_scope(false);
@@ -1714,8 +1713,8 @@ impl Compiler<'_> {
                     methods.push((f.name, p));
                 }
                 Member::Stmt(s) => self.errors.push(Error::syntax(
-                    "seuls des champs et des méthodes sont permis dans un `type` / une `class` \
-                     (les macros arriveront plus tard)",
+                    "only fields and methods are allowed in a `type` / `class` \
+                     (macros will come later)",
                     s.span,
                 )),
                 Member::Field(_) => {}
@@ -1806,8 +1805,8 @@ impl Compiler<'_> {
         stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || self.expr_inner(e))
     }
 
-    /// Opérandes successifs ; un opérande qui est une variable est copié si une
-    /// expression suivante peut la modifier (`x + (x = 2)` vaut `1 + 2`).
+    /// Successive operands; an operand that is a variable is copied if a later
+    /// expression may modify it (`x + (x = 2)` is `1 + 2`).
     fn operands(&mut self, es: &[ExprId]) -> Vec<Op> {
         let mut out = Vec::with_capacity(es.len());
         for (k, &e) in es.iter().enumerate() {
@@ -1823,7 +1822,7 @@ impl Compiler<'_> {
         out
     }
 
-    /// Évalue `es` dans des registres consécutifs `valeur` ; renvoie le premier.
+    /// Evaluates `es` into consecutive `value` registers; returns the first.
     fn eval_range(&mut self, es: &[ExprId]) -> Reg {
         let start = self.range(es.len() as u32);
         for (k, &e) in es.iter().enumerate() {
@@ -1893,7 +1892,7 @@ impl Compiler<'_> {
             ExprKind::Path(p) => {
                 let p = ast.get(p).to_vec();
                 if p.len() != 2 {
-                    return self.fail("seuls les chemins `Enum::Variante` sont permis", span);
+                    return self.fail("only `Enum::Variant` paths are allowed", span);
                 }
                 let head = self.read_var(p[0], span);
                 let d = self.tmp(RegTy::Value);
@@ -2047,7 +2046,7 @@ impl Compiler<'_> {
             }
             ExprKind::Field(recv, name) => {
                 let r = self.expr(recv);
-                // Type du champ connu : lecture et vérification vers un registre typé.
+                // Field type known: read and check into a typed register.
                 if let Some(&t) = self.prims.fields.get(&e.0) {
                     let d = self.tmp(t);
                     self.emit(Instr::FieldAs(d, r.0, name, t), span);
@@ -2184,7 +2183,7 @@ impl Compiler<'_> {
                     }
                     None => self.fail(
                         format!(
-                            "`{}` en dehors d'une boucle",
+                            "`{}` outside of a loop",
                             if is_break { "break" } else { "next" }
                         ),
                         span,
@@ -2194,7 +2193,7 @@ impl Compiler<'_> {
         }
     }
 
-    /// Réunit les valeurs des branches (`if`, `case`) dans un registre.
+    /// Gathers the values of the branches (`if`, `case`) into one register.
     fn merge(&mut self, branches: &[(BlockId, Op)], span: Span) -> Op {
         let blocks = &self.fns.last().unwrap().blocks;
         let live: Vec<&(BlockId, Op)> = branches
@@ -2226,7 +2225,7 @@ impl Compiler<'_> {
         match (a.1, b.1) {
             (RegTy::Int, RegTy::Int) if arith || cmp => {
                 let ty = if cmp { RegTy::Bool } else { RegTy::Int };
-                // Constante à droite, tout juste chargée : opérande immédiat.
+                // Constant on the right, just loaded: immediate operand.
                 let k = {
                     let f = self.f();
                     let blk = &mut f.blocks[f.cur as usize];
@@ -2278,13 +2277,13 @@ impl Compiler<'_> {
         match self.resolve(SELF) {
             Some(_) => self.read_var(SELF, span),
             None => self.fail(
-                "`self` et `@champ` ne s'utilisent que dans une méthode",
+                "`self` and `@field` can only be used inside a method",
                 span,
             ),
         }
     }
 
-    /// Index du champ `@name` de `self`.
+    /// Index of the `@name` field of `self`.
     fn this_field(&mut self, name: Symbol, span: Span) -> Option<u32> {
         let this = self.f().this.clone();
         match this {
@@ -2292,13 +2291,13 @@ impl Compiler<'_> {
                 Some(i) => Some(i as u32),
                 None => {
                     let n = self.i.resolve(name).to_string();
-                    self.fail(format!("pas de champ `@{n}`"), span);
+                    self.fail(format!("no field `@{n}`"), span);
                     None
                 }
             },
             None => {
                 self.fail(
-                    "`self` et `@champ` ne s'utilisent que dans une méthode",
+                    "`self` and `@field` can only be used inside a method",
                     span,
                 );
                 None
@@ -2363,8 +2362,8 @@ impl Compiler<'_> {
                     v = self.binary(op, old, v, span);
                     shape = None;
                 }
-                // Variable dans un registre : la valeur y est rangée directement, et le
-                // registre est la valeur de l'assignation.
+                // Variable in a register: the value is stored there directly, and the
+                // register is the value of the assignment.
                 if let Some((var, origin)) = self.resolve(name)
                     && var.mutable
                     && let Store::Reg(r) = var.store
@@ -2373,7 +2372,7 @@ impl Compiler<'_> {
                     self.store_to(r, v, tspan);
                     return (r, var.ty);
                 }
-                // Copie : la valeur de l'assignation ne doit pas changer si la variable change.
+                // Copy: the value of the assignment must not change if the variable changes.
                 let result = if self.f().is_var[v.0 as usize] {
                     let t = self.tmp(v.1);
                     self.emit(Instr::Move(t, v.0), span);
@@ -2440,7 +2439,7 @@ impl Compiler<'_> {
                 self.emit(Instr::SetIndex(ops[0].0, ops[1].0, v.0), tspan);
                 v
             }
-            _ => self.fail("on ne peut pas assigner à cette expression", tspan),
+            _ => self.fail("cannot assign to this expression", tspan),
         }
     }
 
@@ -2448,7 +2447,7 @@ impl Compiler<'_> {
         let ast = self.ast;
         let exit = self.new_block();
         self.push_scope(false);
-        // `for i in a..b` : compteur entier, sans itérateur.
+        // `for i in a..b`: integer counter, no iterator.
         if let (ExprKind::Range { lo, hi, inclusive }, [(name, vspan)]) =
             (ast.kind(x.iter), x.vars.as_slice())
         {
@@ -2479,7 +2478,7 @@ impl Compiler<'_> {
                 && !assigns(ast, &x.body, *name)
                 && prim == Some(RegTy::Int)
             {
-                // La variable n'est pas modifiée par le corps : c'est le compteur lui-même.
+                // The body does not modify the variable: it is the counter itself.
                 self.f().scopes.last_mut().unwrap().vars.push(Var {
                     name: *name,
                     store: Store::Reg(k),
@@ -2498,8 +2497,8 @@ impl Compiler<'_> {
             self.f().loops.pop();
             self.term(Term::Jump(step), span);
             self.switch(step);
-            // Intervalle inclusif : sortie après la borne, sans l'incrémenter (pas de
-            // dépassement pour `a..i64::MAX`).
+            // Inclusive range: exit after the bound without incrementing it (no
+            // overflow for `a..i64::MAX`).
             if inclusive {
                 let last = self.tmp(RegTy::Bool);
                 self.emit(Instr::IBin(BinOp::Eq, last, k, end), span);
@@ -2596,7 +2595,7 @@ fn prim_name<'a>(t: &TypeExpr, i: &'a Interner) -> Option<&'a str> {
     }
 }
 
-/// Type de registre d'une annotation simple (`int`, `float`, `bool`).
+/// Register type of a simple annotation (`int`, `float`, `bool`).
 fn prim_of(t: &TypeExpr, i: &Interner) -> Option<RegTy> {
     match prim_name(t, i)? {
         "int" => Some(RegTy::Int),
@@ -2606,7 +2605,7 @@ fn prim_of(t: &TypeExpr, i: &Interner) -> Option<RegTy> {
     }
 }
 
-/// Registre écrit par une instruction à une seule destination (pour `store_to`).
+/// Register written by a single-destination instruction (for `store_to`).
 fn dest_mut(ins: &mut Instr) -> Option<&mut Reg> {
     use Instr::*;
     Some(match ins {
@@ -2633,7 +2632,7 @@ fn dest_mut(ins: &mut Instr) -> Option<&mut Reg> {
     })
 }
 
-/// Le bloc (ou ses lambdas) assigne-t-il la variable `name` ?
+/// Does the block (or its lambdas) assign the variable `name`?
 fn assigns(ast: &Ast, b: &Block, name: Symbol) -> bool {
     let mut found = false;
     visit_block(ast, b, &mut |e| {
@@ -2646,7 +2645,7 @@ fn assigns(ast: &Ast, b: &Block, name: Symbol) -> bool {
     found
 }
 
-/// Appelle `f` sur chaque expression d'un bloc, sous-expressions et lambdas comprises.
+/// Calls `f` on each expression of a block, sub-expressions and lambdas included.
 fn visit_block(ast: &Ast, b: &Block, f: &mut dyn FnMut(ExprId)) {
     for s in &b.stmts {
         match &s.kind {
@@ -2778,7 +2777,7 @@ fn is_cmp(op: BinOp) -> bool {
     )
 }
 
-/// Les sauts vers un bloc vide qui ne fait que sauter vont directement à sa cible.
+/// Jumps to an empty block that only jumps go straight to its target.
 fn thread_jumps(blocks: &mut [BB]) {
     let n = blocks.len();
     let target = |blocks: &[BB], mut b: BlockId| {
@@ -2804,12 +2803,12 @@ fn thread_jumps(blocks: &mut [BB]) {
     }
 }
 
-/// Un bloc qui saute sans condition vers un bloc dont il est le seul prédécesseur absorbe
-/// ce bloc : moins de sauts à exécuter. Le bloc absorbé devient inaccessible.
+/// A block that jumps unconditionally to a block whose only predecessor it is absorbs
+/// that block: fewer jumps to run. The absorbed block becomes unreachable.
 fn merge_blocks(blocks: &mut [BB]) {
     loop {
         let mut preds = vec![0u32; blocks.len()];
-        preds[0] = 1; // point d'entrée
+        preds[0] = 1; // entry point
         for b in blocks.iter_mut() {
             if let Some((t, _)) = &mut b.term {
                 for x in t.targets_mut() {
@@ -2833,7 +2832,7 @@ fn merge_blocks(blocks: &mut [BB]) {
             BB {
                 instrs: Vec::new(),
                 spans: Vec::new(),
-                // Inaccessible : il saute vers lui-même et n'est plus jamais atteint.
+                // Unreachable: it jumps to itself and is never reached again.
                 term: Some((Term::Jump(t as BlockId), Span::default())),
             },
         );
@@ -2843,7 +2842,7 @@ fn merge_blocks(blocks: &mut [BB]) {
     }
 }
 
-/// Ne garde que les blocs accessibles depuis l'entrée, renumérotés dans l'ordre.
+/// Keeps only the blocks reachable from the entry, renumbered in order.
 fn compact(blocks: &mut Vec<BB>) -> Vec<BB> {
     let n = blocks.len();
     let mut seen = vec![false; n];

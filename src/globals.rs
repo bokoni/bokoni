@@ -1,7 +1,7 @@
-//! Variables globales : une case par nom, qui persiste d'un script à l'autre (REPL).
+//! Global variables: one slot per name, persisting from one script to the next (REPL).
 //!
-//! Le compilateur résout chaque nom global en index de case ; l'exécution lit la case
-//! directement, sans recherche par nom.
+//! The compiler resolves each global name to a slot index; execution reads the slot
+//! directly, without any lookup by name.
 
 use crate::intern::{FxHashMap, Symbol};
 use crate::ir::{JitState, Proto};
@@ -10,11 +10,11 @@ use std::rc::{Rc, Weak};
 
 pub struct GlobalSlot {
     pub name: Symbol,
-    /// `None` : nom connu du compilateur mais pas encore défini.
+    /// `None`: name known to the compiler but not defined yet.
     pub value: Option<Value>,
     pub mutable: bool,
-    /// Fonctions dont la compilation native dépend de la valeur de la case (appel direct
-    /// d'une fonction globale) : invalidées si elle change.
+    /// Functions whose native compilation depends on the slot's value (direct call of a
+    /// global function): invalidated when it changes.
     watchers: Vec<Weak<Proto>>,
 }
 
@@ -25,7 +25,7 @@ pub struct Globals {
 }
 
 impl Globals {
-    /// Case du nom (créée vide si besoin).
+    /// Slot of the name (created empty if needed).
     pub fn slot(&mut self, name: Symbol) -> u32 {
         if let Some(&i) = self.index.get(&name) {
             return i;
@@ -54,14 +54,14 @@ impl Globals {
         self.invalidate(i);
     }
 
-    /// Change la valeur d'une case déjà définie.
+    /// Changes the value of an already defined slot.
     #[inline]
     pub fn assign(&mut self, i: u32, value: Value) {
         self.slots[i as usize].value = Some(value);
         self.invalidate(i);
     }
 
-    /// `proto` (compilé en natif, ou refusé) dépend de la valeur de la case `i`.
+    /// `proto` (compiled natively, or rejected) depends on the value of slot `i`.
     pub fn watch(&mut self, i: u32, proto: &Rc<Proto>) {
         self.slots[i as usize].watchers.push(Rc::downgrade(proto));
     }
@@ -88,13 +88,13 @@ impl Globals {
         self.get_binding(name).map(|(v, _)| v)
     }
 
-    /// Valeur et caractère modifiable d'une globale définie.
+    /// Value and mutability of a defined global.
     pub fn get_binding(&self, name: Symbol) -> Option<(Value, bool)> {
         let s = &self.slots[*self.index.get(&name)? as usize];
         Some((s.value.clone()?, s.mutable))
     }
 
-    /// Vide toutes les cases (casse les cycles fonction → globale à la destruction).
+    /// Clears every slot (breaks function → global cycles on teardown).
     pub fn clear(&mut self) {
         for s in &mut self.slots {
             s.value = None;

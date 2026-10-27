@@ -1,20 +1,20 @@
-//! Compilation native (JIT) avec Cranelift.
+//! Native compilation (JIT) with Cranelift.
 //!
-//! Sont compilées les fonctions dont les paramètres et le retour sont annotés `int`,
-//! `float` ou `bool`, et dont le corps n'utilise que de l'arithmétique, des comparaisons,
-//! des branchements et des appels à d'autres fonctions compilables (récursion comprise).
-//! Tout le reste est exécuté par l'interpréteur : le résultat est le même, plus lentement.
+//! Compiled functions are those whose parameters and return are annotated `int`, `float`
+//! or `bool`, and whose body uses only arithmetic, comparisons, branches and calls to other
+//! compilable functions (recursion included). Everything else runs in the interpreter: same
+//! result, only slower.
 //!
-//! - Les registres `valeur` de l'IR sont typés par une analyse : le résultat d'un appel à
-//!   une fonction `: int` est un `int`, etc. Si un registre ne peut pas être typé, la
-//!   fonction n'est pas compilée.
-//! - Mêmes règles qu'à l'interprétation : dépassement de capacité, division par zéro et
-//!   profondeur d'appels sont vérifiés, avec les mêmes messages et la même pile d'appels.
-//! - Un appel à une fonction globale est direct (code natif → code natif). Si la globale
-//!   est redéfinie, le code qui l'appelle est invalidé puis recompilé au besoin.
+//! - The IR's `value` registers are typed by an analysis: the result of calling a `: int`
+//!   function is an `int`, and so on. If a register cannot be typed, the function is not
+//!   compiled.
+//! - Same rules as the interpreter: overflow, division by zero and call depth are checked,
+//!   with the same messages and the same call stack.
+//! - A call to a global function is direct (native code → native code). If the global is
+//!   redefined, the calling code is invalidated, then recompiled when needed.
 //!
-//! Convention d'appel interne : `fn(ctx, params…) -> (statut, résultat)`, statut 0 = succès,
-//! 1 = erreur (décrite dans `ctx`). Chaque fonction a aussi un point d'entrée pour Rust :
+//! Internal calling convention: `fn(ctx, params…) -> (status, result)`, status 0 = success,
+//! 1 = error (described in `ctx`). Each function also has an entry point for Rust:
 //! `extern "C" fn(ctx, *const u64 args, *mut u64 ret) -> i32`.
 
 use crate::ast::BinOp;
@@ -38,15 +38,15 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
 use std::rc::Rc;
 
-/// Contexte partagé avec le code natif. Les trois premiers champs sont lus et écrits par
-/// le code généré (positions fixes) ; les suivants ne servent qu'au code Rust.
+/// Context shared with native code. The first three fields are read and written by the
+/// generated code (fixed offsets); the others are used by Rust code only.
 #[repr(C)]
 pub struct JitCtx {
     pub depth: i64,
     pub max_depth: i64,
-    /// Erreur survenue : index dans la table des erreurs.
+    /// Error that occurred: index into the error table.
     pub err: i64,
-    /// Pile d'appels de l'erreur (index dans la table des appels), plus récent en premier.
+    /// Call stack of the error (indices into the call table), most recent first.
     pub traces: Vec<u32>,
 }
 
@@ -59,8 +59,8 @@ enum ErrKind {
     Overflow,
     DivZero,
     Depth,
-    /// Hypothèse du code natif non vérifiée (champ d'un autre type) : l'appel est refait
-    /// par l'interpréteur.
+    /// An assumption of the native code did not hold (field of another type): the call is
+    /// redone by the interpreter.
     Bail,
 }
 
@@ -76,7 +76,7 @@ struct TraceInfo {
 }
 
 extern "C" fn bk_trace(ctx: *mut JitCtx, id: u32) {
-    // SAFETY : `ctx` est le contexte passé par `Jit::call`, valide pendant l'appel.
+    // SAFETY: `ctx` is the context passed by `Jit::call`, valid during the call.
     unsafe { (*ctx).traces.push(id) }
 }
 
@@ -84,14 +84,14 @@ extern "C" fn bk_frem(a: f64, b: f64) -> f64 {
     a.rem_euclid(b)
 }
 
-/// Champs d'un objet du type `info` (passé en paramètre) ; nul si l'objet est d'un autre
-/// type (type redéclaré depuis la compilation).
+/// Fields of an object of type `info` (passed as a parameter); null if the object is of
+/// another type (type redeclared since compilation).
 extern "C" fn bk_obj_fields(
     obj: *const Value,
     info: *const crate::objects::TypeInfo,
 ) -> *const Value {
-    // SAFETY : `obj` désigne un argument vivant pendant l'appel natif. Le code natif est
-    // sans effet de bord : les champs ne changent pas (ni ne sont déplacés) pendant l'appel.
+    // SAFETY: `obj` is an argument alive during the native call. Native code has no side
+    // effects: the fields neither change nor move during the call.
     unsafe {
         match &*obj {
             Value::Object(o) => match o.try_borrow() {
@@ -103,33 +103,33 @@ extern "C" fn bk_obj_fields(
     }
 }
 
-/// Construction native d'un objet (`info`) ou d'une liste (`info` absent) : pour chaque
-/// argument, le champ visé (objet) et la conversion.
+/// Native construction of an object (`info`) or a list (no `info`): for each argument,
+/// the target field (object) and the conversion.
 struct BuildPlan {
     info: Option<Rc<crate::objects::TypeInfo>>,
     items: Vec<(usize, Kind)>,
 }
 
-/// Valeur du script à partir des bits d'une valeur native.
+/// Script value from the bits of a native value.
 ///
 /// # Safety
-/// Pour `Kind::Ref`, `bits` est l'adresse d'une valeur vivante.
+/// For `Kind::Ref`, `bits` is the address of a live value.
 unsafe fn from_bits(kind: Kind, bits: u64) -> Value {
     match kind {
         Kind::Int => Value::Int(bits as i64),
         Kind::Float => Value::Float(f64::from_bits(bits)),
         Kind::IntToFloat => Value::Float(bits as i64 as f64),
         Kind::Bool => Value::Bool(bits & 0xff != 0),
-        // SAFETY : cf. ci-dessus.
+        // SAFETY: see above.
         Kind::Ref => unsafe { (*(bits as *const Value)).clone() },
     }
 }
 
-/// Construit l'objet ou la liste décrit par `plan` dans la case `dst` (l'ancienne valeur
-/// est libérée après : un argument peut désigner `dst`).
+/// Builds the object or list described by `plan` into slot `dst` (the old value is
+/// dropped afterwards: an argument may refer to `dst`).
 extern "C" fn bk_build(dst: *mut Value, args: *const u64, plan: *const BuildPlan) {
-    // SAFETY : `dst` est une case du cadre natif, `args` contient un argument par élément
-    // de `plan` (gardé par le `Jit`), les objets désignés vivent pendant l'appel.
+    // SAFETY: `dst` is a slot of the native frame, `args` holds one argument per element of
+    // `plan` (kept alive by the `Jit`), the objects referred to live during the call.
     unsafe {
         let plan = &*plan;
         let v = match &plan.info {
@@ -157,20 +157,20 @@ extern "C" fn bk_build(dst: *mut Value, args: *const u64, plan: *const BuildPlan
     }
 }
 
-/// Copie (comptage de références) de `*src` dans la case `dst`.
+/// Copies `*src` (reference counted) into slot `dst`.
 extern "C" fn bk_clone_into(dst: *mut Value, src: *const Value) {
-    // SAFETY : `dst` est une case du cadre natif, `src` une valeur vivante.
+    // SAFETY: `dst` is a slot of the native frame, `src` a live value.
     unsafe {
         let v = (*src).clone();
         *dst = v;
     }
 }
 
-/// Résultat d'une fonction native vers la case `dst` de l'appelant : déplacé depuis une
-/// case de la fonction (`owned`), sinon copié (valeur empruntée).
+/// Result of a native function into the caller's slot `dst`: moved out of a slot of the
+/// function (`owned`), copied otherwise (borrowed value).
 extern "C" fn bk_move_out(dst: *mut Value, src: *mut Value, owned: i32) {
-    // SAFETY : `dst` est une case de l'appelant, `src` une valeur vivante ; si `owned`,
-    // `src` est une case de la fonction qui se termine.
+    // SAFETY: `dst` is a slot of the caller, `src` a live value; if `owned`, `src` is a slot
+    // of the function that is returning.
     unsafe {
         let v = if owned != 0 {
             std::mem::replace(&mut *src, Value::Nil)
@@ -181,9 +181,9 @@ extern "C" fn bk_move_out(dst: *mut Value, src: *mut Value, owned: i32) {
     }
 }
 
-/// Libère les `n` cases du cadre natif.
+/// Drops the `n` slots of the native frame.
 extern "C" fn bk_drop_slots(base: *mut Value, n: u64) {
-    // SAFETY : `base` désigne `n` cases du cadre, initialisées (au moins à `nil`).
+    // SAFETY: `base` points to `n` slots of the frame, initialized (at least to `nil`).
     unsafe {
         for i in 0..n as usize {
             let slot = base.add(i);
@@ -193,11 +193,11 @@ extern "C" fn bk_drop_slots(base: *mut Value, n: u64) {
     }
 }
 
-/// Éléments d'une liste : adresse dans `out[0]`, nombre dans `out[1]` ; 1 si ce n'est
-/// pas une liste.
+/// Elements of a list: address in `out[0]`, count in `out[1]`; 1 if it is not a
+/// list.
 extern "C" fn bk_list_view(v: *const Value, out: *mut u64) -> i32 {
-    // SAFETY : `v` désigne une valeur vivante pendant l'appel natif, `out` deux cases.
-    // Le code natif est sans effet de bord : la liste ne change pas pendant l'appel.
+    // SAFETY: `v` is a value alive during the native call, `out` two slots. Native code has
+    // no side effects: the list does not change during the call.
     unsafe {
         let Value::List(l) = &*v else {
             return 1;
@@ -211,11 +211,11 @@ extern "C" fn bk_list_view(v: *const Value, out: *mut u64) -> i32 {
     0
 }
 
-/// Champ d'un objet passé en paramètre (`FieldAs`) : 0 et la valeur (bits) dans `out`,
-/// ou 1 si l'objet n'a pas ce champ avec ce type.
+/// Field of an object passed as a parameter (`FieldAs`): 0 and the value (bits) in
+/// `out`, or 1 if the object has no such field with that type.
 extern "C" fn bk_field_native(obj: *const Value, cache: *mut u8, out: *mut u64) -> i32 {
-    // SAFETY : `obj` désigne un argument vivant pendant l'appel natif (cf. `Jit::call`) ;
-    // `cache` est un `FieldCache` gardé par le `Jit`.
+    // SAFETY: `obj` is an argument alive during the native call (see `Jit::call`); `cache`
+    // is a `FieldCache` kept alive by the `Jit`.
     unsafe {
         let cache = &mut *(cache as *mut FieldCache);
         let bits = match cache.get(&*obj) {
@@ -229,7 +229,7 @@ extern "C" fn bk_field_native(obj: *const Value, cache: *mut u8, out: *mut u64) 
     0
 }
 
-/// Fonction compilée : identifiant Cranelift et signature.
+/// Compiled function: Cranelift id and signature.
 struct Compiled {
     id: FuncId,
     params: Vec<RegTy>,
@@ -241,7 +241,7 @@ pub struct Jit {
     ctx: Box<JitCtx>,
     errors: Vec<ErrInfo>,
     traces: Vec<TraceInfo>,
-    /// Fonctions déjà compilées (clé : adresse du `Proto`).
+    /// Functions already compiled (key: address of the `Proto`).
     compiled: FxHashMap<usize, Compiled>,
     trace_fn: FuncId,
     frem_fn: FuncId,
@@ -250,45 +250,45 @@ pub struct Jit {
     list_fn: FuncId,
     /// `bk_build`, `bk_clone_into`, `bk_move_out`, `bk_drop_slots`.
     mem_fns: [FuncId; 4],
-    /// Plans de construction (adresses gardées par le code natif).
+    /// Construction plans (addresses held by native code).
     #[allow(clippy::vec_box)]
     build_plans: Vec<Box<BuildPlan>>,
-    /// Types dont le code natif connaît la disposition (gardés en vie : leur adresse sert
-    /// d'identité).
+    /// Types whose layout native code knows (kept alive: their address serves as their
+    /// identity).
     known_types: Vec<Rc<crate::objects::TypeInfo>>,
-    /// Le dernier appel natif a été abandonné (`ErrKind::Bail`).
+    /// The last native call was abandoned (`ErrKind::Bail`).
     pub bailed: bool,
-    /// Symbole de la méthode `len` (listes).
+    /// Symbol of the `len` method (lists).
     pub len_sym: crate::intern::Symbol,
-    /// Fonctions d'aide du code de base (`bk_step`, `bk_iter_next`, `bk_drop`).
+    /// Helpers of the baseline code (`bk_step`, `bk_iter_next`, `bk_drop`).
     dyn_fns: Option<(FuncId, FuncId, FuncId)>,
-    /// Fonctions d'aide rapides (`FAST`), dans l'ordre de `Fast`.
+    /// Fast helpers (`FAST`), in the order of `Fast`.
     fast_fns: Vec<FuncId>,
-    /// Caches des accès aux champs du code de base : en `Box`, car le code natif garde
-    /// leur adresse.
+    /// Field access caches of the baseline code: boxed, because native code keeps their
+    /// address.
     #[allow(clippy::vec_box)]
     field_caches: Vec<Box<FieldCache>>,
     next: u32,
 }
 
-/// Type d'un registre pour le code natif.
+/// Type of a register for native code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum JTy {
     Int,
     Float,
     Bool,
-    /// Jamais lu (`nil` d'une expression dont la valeur est ignorée).
+    /// Never read (`nil` of an expression whose value is ignored).
     Nil,
-    /// Fonction globale appelée directement (case globale).
+    /// Global function called directly (global slot).
     Callee(u32),
-    /// Objet du type `anns[i]` : pointeur vers la valeur (empruntée à l'appelant, ou
-    /// dans une case du cadre natif).
+    /// Object of type `anns[i]`: pointer to the value (borrowed from the caller, or in a
+    /// slot of the native frame).
     Obj(u32),
-    /// Liste d'éléments du type `anns[i]` : pointeur vers la valeur.
+    /// List of elements of type `anns[i]`: pointer to the value.
     List(u32),
-    /// Itérateur sur une liste d'éléments du type `anns[i]`.
+    /// Iterator over a list of elements of type `anns[i]`.
     Iter(u32),
-    /// `type` d'une case globale, appelé pour construire un objet.
+    /// `type` in a global slot, called to construct an object.
     Ctor(u32),
 }
 
@@ -310,7 +310,7 @@ fn jty(t: RegTy) -> JTy {
     }
 }
 
-/// Type Cranelift d'un registre ; `Value` : pointeur vers un objet.
+/// Cranelift type of a register; `Value`: pointer to an object.
 fn clif(t: RegTy) -> Type {
     match t {
         RegTy::Int | RegTy::Value => types::I64,
@@ -319,8 +319,8 @@ fn clif(t: RegTy) -> Type {
     }
 }
 
-/// Type natif d'une annotation : simple, ou `Value` (pointeur) pour un objet d'un type
-/// déclaré et une liste d'éléments simples ou d'objets.
+/// Native type of an annotation: simple, or `Value` (pointer) for an object of a declared
+/// type and a list of simple elements or objects.
 fn native_ty(rt: &RtType) -> Option<RegTy> {
     match rt {
         RtType::Named(..) => Some(RegTy::Value),
@@ -331,7 +331,7 @@ fn native_ty(rt: &RtType) -> Option<RegTy> {
     }
 }
 
-/// Signature native d'une fonction (paramètres et retour), sinon `None`.
+/// Native signature of a function (parameters and return), otherwise `None`.
 fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
     if p.kind != ProtoKind::Function || !p.captures.is_empty() || p.ncells != 0 {
         return None;
@@ -346,12 +346,12 @@ fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
     Some((params, native_ty(&p.ret.as_ref()?.ty)?))
 }
 
-/// Annotation du paramètre `i`.
+/// Annotation of parameter `i`.
 fn ann_of(q: &Proto, i: usize) -> Option<&RtType> {
     q.params[i].ty.as_ref().map(|t| &*t.ty)
 }
 
-/// Même type : un type déclaré se reconnaît à sa case globale.
+/// Same type: a declared type is identified by its global slot.
 fn same_ann(a: &RtType, b: &RtType) -> bool {
     match (a, b) {
         (RtType::Named(x, _), RtType::Named(y, _)) => x == y,
@@ -360,7 +360,7 @@ fn same_ann(a: &RtType, b: &RtType) -> bool {
     }
 }
 
-/// Index de `t` dans la table des types (ajouté au besoin).
+/// Index of `t` in the type table (added if needed).
 fn intern_ann(anns: &mut Vec<RtType>, t: &RtType) -> u32 {
     match anns.iter().position(|a| same_ann(a, t)) {
         Some(i) => i as u32,
@@ -371,16 +371,16 @@ fn intern_ann(anns: &mut Vec<RtType>, t: &RtType) -> u32 {
     }
 }
 
-/// Type natif d'une valeur annotée `t` (`native_ty` l'accepte).
+/// Native type of a value annotated `t` (`native_ty` accepts it).
 fn value_jty(anns: &mut Vec<RtType>, t: &RtType) -> JTy {
     match t {
         RtType::Named(..) => JTy::Obj(intern_ann(anns, t)),
         RtType::List(e) => JTy::List(intern_ann(anns, e)),
-        t => jty(prim(t).expect("type simple")),
+        t => jty(prim(t).expect("simple type")),
     }
 }
 
-/// Fonction du script dans une case globale.
+/// Script function in a global slot.
 fn global_proto(globals: &Globals, slot: u32) -> Option<Rc<Proto>> {
     match &globals.at(slot).value {
         Some(Value::Function(f)) => match &**f {
@@ -391,7 +391,7 @@ fn global_proto(globals: &Globals, slot: u32) -> Option<Rc<Proto>> {
     }
 }
 
-/// `type` (pas `class`) dans une case globale.
+/// `type` (not `class`) in a global slot.
 fn global_type(globals: &Globals, slot: u32) -> Option<Rc<crate::objects::TypeInfo>> {
     match &globals.at(slot).value {
         Some(Value::Type(info)) if info.kind == crate::ast::TypeDeclKind::Type => {
@@ -401,20 +401,20 @@ fn global_type(globals: &Globals, slot: u32) -> Option<Rc<crate::objects::TypeIn
     }
 }
 
-/// Conversion d'une valeur native vers une valeur du script (construction).
+/// Conversion of a native value to a script value (construction).
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Kind {
     Int,
     Float,
-    /// `int` donné pour un champ `float`.
+    /// `int` given for a `float` field.
     IntToFloat,
     Bool,
-    /// Objet ou liste : la valeur pointée est copiée (comptage de références).
+    /// Object or list: the pointed-to value is copied (reference counted).
     Ref,
 }
 
-/// Valeur native de type `t` vers une valeur, pour un champ annoté `want` (`None` : non
-/// annoté). `None` si la conversion n'est pas garantie.
+/// Native value of type `t` to a value, for a field annotated `want` (`None`: not
+/// annotated). `None` if the conversion is not guaranteed.
 fn kind_for(anns: &[RtType], t: JTy, want: Option<&RtType>) -> Option<Kind> {
     let kind = match t {
         JTy::Int => Kind::Int,
@@ -437,7 +437,7 @@ fn kind_for(anns: &[RtType], t: JTy, want: Option<&RtType>) -> Option<Kind> {
     }
 }
 
-/// Construction `T(…)` : pour chaque argument, (champ, conversion).
+/// Construction `T(…)`: for each argument, (field, conversion).
 fn ctor_plan(
     info: &crate::objects::TypeInfo,
     site: &crate::ir::CallSite,
@@ -465,13 +465,13 @@ fn ctor_plan(
     Some(out)
 }
 
-/// Type d'un registre à un point du programme.
+/// Type of a register at a program point.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Lat {
-    /// Pas encore écrit.
+    /// Not written yet.
     Undef,
     T(JTy),
-    /// Types différents selon le chemin (ou non écrit sur l'un d'eux) : illisible.
+    /// Different types depending on the path (or not written on one of them): unreadable.
     Conflict,
 }
 
@@ -488,31 +488,31 @@ impl Lat {
     }
 }
 
-/// Résultat de l'analyse d'une fonction : type des registres en chaque point.
+/// Result of analysing a function: type of the registers at each point.
 struct Plan {
-    /// Types à l'entrée de chaque bloc.
+    /// Types at the entry of each block.
     entry: Vec<Vec<Lat>>,
-    /// Type écrit par chaque instruction de chaque bloc (et par le terminateur
-    /// `IterNext`), s'il y en a.
+    /// Type written by each instruction of each block (and by the `IterNext` terminator),
+    /// if any.
     defs: Vec<Vec<Option<JTy>>>,
     term_defs: Vec<Option<JTy>>,
-    /// Fonctions appelées directement.
+    /// Functions called directly.
     callees: Vec<u32>,
-    /// Types construits (`T(…)`).
+    /// Constructed types (`T(…)`).
     ctors: Vec<u32>,
-    /// Types des objets et des éléments de liste (`JTy::Obj` / `List` / `Iter`).
+    /// Types of objects and list elements (`JTy::Obj` / `List` / `Iter`).
     anns: Vec<RtType>,
 }
 
-/// Type d'un élément de type `anns[a]`.
+/// Type of an element of type `anns[a]`.
 fn elem_jty(anns: &[RtType], a: u32) -> JTy {
     match &anns[a as usize] {
         RtType::Named(..) => JTy::Obj(a),
-        t => jty(prim(t).expect("élément simple ou objet")),
+        t => jty(prim(t).expect("simple element or object")),
     }
 }
 
-/// Analyse d'une fonction : contexte partagé par les instructions.
+/// Analysis of a function: context shared by the instructions.
 struct Analysis<'a> {
     p: &'a Proto,
     globals: &'a Globals,
@@ -527,7 +527,7 @@ impl Analysis<'_> {
         global_proto(self.globals, slot).and_then(|q| native_sig(&q))
     }
 
-    /// Type écrit par `ins` (lecture des opérandes dans `cur`) ; `None` : non compilable.
+    /// Type written by `ins` (operands read from `cur`); `None`: not compilable.
     fn instr(&mut self, ins: &Instr, cur: &[Lat]) -> Option<Option<JTy>> {
         use Instr::*;
         let g = |r: Reg| cur[r as usize].get();
@@ -574,7 +574,7 @@ impl Analysis<'_> {
                 }
                 JTy::Int
             }
-            // Liste littérale : éléments tous du même type.
+            // List literal: elements all of the same type.
             List(_, start, n) => {
                 let first = g(*start)?;
                 if *n == 0 || (0..*n).any(|k| g(*start + k) != Some(first)) {
@@ -654,7 +654,7 @@ impl Analysis<'_> {
                             let at = g(site.start + k as u32)?;
                             let ok = match (pt, at) {
                                 (RegTy::Float, JTy::Int | JTy::Float) => true,
-                                // Objet ou liste transmis tel quel : même type, déjà vérifié.
+                                // Object or list passed as is: same type, already checked.
                                 (RegTy::Value, JTy::Obj(_) | JTy::List(_)) => {
                                     kind_for(&self.anns, at, ann_of(&callee, k)) == Some(Kind::Ref)
                                 }
@@ -681,7 +681,7 @@ impl Analysis<'_> {
     }
 }
 
-/// Types des registres d'une fonction compilable ; `None` si elle ne l'est pas.
+/// Register types of a compilable function; `None` if it is not compilable.
 fn analyze(p: &Proto, globals: &Globals, len: crate::intern::Symbol) -> Option<Plan> {
     let (_, ret) = native_sig(p)?;
     let mut an = Analysis {
@@ -692,7 +692,7 @@ fn analyze(p: &Proto, globals: &Globals, len: crate::intern::Symbol) -> Option<P
         callees: Vec::new(),
         ctors: Vec::new(),
     };
-    // Registres typés de l'IR : leur type ne change pas.
+    // Typed IR registers: their type does not change.
     let fixed: Vec<Option<JTy>> = p
         .regs
         .iter()
@@ -724,7 +724,7 @@ fn analyze(p: &Proto, globals: &Globals, len: crate::intern::Symbol) -> Option<P
                 if let (Some(d), Some(t)) = (d, t) {
                     let t = match fixed[d as usize] {
                         None => t,
-                        // Registre typé : même type, ou `int` vers `float` (converti).
+                        // Typed register: same type, or `int` to `float` (converted).
                         Some(f) if f == t || (f == JTy::Float && t == JTy::Int) => f,
                         Some(_) => return None,
                     };
@@ -792,8 +792,8 @@ fn analyze(p: &Proto, globals: &Globals, len: crate::intern::Symbol) -> Option<P
     })
 }
 
-/// Registres lus et écrit par une instruction acceptée par le JIT typé ; `None` pour
-/// les autres.
+/// Registers read and written by an instruction accepted by the typed JIT; `None` for
+/// the others.
 fn reads_writes(p: &Proto, ins: &Instr) -> Option<(Vec<Reg>, Option<Reg>)> {
     use Instr::*;
     Some(match ins {
@@ -868,7 +868,7 @@ fn float_cc(op: BinOp) -> FloatCC {
 }
 
 impl Jit {
-    /// `None` si la machine n'est pas prise en charge par Cranelift.
+    /// `None` if the machine is not supported by Cranelift.
     pub fn new() -> Option<Self> {
         let mut flags = settings::builder();
         flags.set("use_colocated_libcalls", "false").ok()?;
@@ -909,7 +909,7 @@ impl Jit {
         let frem_fn = module
             .declare_function("bk_frem", Linkage::Import, &sig)
             .ok()?;
-        // Les objets passent par pointeur dans des variables `i64`.
+        // Objects are passed by pointer in `i64` variables.
         if ptr != types::I64 {
             return None;
         }
@@ -982,10 +982,10 @@ impl Jit {
         })
     }
 
-    /// Compile `root` (et les fonctions qu'il appelle) si possible. Met à jour l'état JIT de
-    /// chaque fonction rencontrée.
+    /// Compiles `root` (and the functions it calls) if possible. Updates the JIT state of
+    /// every function encountered.
     pub fn compile(&mut self, root: &Rc<Proto>, globals: &mut Globals) {
-        // 1. Fonctions atteignables par appels directs, et leur analyse.
+        // 1. Functions reachable through direct calls, and their analysis.
         let mut order: Vec<Rc<Proto>> = Vec::new();
         let mut plans: FxHashMap<usize, Option<Plan>> = FxHashMap::default();
         let mut todo = vec![root.clone()];
@@ -998,7 +998,7 @@ impl Jit {
                 if matches!(*p.jit.borrow(), JitState::Native(_)) {
                     continue;
                 }
-                // Code invalidé (une fonction appelée a été redéfinie) : à recompiler.
+                // Invalidated code (a called function was redefined): to recompile.
                 self.compiled.remove(&key);
             }
             let rejected = matches!(*p.jit.borrow(), JitState::Rejected);
@@ -1018,7 +1018,7 @@ impl Jit {
             plans.insert(key, plan);
             order.push(p);
         }
-        // 2. Une fonction qui appelle une fonction non compilable ne l'est pas non plus.
+        // 2. A function that calls a non-compilable function is not compilable either.
         loop {
             let mut changed = false;
             for p in &order {
@@ -1046,7 +1046,7 @@ impl Jit {
                 break;
             }
         }
-        // 3. Déclaration, puis génération du code.
+        // 3. Declaration, then code generation.
         let mut new = Vec::new();
         for p in &order {
             let key = Rc::as_ptr(p) as usize;
@@ -1071,7 +1071,7 @@ impl Jit {
             let key = Rc::as_ptr(p) as usize;
             let plan = plans.remove(&key).unwrap().unwrap();
             if self.define(p, &plan, globals).is_err() {
-                // Échec inattendu de Cranelift : l'interpréteur reste disponible.
+                // Unexpected Cranelift failure: the interpreter is still available.
                 self.compiled.remove(&key);
                 *p.jit.borrow_mut() = JitState::Rejected;
                 continue;
@@ -1095,7 +1095,7 @@ impl Jit {
             for slot in callees {
                 globals.watch(slot, &p);
             }
-            // Type d'un paramètre redéclaré : disposition des champs à recompiler.
+            // Type of a parameter redeclared: field layout to recompile.
             for prm in &p.params {
                 if let Some(ann) = &prm.ty
                     && let RtType::Named(slot, _) = &*ann.ty
@@ -1104,7 +1104,7 @@ impl Jit {
                 }
             }
         }
-        // Les fonctions refusées : réessayées si une fonction qu'elles appellent change.
+        // Rejected functions: retried if a function they call changes.
         for p in &order {
             let key = Rc::as_ptr(p) as usize;
             if let Some(None) = plans.get(&key) {
@@ -1125,7 +1125,7 @@ impl Jit {
         for p in params {
             sig.params.push(AbiParam::new(clif(*p)));
         }
-        // Objet ou liste renvoyé : écrit dans une case fournie par l'appelant.
+        // Object or list returned: written into a slot provided by the caller.
         if ret == RegTy::Value {
             sig.params.push(AbiParam::new(types::I64));
         }
@@ -1148,7 +1148,7 @@ impl Jit {
         (self.traces.len() - 1) as i64
     }
 
-    /// Génère le code d'une fonction.
+    /// Generates the code of a function.
     fn define(&mut self, p: &Rc<Proto>, plan: &Plan, globals: &Globals) -> Result<(), ()> {
         let key = Rc::as_ptr(p) as usize;
         let (id, ret) = {
@@ -1158,7 +1158,7 @@ impl Jit {
         let mut ctx = self.module.make_context();
         ctx.func.signature = self.signature(&self.compiled[&key].params.clone(), ret);
         ctx.func.name = UserFuncName::user(0, id.as_u32());
-        // Fonctions appelées, connues dans cette fonction.
+        // Called functions, known in this function.
         let mut callee_refs = FxHashMap::default();
         for slot in &plan.callees {
             let q = global_proto(globals, *slot).ok_or(())?;
@@ -1181,8 +1181,8 @@ impl Jit {
         let list_ref = self
             .module
             .declare_func_in_func(self.list_fn, &mut ctx.func);
-        // Paramètres objets dont les champs sont lus : type connu maintenant (case globale
-        // de l'annotation), donc position de chaque champ connue.
+        // Object parameters whose fields are read: their type is known now (global slot of the
+        // annotation), hence the offset of every field.
         let mut obj_types: Vec<Option<Rc<crate::objects::TypeInfo>>> = vec![None; plan.anns.len()];
         for (a, ann) in plan.anns.iter().enumerate() {
             if let RtType::Named(slot, _) = ann
@@ -1190,18 +1190,18 @@ impl Jit {
                 && info.kind == crate::ast::TypeDeclKind::Type
             {
                 obj_types[a] = Some(info.clone());
-                // Gardé en vie : son adresse identifie le type dans le code natif.
+                // Kept alive: its address identifies the type in native code.
                 if !self.known_types.iter().any(|t| Rc::ptr_eq(t, info)) {
                     self.known_types.push(info.clone());
                 }
             }
         }
-        // Registres d'objets, de listes et d'itérateurs : « empruntés » s'ils désignent
-        // toujours une valeur qui vit pendant tout l'appel (paramètre, élément d'une liste
-        // empruntée) ; sinon « possédants » : une case du cadre natif, libérée à la sortie.
+        // Registers of objects, lists and iterators: "borrowed" if they always refer to a value
+        // that lives for the whole call (parameter, element of a borrowed list); otherwise
+        // "owning": a slot of the native frame, dropped on exit.
         let is_ref = |t: Option<JTy>| matches!(t, Some(JTy::Obj(_) | JTy::List(_) | JTy::Iter(_)));
         let nregs = p.regs.len();
-        // Couples (registre, type) : paramètres, écritures, types connus à l'entrée des blocs.
+        // (register, type) pairs: parameters, writes, types known at block entries.
         let mut pairs: Vec<(Reg, JTy)> = Vec::new();
         for m in &plan.entry {
             for (r, l) in m.iter().enumerate() {
@@ -1276,7 +1276,7 @@ impl Jit {
         let clone_ref = self.module.declare_func_in_func(clone_fn, &mut ctx.func);
         let move_ref = self.module.declare_func_in_func(move_fn, &mut ctx.func);
         let drop_ref = self.module.declare_func_in_func(drop_fn, &mut ctx.func);
-        // Erreurs et appels de cette fonction, numérotés à la suite des tables.
+        // Errors and calls of this function, numbered after the existing tables.
         let (err_base, trace_base) = (self.errors.len() as i64, self.traces.len() as i64);
         let mut err_sites: Vec<(ErrKind, Span)> = Vec::new();
         let mut call_sites: Vec<(Rc<str>, Span)> = Vec::new();
@@ -1284,7 +1284,7 @@ impl Jit {
         let tc = self.module.target_config();
         let mut fctx = FunctionBuilderContext::new();
         let mut bx = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-        // Une variable par registre et par type qu'il prend.
+        // One variable per register and per type it takes.
         let mut vars: FxHashMap<(Reg, JTy), Variable> = FxHashMap::default();
         for (r, t) in &pairs {
             let ty = match t {
@@ -1295,7 +1295,7 @@ impl Jit {
             };
             vars.insert((*r, *t), bx.declare_var(ty));
         }
-        // Itérateurs : adresse des éléments, nombre, position.
+        // Iterators: address of the elements, count, position.
         let iter_vars: FxHashMap<Reg, [Variable; 3]> = pairs
             .iter()
             .filter(|(_, t)| matches!(t, JTy::Iter(_)))
@@ -1311,13 +1311,13 @@ impl Jit {
         bx.append_block_params_for_function_params(entry);
         bx.switch_to_block(entry);
         let ctxv = bx.block_params(entry)[0];
-        // Case de sortie des lectures de champ.
+        // Output slot of field reads.
         let out_slot = bx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
             cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
             16,
             3,
         ));
-        // Cases des valeurs possédées, `nil` (octets nuls) à l'entrée.
+        // Slots of owned values, `nil` (zero bytes) on entry.
         let vals = bx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
             cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
             (nslots.max(1) as i32 * crate::value::layout::SIZE) as u32,
@@ -1329,7 +1329,7 @@ impl Jit {
             bx.ins().store(MemFlagsData::trusted(), z, vals_base, k * 8);
         }
         let out_param = (ret == RegTy::Value).then(|| bx.block_params(entry)[1 + p.params.len()]);
-        // Tous les registres sont définis dès l'entrée (valeur nulle).
+        // Every register is defined from the entry (zero value).
         for v in iter_vars.values().flatten() {
             let z = bx.ins().iconst(types::I64, 0);
             bx.def_var(*v, z);
@@ -1347,9 +1347,9 @@ impl Jit {
             let t = plan.entry[0][prm.reg as usize].get().ok_or(())?;
             bx.def_var(vars[&(prm.reg, t)], a);
         }
-        // Adresse des champs de chaque objet de type connu (vérifié une fois ici).
-        // Paramètre objet jamais réaffecté dont des champs sont lus : type vérifié et
-        // adresse des champs prise ici, une fois.
+        // Field address of each object of known type (checked once here).
+        // Object parameter never reassigned whose fields are read: type checked and field
+        // address taken here, once.
         let reads_fields = |reg: Reg| {
             p.blocks
                 .iter()
@@ -1389,7 +1389,7 @@ impl Jit {
         bx.switch_to_block(start);
         bx.ins().jump(blocks[0], &[]);
 
-        // Types en cours (avant l'instruction) et type écrit par l'instruction.
+        // Current types (before the instruction) and type written by the instruction.
         let mut cur: Vec<Option<JTy>>;
         let mut dty: Option<JTy>;
         macro_rules! tyof {
@@ -1407,7 +1407,7 @@ impl Jit {
                 *vars.get(&($r, dty.ok_or(())?)).ok_or(())?
             };
         }
-        // Branche vers l'erreur `id` si `cond`.
+        // Branches to error `id` if `cond`.
         macro_rules! check {
             ($bx:expr, $cond:expr, $kind:expr, $span:expr) => {{
                 err_sites.push(($kind, $span));
@@ -1418,7 +1418,7 @@ impl Jit {
                 $bx.switch_to_block(cont);
             }};
         }
-        // Éléments d'une liste : (adresse, nombre) ; abandon si ce n'est pas une liste.
+        // Elements of a list: (address, count); bail if it is not a list.
         macro_rules! view {
             ($bx:expr, $list:expr, $span:expr) => {{
                 let out = $bx.ins().stack_addr(types::I64, out_slot, 0);
@@ -1430,15 +1430,15 @@ impl Jit {
                 (data, len)
             }};
         }
-        // Adresse de la case du registre possédant `r`.
+        // Address of the slot of owning register `r`.
         macro_rules! own {
             ($bx:expr, $r:expr) => {{
                 let off = *slot_of.get(&$r).ok_or(())?;
                 $bx.ins().stack_addr(types::I64, vals, off)
             }};
         }
-        // Valeur de l'élément `v` (objet : adresse) vers le registre `d` : copiée dans sa
-        // case si `d` est possédant.
+        // Value of element `v` (object: address) into register `d`: copied into its slot if
+        // `d` is owning.
         macro_rules! put_ref {
             ($bx:expr, $d:expr, $v:expr) => {{
                 if borrowed[$d as usize] {
@@ -1450,7 +1450,7 @@ impl Jit {
                 }
             }};
         }
-        // Libère les cases (avant chaque sortie).
+        // Drops the slots (before every exit).
         macro_rules! drop_slots {
             ($bx:expr) => {{
                 if nslots > 0 {
@@ -1460,8 +1460,8 @@ impl Jit {
                 }
             }};
         }
-        // Construit dans la case de `d` l'objet ou la liste décrit par `items` (valeurs
-        // natives des registres `regs`).
+        // Builds into the slot of `d` the object or list described by `items` (native values
+        // of registers `regs`).
         macro_rules! build {
             ($bx:expr, $d:expr, $info:expr, $items:expr, $regs:expr) => {{
                 let items: Vec<(usize, Kind)> = $items;
@@ -1491,8 +1491,8 @@ impl Jit {
                 $bx.def_var(dvar!($d), slot);
             }};
         }
-        // Valeur de l'élément à l'adresse `addr`, du type `anns[a]` : l'adresse pour un
-        // objet ; sinon étiquette vérifiée (abandon si elle diffère), `int` vers `float`.
+        // Value of the element at address `addr`, of type `anns[a]`: the address for an
+        // object; otherwise the tag is checked (bail if it differs), `int` to `float`.
         macro_rules! elem {
             ($bx:expr, $addr:expr, $a:expr, $span:expr) => {{
                 use crate::value::layout::{PAYLOAD, TAG_BOOL, TAG_FLOAT, TAG_INT};
@@ -1572,15 +1572,14 @@ impl Jit {
                         let v = int_bin(&mut bx, *op, x, y, &mut |bx, c, k| check!(bx, c, k, span));
                         bx.def_var(dvar!(*d), v);
                     }
-                    // Champ d'un objet de type connu : lecture directe et vérification de
-                    // l'étiquette.
+                    // Field of an object of known type: direct read and tag check.
                     FieldAs(d, a, name, t)
                         if let Some(JTy::Obj(k)) = tyof!(*a)
                             && let Some(info) = &obj_types[k as usize]
                             && let Some(idx) = info.field_index(*name) =>
                     {
-                        // Paramètre : adresse des champs prise à l'entrée ; élément d'une
-                        // liste : vérifiée à chaque lecture.
+                        // Parameter: field address taken on entry; list element: checked on every
+                        // read.
                         let fp = match fields_ptr.get(a).copied() {
                             Some(fp) => fp,
                             None => {
@@ -1690,7 +1689,7 @@ impl Jit {
                                 let x = bx.use_var(uvar!(*a));
                                 bx.ins().icmp_imm_s(IntCC::Equal, x, 0)
                             }
-                            // Un nombre est toujours vrai.
+                            // A number is always truthy.
                             _ => bx.ins().iconst(types::I8, 0),
                         };
                         bx.def_var(dvar!(*d), v);
@@ -1736,7 +1735,7 @@ impl Jit {
                             };
                             args.push(v);
                         }
-                        // Objet ou liste renvoyé : dans la case de `dst`.
+                        // Object or list returned: in the slot of `dst`.
                         let out = if cret == RegTy::Value {
                             let slot = own!(bx, *dst);
                             args.push(slot);
@@ -1744,7 +1743,7 @@ impl Jit {
                         } else {
                             None
                         };
-                        // Profondeur d'appels.
+                        // Call depth.
                         let depth =
                             bx.ins()
                                 .load(types::I64, MemFlagsData::trusted(), ctxv, DEPTH_OFFSET);
@@ -1766,7 +1765,7 @@ impl Jit {
                         };
                         bx.ins()
                             .store(MemFlagsData::trusted(), depth, ctxv, DEPTH_OFFSET);
-                        // Erreur dans la fonction appelée : on ajoute cet appel à la pile.
+                        // Error in the called function: add this call to the stack.
                         call_sites.push((q.name.clone(), span));
                         let tid = trace_base + (call_sites.len() - 1) as i64;
                         let failed = bx.create_block();
@@ -1782,8 +1781,8 @@ impl Jit {
                     }
                     IterNew { dst, src, .. } => {
                         let mut list = bx.use_var(uvar!(*src));
-                        // Liste possédée : l'itérateur en garde une copie (elle reste
-                        // vivante même si son registre change pendant la boucle).
+                        // Owned list: the iterator keeps a copy of it (it stays alive even if its register
+                        // changes during the loop).
                         if !borrowed[*dst as usize] {
                             let slot = own!(bx, *dst);
                             bx.ins().call(clone_ref, &[slot, list]);
@@ -1802,8 +1801,8 @@ impl Jit {
                         };
                         let list = bx.use_var(uvar!(*a));
                         let (data, len) = view!(bx, list, span);
-                        // Index négatif : depuis la fin ; hors limites : l'interpréteur
-                        // produit l'erreur.
+                        // Negative index: from the end; out of bounds: the interpreter produces the
+                        // error.
                         let i = bx.use_var(uvar!(*i));
                         let neg = bx.ins().icmp_imm_s(IntCC::SignedLessThan, i, 0);
                         let from_end = bx.ins().iadd(i, len);
@@ -1881,8 +1880,8 @@ impl Jit {
                         _ => v,
                     };
                     if let Some(out) = out_param {
-                        // Déplacé si la valeur est dans la case du registre (possédée),
-                        // copié sinon (paramètre…).
+                        // Moved if the value is in the register's slot (owned), copied otherwise
+                        // (parameter…).
                         let owned = match slot_of.get(reg) {
                             Some(&off) => {
                                 let slot = bx.ins().stack_addr(types::I64, vals, off);
@@ -1929,8 +1928,8 @@ impl Jit {
                 }
             }
         }
-        // Sortie en erreur : l'index de l'erreur est rangé dans `ctx` (-1 : déjà rangé
-        // par la fonction appelée).
+        // Error exit: the error index is stored in `ctx` (-1: already stored by the called
+        // function).
         bx.switch_to_block(fail);
         let eid = bx.block_params(fail)[0];
         let set = bx.create_block();
@@ -1964,7 +1963,7 @@ impl Jit {
         Ok(())
     }
 
-    /// Point d'entrée pour Rust : `fn(ctx, args, ret) -> statut`.
+    /// Entry point for Rust: `fn(ctx, args, ret) -> status`.
     fn define_entry(&mut self, key: usize) -> Result<FuncId, ()> {
         let (id, params, ret) = {
             let c = &self.compiled[&key];
@@ -2002,7 +2001,7 @@ impl Jit {
                 .load(clif(*t), MemFlagsData::trusted(), args, (k * 8) as i32);
             call_args.push(v);
         }
-        // Objet ou liste : `out` désigne la valeur qui recevra le résultat.
+        // Object or list: `out` points to the value that receives the result.
         if ret == RegTy::Value {
             call_args.push(out);
         }
@@ -2027,11 +2026,11 @@ impl Jit {
         Ok(eid)
     }
 
-    /// Exécute le code natif. `depth` : profondeur d'appels actuelle.
+    /// Runs the native code. `depth`: current call depth.
     ///
-    /// `None` : la pile native ne suffit pas pour la profondeur demandée ; l'appel doit être
-    /// refait par l'interpréteur (dont la pile grandit sur le tas). C'est sans risque : les
-    /// fonctions compilées n'ont pas d'effet de bord.
+    /// `None`: the native stack is too small for the requested depth; the call must be
+    /// redone by the interpreter (whose stack grows on the heap). This is safe: compiled
+    /// functions have no side effects.
     pub fn call(
         &mut self,
         code: &NativeCode,
@@ -2052,11 +2051,11 @@ impl Jit {
                 Value::Int(i) => *i as u64,
                 Value::Float(f) => f.to_bits(),
                 Value::Bool(b) => *b as u64,
-                // Objet : pointeur vers l'argument, vivant pendant tout l'appel.
+                // Object: pointer to the argument, alive for the whole call.
                 v => v as *const Value as u64,
             };
         }
-        // Profondeur permise par la pile native restante (estimation prudente par appel).
+        // Depth allowed by the remaining native stack (conservative estimate per call).
         const FRAME: usize = 512;
         const MARGIN: usize = 64 * 1024;
         let stack_cap = stacker::remaining_stack().map_or(usize::MAX, |r| {
@@ -2069,14 +2068,14 @@ impl Jit {
         self.ctx.traces.clear();
         self.bailed = false;
         let mut out = 0u64;
-        // Objet ou liste renvoyé : écrit directement dans `result`.
+        // Object or list returned: written directly into `result`.
         let mut result = Value::Nil;
         let out_ptr = match code.ret {
             RegTy::Value => &mut result as *mut Value as *mut u64,
             _ => &mut out as *mut u64,
         };
-        // SAFETY : `entry` est un point d'entrée généré par `define_entry` avec cette
-        // signature ; les arguments ont le nombre et le type attendus.
+        // SAFETY: `entry` is an entry point generated by `define_entry` with this signature;
+        // the arguments have the expected number and types.
         let f: extern "C" fn(*mut JitCtx, *const u64, *mut u64) -> i32 =
             unsafe { std::mem::transmute(code.entry) };
         let status = f(&mut *self.ctx, buf.as_ptr(), out_ptr);
@@ -2097,10 +2096,10 @@ impl Jit {
             return None;
         }
         let msg = match info.kind {
-            ErrKind::Overflow => "dépassement de capacité d'un entier".to_string(),
-            ErrKind::DivZero => "division par zéro".to_string(),
+            ErrKind::Overflow => "integer overflow".to_string(),
+            ErrKind::DivZero => "division by zero".to_string(),
             ErrKind::Depth => {
-                format!("trop d'appels imbriqués ({max_depth}) : récursion infinie ?")
+                format!("too many nested calls ({max_depth}): infinite recursion?")
             }
             ErrKind::Bail => unreachable!(),
         };
@@ -2114,7 +2113,7 @@ impl Jit {
     }
 }
 
-/// Appels directs d'une fonction (cases globales), pour surveiller leur redéfinition.
+/// Direct calls of a function (global slots), to watch for their redefinition.
 fn analyze_callees(p: &Proto) -> Option<Vec<u32>> {
     let mut out = Vec::new();
     for b in &p.blocks {
@@ -2129,8 +2128,8 @@ fn analyze_callees(p: &Proto) -> Option<Vec<u32>> {
     (!out.is_empty()).then_some(out)
 }
 
-/// Arithmétique entière avec les vérifications de l'interpréteur. `check(bx, cond, kind)`
-/// branche vers l'erreur si `cond`.
+/// Integer arithmetic with the interpreter's checks. `check(bx, cond, kind)` branches to
+/// the error if `cond`.
 fn int_bin(
     bx: &mut FunctionBuilder,
     op: BinOp,
@@ -2157,7 +2156,7 @@ fn int_bin(
         BinOp::Div | BinOp::Rem => {
             let zero = bx.ins().icmp_imm_s(IntCC::Equal, y, 0);
             check(bx, zero, ErrKind::DivZero);
-            // i64::MIN / -1 déborde (et ferait planter `sdiv`).
+            // i64::MIN / -1 overflows (and would crash `sdiv`).
             let min = bx.ins().icmp_imm_s(IntCC::Equal, x, i64::MIN);
             let m1 = bx.ins().icmp_imm_s(IntCC::Equal, y, -1);
             let both = bx.ins().band(min, m1);
@@ -2166,7 +2165,7 @@ fn int_bin(
             let r = bx.ins().srem(x, y);
             let neg = bx.ins().icmp_imm_s(IntCC::SignedLessThan, r, 0);
             if op == BinOp::Div {
-                // Division euclidienne : reste toujours positif.
+                // Euclidean division: the remainder is always non-negative.
                 let ypos = bx.ins().icmp_imm_s(IntCC::SignedGreaterThan, y, 0);
                 let minus = bx.ins().iadd_imm_s(q, -1);
                 let plus = bx.ins().iadd_imm_s(q, 1);
@@ -2202,16 +2201,16 @@ fn float_bin(
     }
 }
 
-// ─── Compilation de base (code non typé) ────────────────────────────────────
+// ─── Baseline compilation (untyped code) ───────────────────────────────────
 //
-// Toute fonction peut être compilée ainsi. Les registres restent des `Value` en mémoire
-// (la fenêtre de l'appel) ; le code natif traite lui-même les cas simples (constantes,
-// copies de valeurs scalaires, arithmétique et comparaisons d'entiers et de décimaux,
-// branchements) et appelle `Runtime::step` — le code de l'interpréteur — pour tout le
-// reste, y compris les cas inhabituels (dépassement…) : la sémantique est la même.
+// Any function can be compiled this way. Registers stay `Value`s in memory (the call's
+// window); native code handles the simple cases itself (constants, copies of scalar
+// values, integer and float arithmetic and comparisons, branches) and calls
+// `Runtime::step` — the interpreter's code — for everything else, including unusual cases
+// (overflow…): the semantics are the same.
 
-/// Exécute une instruction de l'IR avec le code de l'interpréteur. 0 : succès, 1 : erreur
-/// (rangée dans le `Runtime`).
+/// Runs an IR instruction with the interpreter's code. 0: success, 1: error (stored in
+/// the `Runtime`).
 extern "C" fn bk_step(
     rt: *mut Runtime,
     f: *mut NativeFrame,
@@ -2219,8 +2218,8 @@ extern "C" fn bk_step(
     lo: u32,
     hi: u32,
 ) -> i32 {
-    // SAFETY : `rt`, `f` et `ins` viennent de `Runtime::run_native`, valides pendant
-    // l'appel ; les pointeurs de la fenêtre désignent des tranches de la longueur donnée.
+    // SAFETY: `rt`, `f` and `ins` come from `Runtime::run_native`, valid during the call;
+    // the window's pointers refer to slices of the given length.
     unsafe {
         let rt = &mut *rt;
         let f = &mut *f;
@@ -2245,9 +2244,9 @@ extern "C" fn bk_step(
     }
 }
 
-/// Élément suivant d'un itérateur `for` : 1 s'il y en a un (rangé dans `dst`), 0 sinon.
+/// Next element of a `for` iterator: 1 if there is one (stored in `dst`), 0 otherwise.
 extern "C" fn bk_iter_next(f: *mut NativeFrame, iter: u32, dst: u32) -> i32 {
-    // SAFETY : comme pour `bk_step`.
+    // SAFETY: as for `bk_step`.
     unsafe {
         let f = &mut *f;
         let regs = std::slice::from_raw_parts_mut(f.regs, f.nregs);
@@ -2255,27 +2254,27 @@ extern "C" fn bk_iter_next(f: *mut NativeFrame, iter: u32, dst: u32) -> i32 {
     }
 }
 
-/// Libère la valeur d'un registre avant d'y écrire une valeur scalaire.
+/// Drops the value of a register before writing a scalar value into it.
 extern "C" fn bk_drop(slot: *mut Value) {
-    // SAFETY : `slot` est un registre de la fenêtre en cours.
+    // SAFETY: `slot` is a register of the current window.
     unsafe {
         std::ptr::drop_in_place(slot);
         slot.write(Value::Nil);
     }
 }
 
-/// Cache d'un accès à un champ (`p.x`) : dernier type vu et position du champ. Le
-/// `Rc` garde le type en vie, donc son adresse ne peut pas désigner un autre type.
+/// Cache of a field access (`p.x`): last type seen and the field's offset. The `Rc`
+/// keeps the type alive, so its address cannot refer to another type.
 struct FieldCache {
     info: Option<Rc<crate::objects::TypeInfo>>,
     idx: usize,
     name: crate::intern::Symbol,
-    /// Type attendu (`FieldAs`), ou `Value`.
+    /// Expected type (`FieldAs`), or `Value`.
     want: RegTy,
 }
 
 impl FieldCache {
-    /// Champ `name` de l'objet `v` (`type` uniquement : une `class` passe par un getter).
+    /// Field `name` of object `v` (`type` only: a `class` goes through a getter).
     fn get(&mut self, v: &Value) -> Option<Value> {
         let Value::Object(o) = v else {
             return None;
@@ -2305,9 +2304,9 @@ impl FieldCache {
     }
 }
 
-/// Fonctions d'aide rapides : `fn(rt, fenêtre, x, y, p) -> statut`. Statut 0 : fait ;
-/// autre : cas non traité, l'interpréteur exécute l'instruction (et produit l'erreur
-/// éventuelle). Pour `Call`, 1 signale une erreur (rangée dans le `Runtime`).
+/// Fast helpers: `fn(rt, window, x, y, p) -> status`. Status 0: done; other: case not
+/// handled, the interpreter runs the instruction (and produces the error, if any). For
+/// `Call`, 1 signals an error (stored in the `Runtime`).
 #[derive(Clone, Copy)]
 enum Fast {
     GetUp,
@@ -2333,16 +2332,16 @@ const FAST: &[(&str, FastFn)] = &[
     ("bk_call", bk_call),
 ];
 
-/// Registres de la fenêtre.
+/// Registers of the window.
 ///
 /// # Safety
-/// `f` vient de `Runtime::run_native`, valide pendant l'appel.
+/// `f` comes from `Runtime::run_native`, valid during the call.
 unsafe fn frame_regs<'a>(f: *mut NativeFrame) -> &'a mut [Value] {
     unsafe { std::slice::from_raw_parts_mut((*f).regs, (*f).nregs) }
 }
 
-/// Lecture d'une variable capturée ou d'une cellule : non traitée si elle n'est pas
-/// encore initialisée (l'interpréteur signale l'erreur).
+/// Read of a captured variable or a cell: not handled if it is not initialized yet
+/// (the interpreter reports the error).
 fn load_cell(regs: &mut [Value], d: u32, c: &crate::vm::Cell) -> i32 {
     let v = c.borrow().clone();
     if let Value::Uninit = v {
@@ -2353,7 +2352,7 @@ fn load_cell(regs: &mut [Value], d: u32, c: &crate::vm::Cell) -> i32 {
 }
 
 extern "C" fn bk_get_up(_: *mut Runtime, f: *mut NativeFrame, d: u32, u: u32, _: *const u8) -> i32 {
-    // SAFETY : fenêtre valide pendant l'appel (cf. `frame_regs`).
+    // SAFETY: window valid during the call (see `frame_regs`).
     unsafe {
         let up = &*(*f).upvals.add(u as usize);
         load_cell(frame_regs(f), d, up)
@@ -2361,7 +2360,7 @@ extern "C" fn bk_get_up(_: *mut Runtime, f: *mut NativeFrame, d: u32, u: u32, _:
 }
 
 extern "C" fn bk_set_up(_: *mut Runtime, f: *mut NativeFrame, u: u32, a: u32, _: *const u8) -> i32 {
-    // SAFETY : idem.
+    // SAFETY: same.
     unsafe {
         let up = &*(*f).upvals.add(u as usize);
         *up.borrow_mut() = frame_regs(f)[a as usize].clone();
@@ -2376,7 +2375,7 @@ extern "C" fn bk_get_cell(
     c: u32,
     _: *const u8,
 ) -> i32 {
-    // SAFETY : idem.
+    // SAFETY: same.
     unsafe {
         let cell = &*(*f).cells.add(c as usize);
         load_cell(frame_regs(f), d, cell)
@@ -2390,7 +2389,7 @@ extern "C" fn bk_set_cell(
     a: u32,
     _: *const u8,
 ) -> i32 {
-    // SAFETY : idem.
+    // SAFETY: same.
     unsafe {
         let cell = &*(*f).cells.add(c as usize);
         *cell.borrow_mut() = frame_regs(f)[a as usize].clone();
@@ -2405,7 +2404,7 @@ extern "C" fn bk_get_global(
     g: u32,
     _: *const u8,
 ) -> i32 {
-    // SAFETY : `rt` et la fenêtre sont valides pendant l'appel.
+    // SAFETY: `rt` and the window are valid during the call.
     unsafe {
         match &(*rt).globals.at(g).value {
             Some(v) => {
@@ -2424,7 +2423,7 @@ extern "C" fn bk_set_global(
     a: u32,
     _: *const u8,
 ) -> i32 {
-    // SAFETY : idem.
+    // SAFETY: same.
     unsafe {
         let rt = &mut *rt;
         let slot = rt.globals.at(g);
@@ -2438,7 +2437,7 @@ extern "C" fn bk_set_global(
 }
 
 extern "C" fn bk_field(_: *mut Runtime, f: *mut NativeFrame, d: u32, a: u32, p: *const u8) -> i32 {
-    // SAFETY : fenêtre valide ; `p` est un `FieldCache` gardé par le `Jit`.
+    // SAFETY: valid window; `p` is a `FieldCache` kept alive by the `Jit`.
     unsafe {
         let cache = &mut *(p as *mut FieldCache);
         let regs = frame_regs(f);
@@ -2459,7 +2458,7 @@ extern "C" fn bk_call(
     hi: u32,
     ins: *const u8,
 ) -> i32 {
-    // SAFETY : comme pour `bk_step`.
+    // SAFETY: as for `bk_step`.
     unsafe {
         let rt = &mut *rt;
         let Instr::Call {
@@ -2518,8 +2517,8 @@ impl Dyn<'_> {
         )
     }
 
-    /// Écrit une valeur scalaire (étiquette, valeur) dans un registre. Un registre
-    /// `valeur` peut contenir une ressource : elle est d'abord libérée.
+    /// Writes a scalar value (tag, payload) into a register. A `value` register may hold a
+    /// resource: it is dropped first.
     fn write(&self, bx: &mut FunctionBuilder, d: Reg, tag: CValue, payload: Option<CValue>) {
         if self.regs_ty[d as usize] == RegTy::Value {
             let old = self.tag(bx, d);
@@ -2554,7 +2553,7 @@ impl Dyn<'_> {
         self.write(bx, d, t, payload);
     }
 
-    /// Appel de `bk_step` pour l'instruction `ins` ; continue dans un nouveau bloc.
+    /// Calls `bk_step` for instruction `ins`; continues in a new block.
     fn step(&self, bx: &mut FunctionBuilder, ins: &Instr, span: Span) {
         let ptr = bx.func.dfg.value_type(self.regs);
         let ip = bx.ins().iconst(ptr, ins as *const Instr as i64);
@@ -2567,8 +2566,8 @@ impl Dyn<'_> {
         bx.switch_to_block(cont);
     }
 
-    /// Fonction d'aide rapide ; si elle ne traite pas le cas (statut non nul),
-    /// l'instruction passe par l'interpréteur.
+    /// Fast helper; if it does not handle the case (non-zero status), the instruction goes
+    /// through the interpreter.
     #[allow(clippy::too_many_arguments)]
     fn fast(
         &self,
@@ -2597,7 +2596,7 @@ impl Dyn<'_> {
         bx.switch_to_block(next);
     }
 
-    /// Vérité d'un registre (`nil` et `false` sont faux), en `i8` (1 : vrai).
+    /// Truthiness of a register (`nil` and `false` are falsy), as an `i8` (1: truthy).
     fn truthy(&self, bx: &mut FunctionBuilder, r: Reg) -> CValue {
         match self.regs_ty[r as usize] {
             RegTy::Bool => {
@@ -2620,7 +2619,7 @@ impl Dyn<'_> {
 }
 
 impl Jit {
-    /// Compile `p` en code natif de base ; adresse du point d'entrée.
+    /// Compiles `p` to baseline native code; returns the entry point's address.
     pub fn compile_dynamic(&mut self, p: &Proto) -> Option<usize> {
         let ptr = self.module.target_config().pointer_type();
         let mut sig = self.module.make_signature();
@@ -2763,7 +2762,7 @@ impl Jit {
         Some(self.module.get_finalized_function(id) as usize)
     }
 
-    /// `bk_step`, `bk_iter_next`, `bk_drop` (déclarés au premier besoin).
+    /// `bk_step`, `bk_iter_next`, `bk_drop` (declared on first use).
     fn dyn_helpers(&mut self) -> Option<(FuncId, FuncId, FuncId)> {
         if let Some(h) = self.dyn_fns {
             return Some(h);
@@ -2810,7 +2809,7 @@ impl Jit {
     }
 }
 
-/// Traduit une instruction : en ligne pour les cas simples, sinon `bk_step`.
+/// Translates an instruction: inline for simple cases, otherwise `bk_step`.
 #[allow(clippy::vec_box)]
 fn dyn_instr(
     d: &Dyn,
@@ -2856,8 +2855,8 @@ fn dyn_instr(
             bx.ins().brif(status, d.fail, &[], cont, &[]);
             bx.switch_to_block(cont);
         }
-        // Garde : l'étiquette attendue, ou un `int` vers `float` ; sinon l'interpréteur
-        // produit l'erreur.
+        // Guard: the expected tag, or an `int` to `float`; otherwise the interpreter produces
+        // the error.
         Guard(r, a, t) if *t != RegTy::Value && ty(*r) == *t => {
             let (tag, cty) = scalar(*t);
             let at = d.tag(bx, *a);
@@ -2907,7 +2906,7 @@ fn dyn_instr(
             let v = d.payload(bx, *a, t);
             d.write_const(bx, *dst, tag, Some(v));
         }
-        // Copie d'une valeur : directe si elle est scalaire, sinon par l'interpréteur.
+        // Copy of a value: direct if it is scalar, otherwise through the interpreter.
         Move(dst, a) if ty(*dst) == RegTy::Value => {
             let t = d.tag(bx, *a);
             let scalar = bx
@@ -2956,7 +2955,7 @@ fn dyn_instr(
             let v = bx.ins().icmp_imm_s(IntCC::Equal, t, 0);
             d.write_const(bx, *r, TAG_BOOL, Some(v));
         }
-        // Opération générique : en ligne pour deux entiers ou deux décimaux.
+        // Generic operation: inline for two integers or two floats.
         Bin(op, r, a, b) if is_arith(*op) || is_cmp(*op) => {
             let ta = d.tag(bx, *a);
             let tb = d.tag(bx, *b);
@@ -3011,7 +3010,7 @@ fn scalar(t: RegTy) -> (u8, Type) {
     }
 }
 
-/// Opération entière en ligne ; cas limite (dépassement, division par zéro) : `bk_step`.
+/// Inline integer operation; edge case (overflow, division by zero): `bk_step`.
 #[allow(clippy::too_many_arguments)]
 fn int_fast(
     d: &Dyn,
@@ -3033,7 +3032,7 @@ fn int_fast(
     bx.switch_to_block(next);
 }
 
-/// Calcule `x op y` et l'écrit dans `r` ; branche vers `slow` pour tout cas limite.
+/// Computes `x op y` and writes it to `r`; branches to `slow` for any edge case.
 fn int_op_into(
     d: &Dyn,
     bx: &mut FunctionBuilder,

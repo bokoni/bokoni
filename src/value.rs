@@ -1,8 +1,8 @@
-//! Valeurs manipulées à l'exécution.
+//! Runtime values.
 //!
-//! Les types de base (`nil`, `bool`, `int`, `float`) sont stockés directement, sans
-//! allocation. Les valeurs composées sont partagées par comptage de références (`Rc`) :
-//! `let b = a` ne copie pas la liste, les deux noms désignent la même.
+//! Base types (`nil`, `bool`, `int`, `float`) are stored inline, without allocation.
+//! Compound values are shared through reference counting (`Rc`): `let b = a` does not
+//! copy the list, both names refer to the same one.
 
 use crate::intern::{FxHashMap, FxHashSet, Interner, Symbol};
 use crate::objects::{EnumInfo, Object, TypeInfo};
@@ -10,10 +10,9 @@ use std::cell::RefCell;
 use std::fmt::{self, Write};
 use std::rc::Rc;
 
-/// Disposition fixe (`repr(C, u8)`) : le code natif du JIT lit l'étiquette (octet 0) et la
-/// valeur des types de base (octet 8) directement. Les types de base (`nil`, `bool`, `int`,
-/// `float`) ont les étiquettes 0 à 3 et ne possèdent rien : les copier ou les écraser ne
-/// demande aucun comptage de références.
+/// Fixed layout (`repr(C, u8)`): JIT native code reads the tag (byte 0) and the payload of
+/// base types (byte 8) directly. Base types (`nil`, `bool`, `int`, `float`) have tags 0 to 3
+/// and own nothing: copying or overwriting them needs no reference counting.
 #[derive(Clone)]
 #[repr(C, u8)]
 pub enum Value {
@@ -28,17 +27,17 @@ pub enum Value {
     Tuple(Rc<[Value]>),
     Range(Rc<Range>),
     Function(Rc<Function>),
-    /// Instance d'un `type` ou d'une `class`.
+    /// Instance of a `type` or a `class`.
     Object(Rc<RefCell<Object>>),
-    /// Variante d'un `enum` (`Protocol::Tcp`) : l'enum et l'index de la variante.
+    /// Variant of an `enum` (`Protocol::Tcp`): the enum and the variant's index.
     Variant(Rc<EnumInfo>, u32),
-    /// Un `type` / une `class` eux-mêmes (appelables : construction).
+    /// A `type` / `class` itself (callable: construction).
     Type(Rc<TypeInfo>),
-    /// Un `enum` lui-même (`Protocol.values()`).
+    /// An `enum` itself (`Protocol.values()`).
     Enum(Rc<EnumInfo>),
-    /// Interne : champ d'objet, variable ou paramètre pas encore initialisé.
+    /// Internal: object field, variable or parameter not initialized yet.
     Uninit,
-    /// Interne : itérateur d'une boucle `for`.
+    /// Internal: iterator of a `for` loop.
     Iter(Rc<RefCell<crate::vm::IterState>>),
 }
 
@@ -50,12 +49,12 @@ pub struct Range {
 }
 
 impl Range {
-    /// Valeurs de l'intervalle, dans l'ordre (sans débordement, même jusqu'à `i64::MAX`).
+    /// Values of the range, in order (no overflow, even up to `i64::MAX`).
     pub fn values(&self) -> std::ops::RangeInclusive<i64> {
         match (self.inclusive, self.hi.checked_sub(1)) {
             (true, _) => self.lo..=self.hi,
             (false, Some(last)) => self.lo..=last,
-            // `lo...i64::MIN` : vide (intervalle déjà épuisé).
+            // `lo...i64::MIN`: empty (an already exhausted range).
             (false, None) => {
                 let mut empty = 0..=0;
                 empty.next();
@@ -83,7 +82,7 @@ impl Range {
     }
 }
 
-/// Champs d'un record, dans l'ordre de déclaration.
+/// Fields of a record, in declaration order.
 #[derive(Clone, Default)]
 pub struct Record {
     pub fields: Vec<(Symbol, Value)>,
@@ -102,7 +101,7 @@ impl Record {
     }
 }
 
-/// Clé de hash : seules les valeurs immuables et comparables exactement sont acceptées.
+/// Hash key: only immutable, exactly comparable values are accepted.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum HashKey {
     Nil,
@@ -132,7 +131,7 @@ impl HashKey {
     }
 }
 
-/// Hash qui conserve l'ordre d'insertion.
+/// Hash that preserves insertion order.
 #[derive(Clone, Default)]
 pub struct HashMap {
     entries: Vec<(HashKey, Value)>,
@@ -182,17 +181,17 @@ impl HashMap {
     }
 }
 
-/// Fonction appelable.
+/// Callable function.
 pub enum Function {
-    /// Fonction ou lambda du script.
+    /// Script function or lambda.
     Script(crate::vm::Closure),
-    /// Fonction Rust enregistrée avec [`Engine::register_fn`](crate::Engine::register_fn).
+    /// Rust function registered with [`Engine::register_fn`](crate::Engine::register_fn).
     Native(NativeFn),
-    /// Fonction intégrée qui a besoin de l'interpréteur (`print`…).
+    /// Builtin function that needs the interpreter (`print`…).
     Builtin(crate::ops::Builtin),
 }
 
-/// Signature commune des fonctions Rust appelables depuis le script.
+/// Common signature of Rust functions callable from scripts.
 pub type NativeImpl = dyn Fn(&[Value]) -> Result<Value, String>;
 
 pub struct NativeFn {
@@ -222,7 +221,7 @@ impl Value {
         Value::List(Rc::new(RefCell::new(items)))
     }
 
-    /// Nom du type, tel qu'écrit dans les annotations.
+    /// Type name, as written in annotations.
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::Nil => "nil",
@@ -235,19 +234,19 @@ impl Value {
             Value::Record(_) => "record",
             Value::Tuple(_) => "tuple",
             Value::Range(_) => "range",
-            Value::Function(_) => "fonction",
+            Value::Function(_) => "function",
             Value::Object(o) => match o.borrow().info.kind {
-                crate::ast::TypeDeclKind::Class => "objet",
-                _ => "valeur de type",
+                crate::ast::TypeDeclKind::Class => "object",
+                _ => "type value",
             },
-            Value::Variant(..) => "variante d'enum",
+            Value::Variant(..) => "enum variant",
             Value::Type(_) => "type",
             Value::Enum(_) => "enum",
-            Value::Uninit | Value::Iter(_) => "valeur interne",
+            Value::Uninit | Value::Iter(_) => "internal value",
         }
     }
 
-    /// Nom du type pour les messages : le nom du type utilisateur quand il y en a un.
+    /// Type name for messages: the user type's name when there is one.
     pub fn type_label(&self) -> String {
         match self {
             Value::Object(o) => o.borrow().info.name.to_string(),
@@ -256,22 +255,22 @@ impl Value {
         }
     }
 
-    /// `nil` et `false` sont faux, tout le reste est vrai (comme Ruby).
+    /// `nil` and `false` are falsy, everything else is truthy (as in Ruby).
     #[inline]
     pub fn truthy(&self) -> bool {
         !matches!(self, Value::Nil | Value::Bool(false))
     }
 
-    /// Égalité structurelle (`==`). Un `int` et un `float` égaux sont égaux.
+    /// Structural equality (`==`). An `int` and a `float` of equal value are equal.
     pub fn equals(&self, other: &Value) -> bool {
-        // Ensemble vide : aucune allocation pour des valeurs simples.
+        // Empty set: no allocation for simple values.
         self.equals_in(other, &mut FxHashSet::default())
     }
 
-    /// Égalité structurelle. `seen` : paires de conteneurs déjà comparées (ou en cours) ;
-    /// une paire revue compte comme égale — égalité des structures cycliques, et travail
-    /// borné par le nombre de paires même pour des structures très partagées. La pile
-    /// grandit sur le tas pour les structures très profondes.
+    /// Structural equality. `seen`: pairs of containers already compared (or in progress);
+    /// a pair seen again counts as equal — this gives equality of cyclic structures, and
+    /// bounds the work by the number of pairs even for heavily shared structures. The stack
+    /// grows on the heap for very deep structures.
     fn equals_in(&self, other: &Value, seen: &mut FxHashSet<(usize, usize)>) -> bool {
         use Value::*;
         let pair = |a: *const (), b: *const ()| (a as usize, b as usize);
@@ -331,7 +330,7 @@ impl Value {
             }
             (Range(a), Range(b)) => a == b,
             (Function(a), Function(b)) => Rc::ptr_eq(a, b),
-            // `class` : identité ; `type` : mêmes champs (données).
+            // `class`: identity; `type`: same fields (data).
             (Object(a), Object(b)) => {
                 Rc::ptr_eq(a, b) || {
                     let (a, b) = (a.borrow(), b.borrow());
@@ -350,7 +349,7 @@ impl Value {
         }
     }
 
-    /// Texte pour `print` et l'interpolation : les chaînes sans guillemets.
+    /// Text for `print` and interpolation: strings without quotes.
     pub fn to_display(&self, i: &Interner) -> String {
         match self {
             Value::Str(s) => s.to_string(),
@@ -358,8 +357,8 @@ impl Value {
         }
     }
 
-    /// Ajoute l'affichage d'une valeur simple (`nil`, booléen, nombre) à `out` ; `false`
-    /// pour les autres valeurs.
+    /// Appends the display of a simple value (`nil`, boolean, number) to `out`; `false` for
+    /// other values.
     pub fn write_scalar(&self, out: &mut String) -> bool {
         match self {
             Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) => {
@@ -370,14 +369,14 @@ impl Value {
         }
     }
 
-    /// Représentation en code source (REPL, contenu des listes) : chaînes entre guillemets.
+    /// Source-code representation (REPL, list contents): strings in quotes.
     pub fn inspect(&self, i: &Interner) -> String {
         let mut out = String::new();
         self.write_inspect(&mut out, Some(i), 0);
         out
     }
 
-    /// Sans interner, les noms de champs s'affichent par leur numéro (`#3`).
+    /// Without an interner, field names are shown by their number (`#3`).
     fn write_inspect(&self, out: &mut String, i: Option<&Interner>, depth: usize) {
         let mut cx = Inspect {
             depth,
@@ -387,8 +386,8 @@ impl Value {
         self.write_in(out, i, &mut cx);
     }
 
-    /// Écrit la valeur ; un conteneur déjà sur le chemin courant (structure cyclique)
-    /// s'écrit `[…]`, et le nombre total de nœuds est borné (structures très partagées).
+    /// Writes the value; a container already on the current path (cyclic structure) is
+    /// written `[…]`, and the total number of nodes is bounded (heavily shared structures).
     fn write_in(&self, out: &mut String, i: Option<&Interner>, cx: &mut Inspect) {
         if cx.depth > 32 || cx.budget == 0 {
             out.push('…');
@@ -493,7 +492,7 @@ impl Value {
                 );
             }
             Value::Function(f) => {
-                let _ = write!(out, "<fonction {}>", f.name());
+                let _ = write!(out, "<function {}>", f.name());
             }
             Value::Object(o) => {
                 let o = o.borrow();
@@ -531,25 +530,24 @@ impl Value {
             Value::Enum(e) => {
                 let _ = write!(out, "<enum {}>", e.name);
             }
-            Value::Uninit | Value::Iter(_) => out.push_str("<interne>"),
+            Value::Uninit | Value::Iter(_) => out.push_str("<internal>"),
         }
     }
 }
 
-/// `2.0` reste `2.0` (et non `2`) pour distinguer les décimaux des entiers.
-/// Nombre maximal de nœuds écrits par un affichage (au-delà : `…`).
+/// Maximum number of nodes written by one display (beyond that: `…`).
 const INSPECT_BUDGET: usize = 1_000_000;
 
-/// État d'un affichage : profondeur, conteneurs du chemin courant, nœuds restants.
+/// Display state: depth, containers on the current path, remaining nodes.
 struct Inspect {
     depth: usize,
     path: Vec<usize>,
     budget: usize,
 }
 
-/// Écriture la plus courte qui redonne exactement le nombre : `3.0`, `0.1`, `1e300`,
-/// `5e-324`, `1.2345678901234568e17` (notation scientifique pour les très grands et très
-/// petits nombres), `NaN`, `inf`.
+/// Shortest text that round-trips exactly: `3.0`, `0.1`, `1e300`, `5e-324`,
+/// `1.2345678901234568e17` (scientific notation for very large and very small numbers),
+/// `NaN`, `inf`. `2.0` stays `2.0` (not `2`) to tell floats from integers.
 fn write_float(out: &mut String, f: f64) {
     let _ = write!(out, "{f:?}");
 }
@@ -568,47 +566,47 @@ impl PartialEq for Value {
     }
 }
 
-/// Étiquettes et positions utilisées par le code natif.
+/// Tags and offsets used by native code.
 pub mod layout {
     pub const TAG_NIL: u8 = 0;
     pub const TAG_BOOL: u8 = 1;
     pub const TAG_INT: u8 = 2;
     pub const TAG_FLOAT: u8 = 3;
-    /// Étiquettes supérieures : la valeur possède une ressource (comptage de références).
+    /// Higher tags: the value owns a resource (reference counted).
     pub const FIRST_HEAP_TAG: u8 = 4;
     pub const PAYLOAD: i32 = 8;
     pub const SIZE: i32 = 24;
 }
 
-/// Libération sans récursion : une structure imbriquée très profondément (liste de liste
-/// de liste…, 300 000 niveaux) ferait sinon déborder la pile en se libérant.
+/// Non-recursive drop: a very deeply nested structure (list of list of list…, 300,000
+/// levels) would otherwise overflow the stack while being dropped.
 ///
-/// Seul le dernier propriétaire d'un conteneur le démonte : ses éléments conteneurs vont
-/// sur une pile de travail (sur le tas), les autres sont libérés sur place.
+/// Only the last owner of a container takes it apart: its container elements go onto a
+/// work stack (on the heap), the others are dropped in place.
 impl Drop for Value {
     #[inline]
     fn drop(&mut self) {
-        // Cas courant (nombre, chaîne, conteneur partagé ou sans conteneur imbriqué) :
-        // libération ordinaire, rien à faire ici.
+        // Common case (number, string, shared container or one without nested containers):
+        // ordinary drop, nothing to do here.
         if is_container(self) && has_nested(self) {
             drop_deep(self);
         }
     }
 }
 
-/// Démonte `v` et ses descendants sans récursion.
+/// Takes `v` and its descendants apart without recursion.
 #[inline(never)]
 fn drop_deep(v: &mut Value) {
     let mut stack: Vec<Value> = Vec::new();
     take_children(v, &mut stack);
     while let Some(mut v) = stack.pop() {
         take_children(&mut v, &mut stack);
-        // `v` n'a plus d'éléments : sa libération ne descend pas.
+        // `v` has no elements left: dropping it does not recurse.
     }
 }
 
-/// `v` est l'unique propriétaire d'un conteneur qui contient lui-même un conteneur
-/// (`Rc::get_mut` : unicité et accès sans vérification d'emprunt).
+/// `v` is the sole owner of a container that itself holds a container (`Rc::get_mut`:
+/// uniqueness and access without a borrow check).
 #[inline]
 fn has_nested(v: &mut Value) -> bool {
     fn any<'a>(mut xs: impl Iterator<Item = &'a Value>) -> bool {
@@ -639,7 +637,7 @@ fn has_nested(v: &mut Value) -> bool {
     }
 }
 
-/// Conteneur susceptible de contenir d'autres valeurs.
+/// Container that may hold other values.
 #[inline]
 fn is_container(v: &Value) -> bool {
     matches!(
@@ -654,8 +652,8 @@ fn is_container(v: &Value) -> bool {
     )
 }
 
-/// Retire les éléments de `v` si `v` est l'unique propriétaire d'un conteneur : les
-/// conteneurs vont dans `out`, le reste est libéré tout de suite.
+/// Removes the elements of `v` if `v` is the sole owner of a container: containers go
+/// into `out`, the rest is dropped right away.
 fn take_children(v: &mut Value, out: &mut Vec<Value>) {
     let mut push = |x: Value| {
         if is_container(&x) {
@@ -717,12 +715,12 @@ mod tests {
     use super::*;
 
     fn tag(v: &Value) -> u8 {
-        // SAFETY : `repr(C, u8)` place l'étiquette sur le premier octet.
+        // SAFETY: `repr(C, u8)` puts the tag in the first byte.
         unsafe { *(v as *const Value as *const u8) }
     }
 
     fn payload<T: Copy>(v: &Value) -> T {
-        // SAFETY : la valeur des variantes est à la position `PAYLOAD`.
+        // SAFETY: the variants' payload is at offset `PAYLOAD`.
         unsafe { *((v as *const Value as *const u8).add(layout::PAYLOAD as usize) as *const T) }
     }
 
@@ -738,7 +736,7 @@ mod tests {
         assert_eq!(payload::<i64>(&Value::Int(-42)), -42);
         assert_eq!(payload::<f64>(&Value::Float(2.5)), 2.5);
         assert!(payload::<bool>(&Value::Bool(true)));
-        // Des octets nuls forment `nil` (remise à zéro des registres).
+        // Zero bytes make `nil` (used to reset registers).
         let zero: Value = unsafe { std::mem::zeroed() };
         assert!(matches!(zero, Value::Nil));
     }

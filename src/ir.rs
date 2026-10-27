@@ -1,19 +1,19 @@
-//! Représentation intermédiaire (IR) : ce que l'interpréteur exécute, et ce que le JIT
-//! compilera.
+//! Intermediate representation (IR): what the interpreter runs and what the JIT
+//! compiles.
 //!
-//! - Une fonction ([`Proto`]) est un graphe de **blocs de base** : une suite
-//!   d'instructions, terminée par un saut, un branchement ou un retour ([`Term`]).
-//! - Les instructions lisent et écrivent des **registres** (variables locales et
-//!   temporaires). Chaque registre a un type ([`RegTy`]) : `int`, `float`, `bool` ou
-//!   `valeur` (n'importe quelle valeur). Une opération entre registres typés est une
-//!   instruction spécialisée (`IBin` : arithmétique entière), que le JIT traduira en
-//!   instructions machine ; le reste passe par des instructions génériques (`Bin`).
-//! - Une valeur dynamique n'entre dans un registre typé que par une garde (`Guard`), qui
-//!   vérifie son type : le typage graduel reste sûr.
-//! - Les variables capturées par une closure vivent dans des **cellules** partagées
-//!   (`NewCell`, `GetCell`) ; la closure y accède par ses **upvalues** (`GetUp`).
-//! - Les variables globales (niveau principal d'un script, fonctions Rust) sont des
-//!   cases d'un tableau (`GetGlobal`), qui persistent d'un script à l'autre (REPL).
+//! - A function ([`Proto`]) is a graph of **basic blocks**: a sequence of
+//!   instructions ending in a jump, a branch or a return ([`Term`]).
+//! - Instructions read and write **registers** (locals and temporaries). Each
+//!   register has a type ([`RegTy`]): `int`, `float`, `bool` or `value` (any
+//!   value). An operation between typed registers is a specialized instruction
+//!   (`IBin`: integer arithmetic) that the JIT turns into machine instructions;
+//!   everything else goes through generic instructions (`Bin`).
+//! - A dynamic value only enters a typed register through a guard (`Guard`) that
+//!   checks its type: gradual typing stays sound.
+//! - Variables captured by a closure live in shared **cells** (`NewCell`,
+//!   `GetCell`); the closure reaches them through its **upvalues** (`GetUp`).
+//! - Global variables (top level of a script, Rust functions) are slots of an
+//!   array (`GetGlobal`) that persist from one script to the next (REPL).
 
 use crate::ast::{BinOp, FnDecl, TypeDeclKind, TypeExpr};
 use crate::intern::{Interner, Symbol};
@@ -25,10 +25,10 @@ use std::rc::Rc;
 pub type Reg = u32;
 pub type BlockId = u32;
 
-/// Type d'un registre.
+/// Type of a register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RegTy {
-    /// N'importe quelle valeur.
+    /// Any value.
     Value,
     Int,
     Float,
@@ -41,67 +41,67 @@ impl RegTy {
     }
 }
 
-/// Un programme analysé : son source sert aux messages d'erreur.
+/// A parsed program: its source is used for error messages.
 pub struct Script {
     pub src: Rc<str>,
     pub name: Rc<str>,
 }
 
-/// Une fonction compilée (fonction, méthode, lambda, programme principal…).
+/// A compiled function (function, method, lambda, main program…).
 pub struct Proto {
     pub name: Rc<str>,
     pub script: Rc<Script>,
     pub kind: ProtoKind,
     pub params: Vec<ParamProto>,
     pub ret: Option<TypeRef>,
-    /// Types de tous les registres. Méthode : registre 0 = `self` ; puis les paramètres.
+    /// Types of all registers. Method: register 0 = `self`; then the parameters.
     pub regs: Vec<RegTy>,
     pub ncells: u32,
-    /// Comment chaque upvalue est capturée dans la fonction englobante (`Closure`).
+    /// How each upvalue is captured from the enclosing function (`Closure`).
     pub captures: Vec<Capture>,
     pub blocks: Vec<Block>,
     pub consts: Vec<Value>,
     pub calls: Vec<CallSite>,
     pub shapes: Vec<Rc<Shape>>,
     pub types: Vec<TypeRef>,
-    /// Noms des champs des records littéraux.
+    /// Field names of literal records.
     pub records: Vec<Rc<[Symbol]>>,
-    /// Fonctions imbriquées (lambdas, `def` locaux).
+    /// Nested functions (lambdas, local `def`s).
     pub children: Vec<Rc<Proto>>,
-    /// Déclarations de `type` / `class` / `enum` (programme principal).
+    /// `type` / `class` / `enum` declarations (main program).
     pub decls: Vec<Decl>,
-    /// Déclaration source (signature pour le vérificateur, introspection).
+    /// Source declaration (signature for the checker, introspection).
     pub decl: Option<Rc<FnDecl>>,
-    /// Compilation native (JIT) de la fonction, version typée.
+    /// Native (JIT) compilation of the function, typed version.
     pub jit: std::cell::RefCell<JitState>,
-    /// Compilation native de base (code non typé) : 0 = pas encore, 1 = impossible,
-    /// sinon adresse du point d'entrée `extern "C" fn(*mut Runtime, *mut NativeFrame) -> i32`.
+    /// Baseline native compilation (untyped code): 0 = not yet, 1 = impossible,
+    /// otherwise the address of the entry point `extern "C" fn(*mut Runtime, *mut NativeFrame) -> i32`.
     pub jit_dyn: std::cell::Cell<usize>,
-    /// Nombre d'appels (la compilation de base attend le deuxième, sauf s'il y a une boucle).
+    /// Number of calls (baseline compilation waits for the second, unless there is a loop).
     pub calls_seen: std::cell::Cell<u32>,
-    /// La fonction contient une boucle (saut vers un bloc précédent).
+    /// The function contains a loop (a jump to an earlier block).
     pub has_loop: bool,
-    /// Aucun paramètre annoté : les arguments se rangent sans vérification.
+    /// No annotated parameter: arguments are stored without checks.
     pub plain_params: bool,
-    /// Annotations de la fonction (`@[…]` avant `def`).
+    /// Annotations of the function (`@[…]` before `def`).
     pub annotations: Annotations,
 }
 
-/// Annotation appliquée à une déclaration (`@[Nom(args)]`).
+/// Annotation applied to a declaration (`@[Name(args)]`).
 pub struct AnnotationIr {
     pub name: Symbol,
-    /// Construit l'objet annotation : fonction sans paramètre, évaluée à la lecture.
+    /// Builds the annotation object: a parameterless function, evaluated when read.
     pub make: Rc<Proto>,
     pub span: Span,
-    /// Premier argument, si c'est une chaîne littérale (message de `Deprecated`, lu par le
-    /// vérificateur sans exécuter le code).
+    /// First argument, if it is a string literal (the `Deprecated` message, read by the
+    /// checker without running the code).
     pub text: Option<Rc<str>>,
 }
 
-/// Annotations d'une déclaration, dans l'ordre d'écriture.
+/// Annotations of a declaration, in source order.
 pub type Annotations = Rc<[AnnotationIr]>;
 
-/// Fenêtre d'exécution passée au code natif de base (positions fixes).
+/// Execution frame passed to baseline native code (fixed offsets).
 #[repr(C)]
 pub struct NativeFrame {
     pub regs: *mut Value,
@@ -112,23 +112,23 @@ pub struct NativeFrame {
     pub nupvals: usize,
     pub ctx: *const Rc<[u32]>,
     pub proto: *const Proto,
-    /// Registre et forme littérale du résultat (`Return`), remplis par le code natif.
+    /// Register and literal shape of the result (`Return`), filled in by native code.
     pub ret: u32,
     pub ret_shape: u32,
 }
 
-/// État de la compilation native d'une fonction.
+/// State of a function's native compilation.
 #[derive(Clone, Debug, Default)]
 pub enum JitState {
-    /// Pas encore essayée (ou invalidée : une fonction appelée a été redéfinie).
+    /// Not tried yet (or invalidated: a called function was redefined).
     #[default]
     Untried,
     Native(NativeCode),
-    /// Non compilable : l'interpréteur l'exécute.
+    /// Not compilable: the interpreter runs it.
     Rejected,
 }
 
-/// Code natif d'une fonction : point d'entrée `extern "C" fn(ctx, args, ret) -> statut`.
+/// Native code of a function: entry point `extern "C" fn(ctx, args, ret) -> status`.
 #[derive(Clone, Debug)]
 pub struct NativeCode {
     pub entry: usize,
@@ -140,15 +140,15 @@ pub struct NativeCode {
 pub enum ProtoKind {
     Main,
     Function,
-    /// Argument manquant = nil, arguments en trop ignorés.
+    /// Missing argument = nil, extra arguments ignored.
     Lambda,
-    /// Bloc `do` : peut servir de bloc de construction (`Server do … end`).
+    /// `do` block: can serve as a builder block (`Server do … end`).
     DoBlock,
-    /// Registre 0 = `self`.
+    /// Register 0 = `self`.
     Method,
-    /// Valeur par défaut d'un champ de `type` (`CtxField` lit les autres champs).
+    /// Default value of a `type` field (`CtxField` reads the other fields).
     FieldDefault,
-    /// Construction d'une annotation (`@[Nom(args)]`), évaluée à la lecture.
+    /// Construction of an annotation (`@[Name(args)]`), evaluated when read.
     Annotation,
 }
 
@@ -157,7 +157,7 @@ pub struct ParamProto {
     pub reg: Reg,
     pub ty: Option<TypeRef>,
     pub has_default: bool,
-    /// `init(@champ)` : index du champ de `self` à initialiser.
+    /// `init(@field)`: index of the `self` field to initialize.
     pub field: Option<u32>,
     pub span: Span,
     pub annotations: Annotations,
@@ -165,9 +165,9 @@ pub struct ParamProto {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Capture {
-    /// Cellule de la fonction englobante.
+    /// Cell of the enclosing function.
     Cell(u32),
-    /// Upvalue de la fonction englobante.
+    /// Upvalue of the enclosing function.
     Up(u32),
 }
 
@@ -178,33 +178,33 @@ pub struct Block {
     pub term_span: Span,
 }
 
-/// Appel : arguments dans les registres `start..start + npos + named.len()`.
+/// Call: arguments in registers `start..start + npos + named.len()`.
 pub struct CallSite {
     pub start: Reg,
     pub npos: u32,
     pub named: Vec<Symbol>,
-    /// Forme littérale de chaque argument (conversion record → type).
+    /// Literal shape of each argument (record → type conversion).
     pub shapes: Vec<Option<u32>>,
-    /// Le dernier argument positionnel est un bloc `do`.
+    /// The last positional argument is a `do` block.
     pub block: bool,
 }
 
-/// Forme d'une expression littérale, connue à la compilation : sert à convertir un record
-/// **littéral** vers le type attendu (`register({path: "/"})`, `[{path: "/a"}]`).
+/// Shape of a literal expression, known at compile time: used to convert a **literal**
+/// record to the expected type (`register({path: "/"})`, `[{path: "/a"}]`).
 #[derive(Debug)]
 pub enum Shape {
     Record(Vec<(Symbol, Option<Rc<Shape>>)>),
     List(Vec<Option<Rc<Shape>>>),
 }
 
-/// Annotation de type compilée.
+/// Compiled type annotation.
 #[derive(Clone, Debug)]
 pub struct TypeRef {
     pub ty: Rc<RtType>,
-    /// Texte de l'annotation, pour les messages.
+    /// Text of the annotation, for messages.
     pub shown: Rc<str>,
     pub span: Span,
-    /// Annotation source (vérificateur, introspection).
+    /// Source annotation (checker, introspection).
     pub expr: Rc<TypeExpr>,
 }
 
@@ -225,11 +225,11 @@ pub enum RtType {
     LitStr(Rc<str>),
     LitInt(i64),
     Fn,
-    /// Type utilisateur : `type`, `class` ou `enum`, dans une case globale.
+    /// User type: `type`, `class` or `enum`, in a global slot.
     Named(u32, Symbol),
 }
 
-/// Déclaration de `type` / `class` / `annotation` / `enum`, exécutée par `DefType` /
+/// `type` / `class` / `annotation` / `enum` declaration, executed by `DefType` /
 /// `DefEnum`.
 pub enum Decl {
     Type(Rc<TypeDeclIr>),
@@ -247,7 +247,7 @@ pub struct TypeDeclIr {
 pub struct FieldIr {
     pub name: Symbol,
     pub ty: Option<TypeRef>,
-    /// Valeur par défaut, calculée par une petite fonction.
+    /// Default value, computed by a small function.
     pub default: Option<Rc<Proto>>,
     pub annotations: Annotations,
 }
@@ -255,17 +255,17 @@ pub struct FieldIr {
 pub struct EnumDeclIr {
     pub name: Symbol,
     pub variants: Vec<Symbol>,
-    /// La variante a une valeur explicite (`= …`), calculée avant `DefEnum`.
+    /// The variant has an explicit value (`= …`), computed before `DefEnum`.
     pub explicit: Vec<bool>,
     pub repr: Option<TypeRef>,
     pub repr_is_str: bool,
     pub methods: Vec<(Symbol, Rc<Proto>)>,
     pub annotations: Annotations,
-    /// Annotations de chaque variante.
+    /// Annotations of each variant.
     pub variant_annotations: Vec<Annotations>,
 }
 
-/// Résolution d'un nom dans un bloc `do` hors construction (ou absent du type construit).
+/// Resolution of a name in a `do` block outside a construction (or missing from the built type).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fallback {
     None,
@@ -277,20 +277,20 @@ pub enum Fallback {
 
 #[derive(Clone, Debug)]
 pub enum Instr {
-    // ── Constantes
+    // ── Constants
     Int(Reg, i64),
     Float(Reg, f64),
     Bool(Reg, bool),
     Nil(Reg),
     Const(Reg, u32),
     Move(Reg, Reg),
-    /// Erreur à l'exécution (message dans les constantes).
+    /// Runtime error (message in the constants).
     Fail(u32),
 
     // ── Variables
     GetGlobal(Reg, u32),
     SetGlobal(u32, Reg),
-    /// Définit une globale (`let` ou `def` au niveau principal).
+    /// Defines a global (`let` or `def` at the top level).
     DefGlobal {
         slot: u32,
         src: Reg,
@@ -301,7 +301,7 @@ pub enum Instr {
     SetCell(u32, Reg),
     GetUp(Reg, u32),
     SetUp(u32, Reg),
-    /// Nom dans un bloc `do` : champ du type en construction, sinon `fallback`.
+    /// Name in a `do` block: field of the type under construction, otherwise `fallback`.
     GetNamed {
         dst: Reg,
         name: Symbol,
@@ -313,38 +313,38 @@ pub enum Instr {
         fallback: Fallback,
         shape: Option<u32>,
     },
-    /// Autre champ du type en construction (valeur par défaut d'un champ).
+    /// Another field of the type under construction (a field's default value).
     CtxField(Reg, u32),
-    /// Valeur dynamique vers registre typé, avec vérification (`int` → `float` converti).
+    /// Dynamic value into a typed register, checked (`int` → `float` converted).
     Guard(Reg, Reg, RegTy),
-    /// Vérification d'une annotation (et conversion des records littéraux).
+    /// Check of an annotation (and conversion of literal records).
     Coerce {
         dst: Reg,
         src: Reg,
         ty: u32,
         shape: Option<u32>,
     },
-    /// Paramètre non fourni (sa valeur par défaut doit être calculée) ?
+    /// Parameter not provided (its default value must be computed)?
     IsUndef(Reg, Reg),
 
-    // ── Arithmétique typée (registres `int` / `float`)
+    // ── Typed arithmetic (`int` / `float` registers)
     IBin(BinOp, Reg, Reg, Reg),
-    /// Opération entière avec une constante : `i + 1`, `i < 1000`.
+    /// Integer operation with a constant: `i + 1`, `i < 1000`.
     IBinK(BinOp, Reg, Reg, i64),
     FBin(BinOp, Reg, Reg, Reg),
     INeg(Reg, Reg),
     FNeg(Reg, Reg),
     IToF(Reg, Reg),
 
-    // ── Opérations génériques
+    // ── Generic operations
     Bin(BinOp, Reg, Reg, Reg),
     Neg(Reg, Reg),
     Not(Reg, Reg),
 
-    // ── Valeurs composées (éléments dans des registres consécutifs)
+    // ── Compound values (elements in consecutive registers)
     List(Reg, Reg, u32),
     Tuple(Reg, Reg, u32),
-    /// Paires clé, valeur.
+    /// Key, value pairs.
     Hash(Reg, Reg, u32),
     Record(Reg, Reg, u32),
     Range {
@@ -353,13 +353,13 @@ pub enum Instr {
         hi: Reg,
         inclusive: bool,
     },
-    /// Interpolation : textes des registres concaténés.
+    /// Interpolation: texts of the registers, concatenated.
     Concat(Reg, Reg, u32),
     Index(Reg, Reg, Reg),
     SetIndex(Reg, Reg, Reg),
     Field(Reg, Reg, Symbol),
-    /// Champ dont le vérificateur connaît le type (`int` / `float` / `bool`), vers un
-    /// registre de ce type.
+    /// Field whose type the checker knows (`int` / `float` / `bool`), into a
+    /// register of that type.
     FieldAs(Reg, Reg, Symbol, RegTy),
     SetField {
         obj: Reg,
@@ -367,7 +367,7 @@ pub enum Instr {
         src: Reg,
         shape: Option<u32>,
     },
-    /// Champ d'objet par index (`@x` dans une méthode).
+    /// Object field by index (`@x` in a method).
     FieldAt(Reg, Reg, u32),
     SetFieldAt {
         obj: Reg,
@@ -376,10 +376,10 @@ pub enum Instr {
         shape: Option<u32>,
     },
     TupleIndex(Reg, Reg, u32),
-    /// `Enum::Variante`
+    /// `Enum::Variant`
     Variant(Reg, Reg, Symbol),
-    /// Déstructuration : `n` valeurs d'un tuple / d'une liste vers `dst..dst+n`
-    /// (`rest` : le reste dans `dst + n`).
+    /// Destructuring: `n` values of a tuple / list into `dst..dst+n`
+    /// (`rest`: the remainder in `dst + n`).
     Unpack {
         dst: Reg,
         src: Reg,
@@ -387,7 +387,7 @@ pub enum Instr {
         rest: bool,
     },
 
-    // ── Appels
+    // ── Calls
     Closure(Reg, u32),
     Call {
         dst: Reg,
@@ -401,22 +401,22 @@ pub enum Instr {
         site: u32,
     },
 
-    // ── Boucles et `case`
-    /// Itérateur sur une liste, un intervalle, un hash (`keys` : clés seules)…
+    // ── Loops and `case`
+    /// Iterator over a list, a range, a hash (`keys`: keys only)…
     IterNew {
         dst: Reg,
         src: Reg,
         keys: bool,
     },
-    /// Le motif d'un `when` correspond-il au sujet ?
+    /// Does a `when` pattern match the subject?
     CaseTest(Reg, Reg, Reg),
 
-    // ── Déclarations (programme principal)
+    // ── Declarations (main program)
     DefType {
         slot: u32,
         decl: u32,
     },
-    /// Valeurs explicites des variantes dans `start..`.
+    /// Explicit variant values in `start..`.
     DefEnum {
         slot: u32,
         decl: u32,
@@ -427,13 +427,13 @@ pub enum Instr {
 #[derive(Clone, Debug)]
 pub enum Term {
     Jump(BlockId),
-    /// Selon la vérité de `cond` (`nil` et `false` sont faux).
+    /// On the truthiness of `cond` (`nil` and `false` are false).
     Branch {
         cond: Reg,
         then: BlockId,
         else_: BlockId,
     },
-    /// Comparaison entière et branchement en une fois (`si i < n`).
+    /// Integer comparison and branch in one step (`if i < n`).
     IfInt {
         op: BinOp,
         a: Reg,
@@ -441,7 +441,7 @@ pub enum Term {
         then: BlockId,
         else_: BlockId,
     },
-    /// Idem avec une constante (`si i < 1000`).
+    /// Same with a constant (`if i < 1000`).
     IfIntK {
         op: BinOp,
         a: Reg,
@@ -453,7 +453,7 @@ pub enum Term {
         reg: Reg,
         shape: Option<u32>,
     },
-    /// Élément suivant dans `dst`, puis `body` ; `done` quand l'itérateur est épuisé.
+    /// Next element into `dst`, then `body`; `done` when the iterator is exhausted.
     IterNext {
         iter: Reg,
         dst: Reg,
@@ -462,10 +462,10 @@ pub enum Term {
     },
 }
 
-// ─── Affichage ──────────────────────────────────────────────────────────────
+// ─── Display ────────────────────────────────────────────────────────────────
 
 impl Proto {
-    /// Texte lisible de l'IR (et de ses fonctions imbriquées).
+    /// Readable text of the IR (and of its nested functions).
     pub fn dump(&self, i: &Interner) -> String {
         let mut out = String::new();
         self.dump_into(&mut out, i);
@@ -496,7 +496,7 @@ impl Proto {
             .map(|(n, t)| format!("r{n}:{}", ty_name(*t)))
             .collect();
         if !typed.is_empty() {
-            let _ = writeln!(out, "  registres typés : {}", typed.join(" "));
+            let _ = writeln!(out, "  typed registers: {}", typed.join(" "));
         }
         for (n, b) in self.blocks.iter().enumerate() {
             let _ = writeln!(out, "  b{n}:");
@@ -539,16 +539,16 @@ impl Proto {
             Nil(d) => format!("r{d} = nil"),
             Const(d, c) => format!("r{d} = {}", self.consts[*c as usize].inspect(i)),
             Move(d, a) => format!("r{d} = r{a}"),
-            Fail(c) => format!("échec {}", self.consts[*c as usize].inspect(i)),
+            Fail(c) => format!("fail {}", self.consts[*c as usize].inspect(i)),
             GetGlobal(d, g) => format!("r{d} = global[{g}]"),
             SetGlobal(g, a) => format!("global[{g}] = r{a}"),
             DefGlobal { slot, src, mutable } => {
                 format!(
-                    "définit global[{slot}] = r{src}{}",
-                    if *mutable { "" } else { " (constante)" }
+                    "define global[{slot}] = r{src}{}",
+                    if *mutable { "" } else { " (constant)" }
                 )
             }
-            NewCell(c) => format!("nouvelle cellule c{c}"),
+            NewCell(c) => format!("new cell c{c}"),
             GetCell(d, c) => format!("r{d} = c{c}"),
             SetCell(c, a) => format!("c{c} = r{a}"),
             GetUp(d, u) => format!("r{d} = up{u}"),
@@ -557,22 +557,22 @@ impl Proto {
                 dst,
                 name,
                 fallback,
-            } => format!("r{dst} = nommé {} sinon {fallback:?}", s(name)),
+            } => format!("r{dst} = named {} else {fallback:?}", s(name)),
             SetNamed {
                 name,
                 src,
                 fallback,
                 ..
-            } => format!("nommé {} = r{src} sinon {fallback:?}", s(name)),
-            CtxField(d, f) => format!("r{d} = champ en construction #{f}"),
-            Guard(d, a, t) => format!("r{d} = garde {} r{a}", ty_name(*t)),
+            } => format!("named {} = r{src} else {fallback:?}", s(name)),
+            CtxField(d, f) => format!("r{d} = field under construction #{f}"),
+            Guard(d, a, t) => format!("r{d} = guard {} r{a}", ty_name(*t)),
             Coerce { dst, src, ty, .. } => {
                 format!(
-                    "r{dst} = vérifie r{src} : {}",
+                    "r{dst} = check r{src}: {}",
                     self.types[*ty as usize].shown
                 )
             }
-            IsUndef(d, a) => format!("r{d} = non fourni r{a}"),
+            IsUndef(d, a) => format!("r{d} = not provided r{a}"),
             IBin(op, d, a, b) => format!("r{d} = r{a} {}i r{b}", op.as_str()),
             IBinK(op, d, a, k) => format!("r{d} = r{a} {}i {k}", op.as_str()),
             FBin(op, d, a, b) => format!("r{d} = r{a} {}f r{b}", op.as_str()),
@@ -582,7 +582,7 @@ impl Proto {
             Bin(op, d, a, b) => format!("r{d} = r{a} {} r{b}", op.as_str()),
             Neg(d, a) => format!("r{d} = - r{a}"),
             Not(d, a) => format!("r{d} = not r{a}"),
-            List(d, a, n) => format!("r{d} = liste r{a}..+{n}"),
+            List(d, a, n) => format!("r{d} = list r{a}..+{n}"),
             Tuple(d, a, n) => format!("r{d} = tuple r{a}..+{n}"),
             Hash(d, a, n) => format!("r{d} = hash r{a}..+{}", n * 2),
             Record(d, a, r) => {
@@ -612,12 +612,12 @@ impl Proto {
             Variant(d, a, v) => format!("r{d} = r{a}::{}", s(v)),
             Unpack { dst, src, n, rest } => {
                 format!(
-                    "r{dst}..+{n} = déstructure r{src}{}",
-                    if *rest { " (+ reste)" } else { "" }
+                    "r{dst}..+{n} = destructure r{src}{}",
+                    if *rest { " (+ rest)" } else { "" }
                 )
             }
             Closure(d, p) => format!("r{d} = closure {}", self.children[*p as usize].name),
-            Call { dst, f, site } => format!("r{dst} = appel r{f}({})", self.show_args(*site, i)),
+            Call { dst, f, site } => format!("r{dst} = call r{f}({})", self.show_args(*site, i)),
             CallMethod {
                 dst,
                 recv,
@@ -628,14 +628,14 @@ impl Proto {
             }
             IterNew { dst, src, keys } => {
                 format!(
-                    "r{dst} = itérateur r{src}{}",
-                    if *keys { " (clés)" } else { "" }
+                    "r{dst} = iterator r{src}{}",
+                    if *keys { " (keys)" } else { "" }
                 )
             }
-            CaseTest(d, p, v) => format!("r{d} = motif r{p} ~ r{v}"),
-            DefType { slot, decl } => format!("définit type #{decl} dans global[{slot}]"),
+            CaseTest(d, p, v) => format!("r{d} = pattern r{p} ~ r{v}"),
+            DefType { slot, decl } => format!("define type #{decl} in global[{slot}]"),
             DefEnum { slot, decl, start } => {
-                format!("définit enum #{decl} dans global[{slot}] (valeurs r{start}..)")
+                format!("define enum #{decl} in global[{slot}] (values r{start}..)")
             }
         }
     }
@@ -653,7 +653,7 @@ impl Proto {
         if c.block
             && let Some(last) = parts.get_mut(c.npos as usize - 1)
         {
-            last.push_str(" (bloc)");
+            last.push_str(" (block)");
         }
         parts.join(", ")
     }
@@ -661,7 +661,7 @@ impl Proto {
 
 fn ty_name(t: RegTy) -> &'static str {
     match t {
-        RegTy::Value => "valeur",
+        RegTy::Value => "value",
         RegTy::Int => "int",
         RegTy::Float => "float",
         RegTy::Bool => "bool",
@@ -670,8 +670,8 @@ fn ty_name(t: RegTy) -> &'static str {
 
 fn show_term(t: &Term) -> String {
     match t {
-        Term::Jump(b) => format!("saut b{b}"),
-        Term::Branch { cond, then, else_ } => format!("si r{cond} alors b{then} sinon b{else_}"),
+        Term::Jump(b) => format!("jump b{b}"),
+        Term::Branch { cond, then, else_ } => format!("if r{cond} then b{then} else b{else_}"),
         Term::IfInt {
             op,
             a,
@@ -679,7 +679,7 @@ fn show_term(t: &Term) -> String {
             then,
             else_,
         } => {
-            format!("si r{a} {}i r{b} alors b{then} sinon b{else_}", op.as_str())
+            format!("if r{a} {}i r{b} then b{then} else b{else_}", op.as_str())
         }
         Term::IfIntK {
             op,
@@ -688,22 +688,22 @@ fn show_term(t: &Term) -> String {
             then,
             else_,
         } => {
-            format!("si r{a} {}i {k} alors b{then} sinon b{else_}", op.as_str())
+            format!("if r{a} {}i {k} then b{then} else b{else_}", op.as_str())
         }
-        Term::Return { reg, .. } => format!("retour r{reg}"),
+        Term::Return { reg, .. } => format!("return r{reg}"),
         Term::IterNext {
             iter,
             dst,
             body,
             done,
         } => {
-            format!("r{dst} = suivant r{iter} puis b{body}, fin b{done}")
+            format!("r{dst} = next r{iter} then b{body}, done b{done}")
         }
     }
 }
 
 impl Term {
-    /// Blocs successeurs (cibles des sauts).
+    /// Successor blocks (jump targets).
     pub fn targets_mut(&mut self) -> Vec<&mut BlockId> {
         match self {
             Term::Jump(b) => vec![b],

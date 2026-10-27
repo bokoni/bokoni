@@ -1,8 +1,8 @@
-//! Vérification statique : erreurs signalées avant l'exécution, et absence de faux positifs.
+//! Static checking: errors reported before execution, and no false positives.
 
 use bokoni::Engine;
 
-/// Messages des erreurs statiques (le programme n'est pas exécuté s'il y en a).
+/// Static error messages (the program is not run if there are any).
 fn errors(src: &str) -> Vec<String> {
     let mut e = Engine::new();
     e.set_output(|_| {});
@@ -12,12 +12,12 @@ fn errors(src: &str) -> Vec<String> {
     }
 }
 
-/// Le programme passe la vérification ET s'exécute sans erreur.
+/// The program passes the checks AND runs without error.
 fn ok(src: &str) {
     let mut e = Engine::new();
     e.set_output(|_| {});
     if let Err(errs) = e.eval(src) {
-        panic!("faux positif ?\n{}", errs.render(src, "test"));
+        panic!("false positive?\n{}", errs.render(src, "test"));
     }
 }
 
@@ -28,118 +28,118 @@ fn has(errs: &[String], needle: &str) -> bool {
 #[test]
 fn reports_all_errors_before_running() {
     let errs = errors(
-        r#"print("ne doit pas s'afficher")
+        r#"print("must not be printed")
 let x = 1
 x = "a"
 y = 2
-let n: int = "trois"
+let n: int = "three"
 def add(a: int, b: int): int = a + b
 add(1)
 add(1, "2")
 "abc".lenght()
 let l = [1, 2]
 l.push("a")
-print(inconnu)
+print(unknown)
 "#,
     );
     assert_eq!(errs.len(), 8, "{errs:#?}");
-    assert!(has(&errs, "type attendu `int`, reçu `str`")); // x = "a"
-    assert!(has(&errs, "`y` n'est pas déclaré"));
-    assert!(has(&errs, "argument `b` manquant"));
-    assert!(has(&errs, "type attendu `int` pour `b`, reçu `str`"));
+    assert!(has(&errs, "expected type `int`, got `str`")); // x = "a"
+    assert!(has(&errs, "`y` is not declared"));
+    assert!(has(&errs, "missing argument `b`"));
+    assert!(has(&errs, "expected type `int` for `b`, got `str`"));
     assert!(has(
         &errs,
-        "`str` n'a pas de méthode `lenght` (voulez-vous dire `len` ?)"
+        "`str` has no method `lenght` (did you mean `len`?)"
     ));
-    assert!(has(&errs, "type attendu `int`, reçu `str`"));
-    assert!(has(&errs, "`inconnu` n'est pas défini"));
+    assert!(has(&errs, "expected type `int`, got `str`"));
+    assert!(has(&errs, "`unknown` is not defined"));
 }
 
 #[test]
 fn names() {
     assert!(has(
         &errors("let total = 1\nprint(totla)"),
-        "(voulez-vous dire `total` ?)"
+        "(did you mean `total`?)"
     ));
     assert!(has(
         &errors("print(x)\nlet x = 1"),
-        "`x` est utilisé avant sa déclaration"
+        "`x` is used before its declaration"
     ));
-    assert!(has(&errors("MAX = 1\nMAX = 2"), "ne peut pas être modifié"));
-    assert!(has(&errors("def f = 1\nf = 2"), "ne peut pas être modifié"));
-    assert!(has(&errors("break"), "`break` en dehors d'une boucle"));
-    assert!(has(&errors("@x"), "que dans une méthode"));
-    assert!(has(&errors("let s: Serveur = 1"), "type `Serveur` inconnu"));
+    assert!(has(&errors("MAX = 1\nMAX = 2"), "cannot be modified"));
+    assert!(has(&errors("def f = 1\nf = 2"), "cannot be modified"));
+    assert!(has(&errors("break"), "`break` outside of a loop"));
+    assert!(has(&errors("@x"), "only be used inside a method"));
+    assert!(has(&errors("let s: Servr = 1"), "unknown type `Servr`"));
     assert!(has(
         &errors("let s: strr = 1"),
-        "(voulez-vous dire `str` ?)"
+        "(did you mean `str`?)"
     ));
-    // Une fonction peut utiliser une variable déclarée plus loin (appelée après).
+    // A function may use a variable declared further down (called afterwards).
     ok("def show() = config + 1\nlet config = 1\nshow()");
-    // Portée de bloc.
+    // Block scope.
     assert!(has(
         &errors("if true\n  let z = 1\nend\nprint(z)"),
-        "`z` n'est pas défini"
+        "`z` is not defined"
     ));
 }
 
 #[test]
 fn inference() {
-    // Type de la variable : celui de sa première valeur.
+    // A variable's type is that of its first value.
     assert!(has(
         &errors("let x = 1\nx = 2.5"),
-        "type attendu `int`, reçu `float`"
+        "expected type `int`, got `float`"
     ));
-    ok("let x = 1.5\nx = 2"); // int → float accepté
-    ok("let x = nil\nx = 1\nx = \"a\""); // nil seul : type inconnu
+    ok("let x = 1.5\nx = 2"); // int → float accepted
+    ok("let x = nil\nx = 1\nx = \"a\""); // nil alone: unknown type
     ok("let xs = []\nxs << 1\nxs << \"a\"");
     assert!(has(
         &errors("let xs = [1, 2]\nxs << \"a\""),
-        "`<<` ajoute `str` à une liste de `int`"
+        "`<<` appends `str` to a list of `int`"
     ));
-    // Retour déduit du corps.
+    // Return type inferred from the body.
     assert!(has(
         &errors("def five = 5\nfive() + \"a\""),
-        "`+` entre `int` et `str`"
+        "`+` between `int` and `str`"
     ));
-    // Paramètres des lambdas déduits des éléments.
+    // Lambda parameters inferred from the elements.
     assert!(has(
         &errors("[1, 2].map(|n| n.upper())"),
-        "`int` n'a pas de méthode `upper`"
+        "`int` has no method `upper`"
     ));
     assert!(has(
         &errors("[\"a\"].map(|s| s.len()).map(|n| n.upper())"),
-        "`int` n'a pas de méthode `upper`"
+        "`int` has no method `upper`"
     ));
     assert!(has(
         &errors("{\"a\" => 1}.each do |k, v|\n  v.upper()\nend"),
-        "`int` n'a pas de méthode `upper`"
+        "`int` has no method `upper`"
     ));
     assert!(has(
         &errors("for i in 0..3\n  i.upper()\nend"),
-        "`int` n'a pas de méthode `upper`"
+        "`int` has no method `upper`"
     ));
 }
 
 #[test]
 fn gradual_typing_has_no_false_positives() {
-    // Paramètres non annotés : `any`, tout est permis.
+    // Unannotated parameters: `any`, anything goes.
     ok("def f(x) = x.whatever_method()\nlet g = |a| a.b.c");
-    // Une valeur qui *peut* convenir n'est pas refusée (vérifiée à l'exécution).
+    // A value that *may* fit is not rejected (checked at runtime).
     ok("let m: \"dev\" | \"prod\" = \"dev\"\nlet s = \"prod\"\nm = s");
     ok("let h = {\"a\" => 1}\nlet v = h[\"a\"]\nlet n: int = v");
     ok("let xs = [1, \"a\"]\nlet first: int = xs[0]");
     ok("let x: int | str = 1\nx = \"a\"");
-    // Fonctions Rust : type inconnu.
+    // Rust functions: unknown type.
     let mut e = Engine::new();
     e.register_fn("ext", |x: i64| x);
-    e.eval("let r = ext(1)\nr.anything").unwrap_err(); // erreur… à l'exécution seulement
+    e.eval("let r = ext(1)\nr.anything").unwrap_err(); // error… at runtime only
     assert!(
         e.eval("let r: str = ext(1)").unwrap_err()[0]
             .message
-            .contains("type attendu `str`")
+            .contains("expected type `str`")
     );
-    // `case` sur une constante.
+    // `case` on a constant.
     ok("let k = case 8080\n  when 80 then 1\n  else 2\nend");
 }
 
@@ -147,36 +147,36 @@ fn gradual_typing_has_no_false_positives() {
 fn types_and_classes() {
     let route = "type Route\n  path: str\n  methods: [str] = [\"GET\"]\nend\n";
     let e = |src: &str| errors(&format!("{route}{src}"));
-    assert!(has(&e("Route()"), "champ `path` obligatoire"));
+    assert!(has(&e("Route()"), "field `path` is required"));
     assert!(has(
         &e("Route(path: \"/\", verb: 1)"),
-        "`Route` n'a pas de champ `verb`"
+        "`Route` has no field `verb`"
     ));
     assert!(has(
         &e("Route(path: 1)"),
-        "type attendu `str` pour le champ `path`"
+        "expected type `str` for field `path`"
     ));
     assert!(has(
         &e("Route do\n  pth = \"/\"\nend"),
-        "(voulez-vous dire `path` ?)"
+        "(did you mean `path`?)"
     ));
     assert!(has(
         &e("Route(path: \"/\").pth"),
-        "(voulez-vous dire `path` ?)"
+        "(did you mean `path`?)"
     ));
     assert!(has(
         &e("def reg(r: Route) = r\nreg({path: \"/\", verb: 1})"),
-        "`Route` n'a pas de champ `verb`"
+        "`Route` has no field `verb`"
     ));
     assert!(has(
         &e("def reg(r: Route) = r\nreg({methods: []})"),
-        "champ `path` obligatoire"
+        "field `path` is required"
     ));
     assert!(has(
         &e("let rs: [Route] = [{path: 1}]"),
-        "type attendu `str` pour le champ `path`"
+        "expected type `str` for field `path`"
     ));
-    // Un `bloc` peut remplir les champs obligatoires : pas d'erreur statique.
+    // A block may fill in the required fields: no static error.
     ok(&format!(
         "{route}let r = Route do\n  path = \"/\"\nend\nr.methods.len()"
     ));
@@ -186,22 +186,22 @@ fn types_and_classes() {
 
     let user = "class User\n  def init(@name: str)\n  end\n  def name: str = @name\n  def rename(n: str) = @name = n\nend\n";
     let e = |src: &str| errors(&format!("{user}{src}"));
-    assert!(has(&e("User(1)"), "type attendu `str` pour `name`"));
+    assert!(has(&e("User(1)"), "expected type `str` for `name`"));
     assert!(has(
         &e("User(\"a\").rename(1)"),
-        "type attendu `str` pour `n`"
+        "expected type `str` for `n`"
     ));
     assert!(has(
         &e("User(\"a\").name.len() + \"x\""),
-        "`+` entre `int` et `str`"
+        "`+` between `int` and `str`"
     ));
     assert!(has(
         &errors("class C\n  def init(@n: int)\n  end\n  def get = @m\nend"),
-        "`C` n'a pas de champ `@m`"
+        "`C` has no field `@m`"
     ));
     assert!(has(
         &errors("class C\n  def init(@n: int)\n  end\nend\nC(1).n"),
-        "champ privé"
+        "private field"
     ));
     ok(&format!(
         "{user}let u = User(\"a\")\nu.rename(\"b\")\nu.name.upper()"
@@ -212,18 +212,18 @@ fn types_and_classes() {
 fn enums() {
     let en = "enum Protocol: str\n  Tcp = \"TCP\"\n  Udp = \"UDP\"\nend\n";
     let e = |src: &str| errors(&format!("{en}{src}"));
-    assert!(has(&e("Protocol::Tpc"), "(voulez-vous dire `Tcp` ?)"));
+    assert!(has(&e("Protocol::Tpc"), "(did you mean `Tcp`?)"));
     assert!(has(
         &e("Protocol::Tcp.value + 1"),
-        "`+` entre `str` et `int`"
+        "`+` between `str` and `int`"
     ));
     assert!(has(
         &e("let p: Protocol = \"TCP\""),
-        "type attendu `Protocol`, reçu `str`"
+        "expected type `Protocol`, got `str`"
     ));
     assert!(has(
         &errors("enum E: int\n  A = \"a\"\nend"),
-        "type attendu `int` pour la variante `A`"
+        "expected type `int` for variant `A`"
     ));
     ok(&format!(
         "{en}let p = Protocol.from(\"TCP\")\nProtocol.values().len()"
@@ -233,14 +233,14 @@ fn enums() {
 #[test]
 fn annotations() {
     assert!(has(
-        &errors("@[Inconnue]\ndef f = 1"),
-        "annotation `Inconnue` inconnue"
+        &errors("@[Unknown]\ndef f = 1"),
+        "unknown annotation `Unknown`"
     ));
     assert!(has(
         &errors("annotation Validate\n  min: int? = nil\nend\n@[Validate(min: \"a\")]\ndef f = 1"),
-        "type attendu `int?` pour le champ `min`"
+        "expected type `int?` for field `min`"
     ));
-    ok("annotation Tag\nend\n@[Tag]\n@[Deprecated(\"utiliser g\")]\ndef f = 1");
+    ok("annotation Tag\nend\n@[Tag]\n@[Deprecated(\"use g\")]\ndef f = 1");
 }
 
 #[test]
@@ -249,16 +249,16 @@ fn checks_use_earlier_definitions() {
     e.set_output(|_| {});
     e.eval("type Server\n  port: int = 80\nend\ndef double(x: int): int = x * 2")
         .unwrap();
-    // Le type et la fonction définis avant sont connus du vérificateur.
+    // The type and function defined earlier are known to the checker.
     let errs = e.eval("Server do\n  prot = 1\nend").unwrap_err();
     assert!(
-        errs[0].message.contains("(voulez-vous dire `port` ?)"),
+        errs[0].message.contains("(did you mean `port`?)"),
         "{errs}"
     );
     assert!(
         e.eval("double(\"a\")").unwrap_err()[0]
             .message
-            .contains("type attendu `int`")
+            .contains("expected type `int`")
     );
     assert_eq!(
         e.eval_as::<i64>("Server do\n  port = 1\nend.port").unwrap(),
@@ -271,16 +271,16 @@ fn static_checks_can_be_disabled() {
     let mut e = Engine::new();
     e.set_output(|_| {});
     e.set_static_checks(false);
-    // Sans vérification statique, l'erreur arrive à l'exécution (après le print).
+    // Without static checks, the error happens at runtime (after the print).
     let out = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
     let sink = out.clone();
     e.set_output(move |s| sink.borrow_mut().push_str(s));
-    let errs = e.eval("print(\"avant\")\nlet x: int = \"a\"").unwrap_err();
+    let errs = e.eval("print(\"before\")\nlet x: int = \"a\"").unwrap_err();
     assert_eq!(errs.len(), 1);
-    assert_eq!(out.borrow().as_str(), "avant\n");
+    assert_eq!(out.borrow().as_str(), "before\n");
 }
 
-/// Programmes corrects et variés : aucune erreur (statique ni à l'exécution).
+/// Varied correct programs: no error (neither static nor at runtime).
 #[test]
 fn valid_programs_pass() {
     ok(r##"
@@ -344,7 +344,7 @@ let evens = [1, 2, 3, 4].filter(|n| n % 2 == 0).map(|n| n * n)
 let ages = {"alice" => 30}
 ages["bob"] = 25
 for name, age in ages
-  print("#{name.capitalize()} a #{age} ans")
+  print("#{name.capitalize()} is #{age}")
 end
 let {x, y} = {x: 3, y: 4}
 let d = (x * x + y * y).sqrt()
@@ -356,7 +356,7 @@ end
 let kind = case 8080
   when 80, 443 then "web"
   when 8000..8999 then "dev"
-  else "autre"
+  else "other"
 end
 def counter()
   let n = 0

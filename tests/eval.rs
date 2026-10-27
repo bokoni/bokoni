@@ -2,7 +2,7 @@ use bokoni::{Engine, ErrorKind, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Exécute `src` ; renvoie la sortie de `print` suivie du résultat (`=> …`) s'il n'est pas nil.
+/// Runs `src`; returns the `print` output followed by the result (`=> …`) unless it is nil.
 fn run(src: &str) -> String {
     let mut e = Engine::new();
     let out = Rc::new(RefCell::new(String::new()));
@@ -24,8 +24,8 @@ fn err(src: &str) -> (ErrorKind, String) {
     let mut e = Engine::new();
     e.set_output(|_| {});
     match e.eval(src) {
-        Ok(v) => panic!("devrait échouer, a donné {}", e.inspect(&v)),
-        // Le type de la première erreur ; les messages de toutes.
+        Ok(v) => panic!("should fail, gave {}", e.inspect(&v)),
+        // The kind of the first error; the messages of all.
         Err(err) => (err[0].kind, err.to_string()),
     }
 }
@@ -44,10 +44,10 @@ fn arithmetic() {
     assert_eq!(run("1 == 1.0"), "=> true");
     assert_eq!(run("\"a\" < \"b\""), "=> true");
     assert_eq!(run("not nil"), "=> true");
-    assert_eq!(run("nil or \"défaut\""), "=> \"défaut\"");
+    assert_eq!(run("nil or \"default\""), "=> \"default\"");
     assert_eq!(run("1 and 2"), "=> 2");
-    assert!(err("1 / 0").1.contains("division par zéro"));
-    assert!(err("9223372036854775807 + 1").1.contains("dépassement"));
+    assert!(err("1 / 0").1.contains("division by zero"));
+    assert!(err("9223372036854775807 + 1").1.contains("overflow"));
     assert_eq!(err("1 < \"a\"").0, ErrorKind::Type);
 }
 
@@ -55,29 +55,29 @@ fn arithmetic() {
 fn variables_and_constants() {
     assert_eq!(run("let x = 1\nx = x + 1\nx += 10\nx"), "=> 12");
     assert_eq!(run("MAX = 10\nMAX * 2"), "=> 20");
-    assert!(err("x = 1").1.contains("utiliser `let x = …`"));
+    assert!(err("x = 1").1.contains("use `let x = …`"));
     assert!(
         err("MAX = 1\nMAX = 2")
             .1
-            .contains("ne peut pas être modifié")
+            .contains("cannot be modified")
     );
-    assert!(err("y").1.contains("`y` n'est pas défini"));
-    // Portée de bloc : un `let` dans un `if` ne fuit pas.
+    assert!(err("y").1.contains("`y` is not defined"));
+    // Block scope: a `let` inside an `if` does not leak.
     assert!(
         err("if true\n  let z = 1\nend\nz")
             .1
-            .contains("`z` n'est pas défini")
+            .contains("`z` is not defined")
     );
-    // Mais on peut modifier une variable extérieure.
+    // But an outer variable can be modified.
     assert_eq!(run("let n = 0\nif true\n  n = 5\nend\nn"), "=> 5");
 }
 
 #[test]
 fn strings() {
     assert_eq!(
-        run(r##"let n = "monde"
-"Bonjour #{n.upper()} (#{1 + 1})""##),
-        "=> \"Bonjour MONDE (2)\""
+        run(r##"let n = "world"
+"Hello #{n.upper()} (#{1 + 1})""##),
+        "=> \"Hello WORLD (2)\""
     );
     assert_eq!(run(r#""a,b,c".split(",")"#), r#"=> ["a", "b", "c"]"#);
     assert_eq!(run(r#""  x ".trim().len()"#), "=> 1");
@@ -95,7 +95,7 @@ fn functions() {
         "=> 11"
     );
     assert_eq!(run("def add(a, b) = a - b\nadd(b: 1, a: 10)"), "=> 9");
-    // Appel avant définition et récursion mutuelle.
+    // Call before definition and mutual recursion.
     assert_eq!(
         run(
             "def even(n) = if n == 0 then true else odd(n - 1) end\ndef odd(n) = if n == 0 then false else even(n - 1) end\neven(10)"
@@ -109,22 +109,22 @@ fn functions() {
     assert!(
         err("def f(a) = a\nf(1, 2)")
             .1
-            .contains("attend 1 argument, reçu 2")
+            .contains("expects 1 argument, got 2")
     );
     assert!(
         err("def f(a, b) = a\nf(1)")
             .1
-            .contains("argument `b` manquant")
+            .contains("missing argument `b`")
     );
     assert!(
         err("def f(a) = a\nf(z: 1)")
             .1
-            .contains("pas de paramètre `z`")
+            .contains("has no parameter `z`")
     );
     assert!(
         err("def f = 1\nf = 2")
             .1
-            .contains("ne peut pas être modifié")
+            .contains("cannot be modified")
     );
 }
 
@@ -139,7 +139,7 @@ fn closures() {
         run("let k = 10\nlet f = |x| x * k\n[1, 2].map(f)"),
         "=> [10, 20]"
     );
-    // Les lambdas sont tolérants : argument manquant = nil.
+    // Lambdas are lenient: a missing argument is nil.
     assert_eq!(run("let f = |a, b| b\nf(1)"), "");
     assert_eq!(run("let f = |x| x + 1\nf.call(1)"), "=> 2");
 }
@@ -181,24 +181,24 @@ fn control_flow() {
     assert_eq!(run("let s = 0\nfor i in 0...3\n  s += i\nend\ns"), "=> 3");
     assert_eq!(
         run(
-            "def k(p) = case p\n  when 80, 443 then \"web\"\n  when 8000..8999 then \"dev\"\n  else \"autre\"\nend\n[k(443), k(8080), k(1)]"
+            "def k(p) = case p\n  when 80, 443 then \"web\"\n  when 8000..8999 then \"dev\"\n  else \"other\"\nend\n[k(443), k(8080), k(1)]"
         ),
-        "=> [\"web\", \"dev\", \"autre\"]"
+        "=> [\"web\", \"dev\", \"other\"]"
     );
-    assert!(err("break").1.contains("`break` en dehors"));
-    assert!(err("for x in 5\nend").1.contains("ne peut pas parcourir"));
+    assert!(err("break").1.contains("`break` outside"));
+    assert!(err("for x in 5\nend").1.contains("cannot iterate"));
 }
 
 #[test]
 fn collections() {
     assert_eq!(run("let l = [1, 2, 3]\nl[-1]"), "=> 3");
     assert_eq!(run("let l = [1, 2]\nl[0] = 9\nl << 3\nl"), "=> [9, 2, 3]");
-    assert!(err("[1][5]").1.contains("hors limites"));
+    assert!(err("[1][5]").1.contains("out of bounds"));
     assert_eq!(run("[3, 1, 2].sort()"), "=> [1, 2, 3]");
     assert_eq!(run("[\"b\", \"a\"].sort().join(\"-\")"), "=> \"a-b\"");
     assert_eq!(run("[2, 9, 4].max()"), "=> 9");
     assert_eq!(run("[1, 2].contains(2)"), "=> true");
-    // Les listes sont partagées (comme Ruby, Python…).
+    // Lists are shared (like Ruby, Python…).
     assert_eq!(run("let a = [1]\nlet b = a\nb << 2\na"), "=> [1, 2]");
 }
 
@@ -210,7 +210,7 @@ fn hashes() {
     );
     assert_eq!(run("let h = {\"a\" => 1}\nh[\"zz\"]"), "");
     assert_eq!(
-        run("let h = {1 => \"un\"}\n[h.has(1), h.get(2, \"?\"), h.keys()]"),
+        run("let h = {1 => \"one\"}\n[h.has(1), h.get(2, \"?\"), h.keys()]"),
         "=> [true, \"?\", [1]]"
     );
     assert_eq!(
@@ -223,7 +223,7 @@ fn hashes() {
         ),
         "=> \"x=1 y=2\""
     );
-    assert!(err("{[1] => 2}").1.contains("clé de hash"));
+    assert!(err("{[1] => 2}").1.contains("hash key"));
 }
 
 #[test]
@@ -232,16 +232,16 @@ fn records_and_tuples() {
     assert!(
         err("let p = {x: 1}\np.z = 3")
             .1
-            .contains("pas de champ `z`")
+            .contains("has no field `z`")
     );
     assert_eq!(run("let x = 10\n{x, y: 20}"), "=> {x: 10, y: 20}");
     assert_eq!(run("let p = {x: 3, y: 4}\nlet {x, y} = p\nx * y"), "=> 12");
-    assert_eq!(run("let t = (1, \"un\")\nt.1"), "=> \"un\"");
+    assert_eq!(run("let t = (1, \"one\")\nt.1"), "=> \"one\"");
     assert_eq!(run("let (a, b) = (1, 2)\na + b"), "=> 3");
     assert_eq!(run("let [h, ...rest] = [1, 2, 3]\nrest"), "=> [2, 3]");
-    // Un champ fonction s'appelle comme une méthode.
+    // A function field is called like a method.
     assert_eq!(run("let o = {double: |x| x * 2}\no.double(21)"), "=> 42");
-    assert!(err("[1].len").1.contains("écrire `.len()`"));
+    assert!(err("[1].len").1.contains("write `.len()`"));
 }
 
 #[test]
@@ -255,27 +255,27 @@ fn type_annotations() {
     assert_eq!(run("let t: (int, str) = (1, \"a\")\nt.0"), "=> 1");
     let (kind, msg) = err("let x: int = \"a\"");
     assert_eq!(kind, ErrorKind::Type);
-    assert!(msg.contains("type attendu `int`, reçu `str`"), "{msg}");
+    assert!(msg.contains("expected type `int`, got `str`"), "{msg}");
     assert!(
         err("let m: \"dev\" | \"prod\" = \"test\"")
             .1
-            .contains("type attendu")
+            .contains("expected type")
     );
     assert!(
         err("def f(n: int) = n\nf(\"a\")")
             .1
-            .contains("type attendu `int`")
+            .contains("expected type `int`")
     );
     assert!(
         err("def f(): str = 1\nf()")
             .1
-            .contains("type attendu `str`")
+            .contains("expected type `str`")
     );
-    assert!(err("let s: Server = 1").1.contains("type `Server` inconnu"));
+    assert!(err("let s: Server = 1").1.contains("unknown type `Server`"));
     assert!(
-        err("let s: Serveur = 1")
+        err("let s: Sever = 1")
             .1
-            .contains("type `Serveur` inconnu")
+            .contains("unknown type `Sever`")
     );
 }
 
@@ -293,7 +293,7 @@ fn types_and_construction() {
         r("let x = Route do\n  path = \"/b\"\nend\nx.path"),
         "=> \"/b\""
     );
-    // Champs publics modifiables, avec vérification du type.
+    // Public fields are writable, with a type check.
     assert_eq!(
         r("let x = Route(path: \"/\")\nx.path = \"/z\"\nx.path"),
         "=> \"/z\""
@@ -301,25 +301,25 @@ fn types_and_construction() {
     assert!(
         err(&format!("{ROUTE}let x = Route(path: \"/\")\nx.path = 1"))
             .1
-            .contains("type attendu `str`")
+            .contains("expected type `str`")
     );
-    // Égalité par valeur pour un `type`.
+    // Value equality for a `type`.
     assert_eq!(r("Route(path: \"/\") == Route(path: \"/\")"), "=> true");
     assert_eq!(r("typeof(Route(path: \"/\"))"), "=> \"Route\"");
     assert!(
         err(&format!("{ROUTE}Route()"))
             .1
-            .contains("champ `path` obligatoire")
+            .contains("field `path` is required")
     );
     assert!(
         err(&format!("{ROUTE}Route(path: \"/\", verb: 1)"))
             .1
-            .contains("pas de champ `verb`")
+            .contains("has no field `verb`")
     );
     assert!(
         err(&format!("{ROUTE}Route(path: 1)"))
             .1
-            .contains("type attendu `str`")
+            .contains("expected type `str`")
     );
 }
 
@@ -327,15 +327,15 @@ fn types_and_construction() {
 fn construction_blocks() {
     let server = "type Server\n  protocol = \"tcp\"\n  port: int = if protocol == \"tcp\" then 80 else 40 end\n  routes: [str] = []\nend\n";
     let r = |src: &str| run(&format!("{server}{src}"));
-    // Défaut calculé après le bloc, en fonction des champs fixés par le bloc.
+    // Default computed after the block, from the fields the block set.
     assert_eq!(r("Server do\n  protocol = \"udp\"\nend.port"), "=> 40");
     assert_eq!(r("Server().port"), "=> 80");
-    // Un champ lu dans le bloc reçoit d'abord sa valeur par défaut.
+    // A field read in the block first gets its default value.
     assert_eq!(
         r("let s = Server do\n  routes << \"/a\"\n  routes << \"/b\"\nend\ns.routes"),
         "=> [\"/a\", \"/b\"]"
     );
-    // Variables locales, variables extérieures, boucles.
+    // Local variables, outer variables, loops.
     assert_eq!(
         r("let base = 8000\nServer do\n  let off = 80\n  port = base + off\nend.port"),
         "=> 8080"
@@ -343,17 +343,17 @@ fn construction_blocks() {
     assert!(
         err(&format!("{server}Server do\n  prot = 1\nend"))
             .1
-            .contains("ni un champ de `Server`")
+            .contains("neither a field of `Server`")
     );
     assert!(
         err(&format!("{server}Server do\n  port = \"x\"\nend"))
             .1
-            .contains("type attendu `int`")
+            .contains("expected type `int`")
     );
     assert!(
         err("type A\n  x: int = y\n  y: int = x\nend\nA()")
             .1
-            .contains("circulaire")
+            .contains("circular")
     );
 }
 
@@ -377,36 +377,36 @@ fn record_literals_convert_to_types() {
         r("def mk(): Route = {path: \"/r\"}\nmk().path"),
         "=> \"/r\""
     );
-    // Seuls les littéraux sont convertis.
+    // Only literals are converted.
     assert!(
         err(&format!(
             "{ROUTE}def reg(r: Route) = r\nlet x = {{path: \"/\"}}\nreg(x)"
         ))
         .1
-        .contains("type attendu `Route` pour `r`, reçu `{path: str}`")
+        .contains("expected type `Route` for `r`, got `{path: str}`")
     );
     assert!(
         err(&format!(
             "{ROUTE}def reg(r: Route) = r\nreg({{path: \"/\", verb: 1}})"
         ))
         .1
-        .contains("pas de champ `verb`")
+        .contains("has no field `verb`")
     );
 }
 
 #[test]
 fn classes() {
-    let user = "class User\n  count = 0\n  def init(@name: str, @email: str? = nil)\n  end\n  def name: str = @name\n  def name=(v: str)\n    @name = v.capitalize()\n  end\n  def greet(other) = \"#{@name} salue #{other.name}\"\n  def bump()\n    @count += 1\n    self\n  end\n  def to_s: str = \"User(#{@name})\"\nend\n";
+    let user = "class User\n  count = 0\n  def init(@name: str, @email: str? = nil)\n  end\n  def name: str = @name\n  def name=(v: str)\n    @name = v.capitalize()\n  end\n  def greet(other) = \"#{@name} greets #{other.name}\"\n  def bump()\n    @count += 1\n    self\n  end\n  def to_s: str = \"User(#{@name})\"\nend\n";
     let r = |src: &str| run(&format!("{user}{src}"));
     assert_eq!(
         r("let u = User(\"ana\")\nu.name = \"bob\"\nu.name"),
         "=> \"Bob\""
     );
-    assert_eq!(r("User(\"a\").greet(User(\"b\"))"), "=> \"a salue b\"");
+    assert_eq!(r("User(\"a\").greet(User(\"b\"))"), "=> \"a greets b\"");
     assert_eq!(r("print(User(\"zoé\"))"), "User(zoé)");
     assert_eq!(r("\"#{User(\"x\")}\""), "=> \"User(x)\"");
     assert_eq!(r("User(\"a\").bump().bump().to_s()"), "=> \"User(a)\"");
-    // Identité, pas égalité de valeur.
+    // Identity, not value equality.
     assert_eq!(
         r("let a = User(\"a\")\n[a == a, a == User(\"a\")]"),
         "=> [true, false]"
@@ -414,24 +414,24 @@ fn classes() {
     assert!(
         err(&format!("{user}User(\"a\").email"))
             .1
-            .contains("champ privé")
+            .contains("private field")
     );
     assert!(
         err(&format!("{user}let u = User(\"a\")\nu.email = \"x\""))
             .1
-            .contains("champ privé")
+            .contains("private field")
     );
     assert!(
         err(&format!("{user}User(1)"))
             .1
-            .contains("type attendu `str`")
+            .contains("expected type `str`")
     );
     assert!(
         err("class C\n  x: int\nend\nC()")
             .1
-            .contains("champ `x` obligatoire")
+            .contains("field `x` is required")
     );
-    assert!(err("@x").1.contains("que dans une méthode"));
+    assert!(err("@x").1.contains("only be used inside a method"));
 }
 
 #[test]
@@ -459,29 +459,29 @@ fn enums() {
     assert!(
         err(&format!("{e}Protocol::Ftp"))
             .1
-            .contains("pas de variante `Ftp`")
+            .contains("has no variant `Ftp`")
     );
     assert!(
         err(&format!("{e}let p: Protocol = \"TCP\""))
             .1
-            .contains("type attendu `Protocol`")
+            .contains("expected type `Protocol`")
     );
     assert!(
         err("enum E: int\n  A = \"a\"\nend")
             .1
-            .contains("type attendu `int` pour la variante `A`")
+            .contains("expected type `int` for variant `A`")
     );
 }
 
 #[test]
 fn recursion_limit() {
     let (_, msg) = err("def f(n) = f(n + 1)\nf(0)");
-    assert!(msg.contains("récursion infinie"), "{msg}");
+    assert!(msg.contains("infinite recursion"), "{msg}");
     assert_eq!(
         run("def fib(n) = if n < 2 then n else fib(n - 1) + fib(n - 2) end\nfib(15)"),
         "=> 610"
     );
-    // 900 appels imbriqués passent, même dans un thread de test (pile de 2 Mio).
+    // 900 nested calls succeed, even in a test thread (2 MiB stack).
     assert_eq!(
         run("def down(n) = if n == 0 then 0 else 1 + down(n - 1) end\ndown(900)"),
         "=> 900"
@@ -496,9 +496,9 @@ fn print_and_builtins() {
     );
     assert_eq!(run("typeof(1.5)"), "=> \"float\"");
     assert!(
-        err("assert(1 == 2, \"maths\")")
+        err("assert(1 == 2, \"math\")")
             .1
-            .contains("assertion échouée : maths")
+            .contains("assertion failed: math")
     );
 }
 
@@ -507,11 +507,11 @@ fn engine_api() {
     let mut e = Engine::new();
     e.register_fn("double", |x: i64| x * 2);
     e.register_fn("greet", |name: String, excl: bool| {
-        format!("Bonjour {name}{}", if excl { "!" } else { "" })
+        format!("Hello {name}{}", if excl { "!" } else { "" })
     });
     e.register_fn("safe_div", |a: f64, b: f64| {
         if b == 0.0 {
-            Err("division par zéro")
+            Err("division by zero")
         } else {
             Ok(a / b)
         }
@@ -522,20 +522,20 @@ fn engine_api() {
     assert_eq!(e.eval_as::<i64>("double(21)").unwrap(), 42);
     assert_eq!(
         e.eval_as::<String>("greet(\"Vincent\", true)").unwrap(),
-        "Bonjour Vincent!"
+        "Hello Vincent!"
     );
     assert_eq!(e.eval_as::<f64>("safe_div(1, 4)").unwrap(), 0.25);
     assert_eq!(e.eval_as::<i64>("total([1, 2, 3])").unwrap(), 6);
     assert_eq!(e.eval_as::<i64>("maybe(nil)").unwrap(), -1);
 
     let msg = e.eval("safe_div(1, 0)").unwrap_err()[0].message.clone();
-    assert_eq!(msg, "division par zéro");
+    assert_eq!(msg, "division by zero");
     let msg = e.eval("double(\"a\")").unwrap_err()[0].message.clone();
-    assert_eq!(msg, "argument 1 de `double` : int attendu, reçu str");
+    assert_eq!(msg, "argument 1 of `double`: expected int, got str");
     let msg = e.eval("double(1, 2)").unwrap_err()[0].message.clone();
-    assert_eq!(msg, "`double` attend 1 argument, reçu 2");
+    assert_eq!(msg, "`double` expects 1 argument, got 2");
 
-    // L'état persiste entre les appels ; appel d'une fonction du script depuis Rust.
+    // State persists between calls; calling a script function from Rust.
     e.eval("let base = 100\ndef plus(x: int): int = x + base")
         .unwrap();
     assert_eq!(e.call_as::<i64>("plus", (5,)).unwrap(), 105);
@@ -543,8 +543,8 @@ fn engine_api() {
     assert_eq!(e.call_as::<i64>("plus", (5,)).unwrap(), 6);
     assert!(matches!(e.get_global("base"), Some(Value::Int(1))));
 
-    // Conversion de résultat refusée.
-    assert!(e.eval_as::<i64>("\"texte\"").is_err());
+    // Result conversion refused.
+    assert!(e.eval_as::<i64>("\"text\"").is_err());
 }
 
 #[test]
@@ -552,13 +552,13 @@ fn errors_from_earlier_scripts_show_their_own_source() {
     let mut e = Engine::new();
     e.eval_named("def boom(x) = x + \"!\"", "lib.bk").unwrap();
     let err = e.eval_named("\n\nboom(1)", "main.bk").unwrap_err();
-    let shown = err.render("ignoré", "ignoré");
+    let shown = err.render("ignored", "ignored");
     assert!(shown.contains("lib.bk:1:15"), "{shown}");
     assert!(shown.contains("def boom(x) = x + \"!\""), "{shown}");
 }
 
-/// Les exemples exécutables de docs/syntax.md tournent (ceux qui n'utilisent pas encore
-/// de fonctionnalité v0.2 et n'illustrent pas une erreur).
+/// The runnable examples of docs/syntax.md run (those that don't use v0.2 features
+/// yet and don't illustrate an error).
 #[test]
 fn spec_examples_run() {
     let examples = [
@@ -568,7 +568,7 @@ fn spec_examples_run() {
         "let nums = [1, 2, 3]\nnums[0]\nnums[-1]\nnums << 4\nnums.len()",
         "let ages = {\"alice\" => 30, \"bob\" => 25}\nlet key = \"carol\"\nlet scores: {str => int} = {}\nages[\"alice\"]\nages[\"dave\"] = 41\nages.has(\"bob\")\nages.delete(\"bob\")\nages.keys()\nscores[key] = 10",
         "let point = {x: 1, y: 2}\npoint.x\npoint.x = 5\nlet x = 10\nlet p2 = {x, y: 20}\ndef dist(p: {x: int, y: int}): float\n  (p.x * p.x + p.y * p.y).sqrt()\nend\ndist(point)",
-        "let pair = (1, \"un\")\npair.0\ndef min_max(nums: [int]): (int, int)\n  (nums.min(), nums.max())\nend\nlet (lo, hi) = min_max([3, 1, 4])\nlet point = {x: 1, y: 2}\nlet {x, y} = point\nlet nums = [1, 2]\nlet [first, ...rest] = nums",
+        "let pair = (1, \"one\")\npair.0\ndef min_max(nums: [int]): (int, int)\n  (nums.min(), nums.max())\nend\nlet (lo, hi) = min_max([3, 1, 4])\nlet point = {x: 1, y: 2}\nlet {x, y} = point\nlet nums = [1, 2]\nlet [first, ...rest] = nums",
     ];
     for src in examples {
         let mut e = Engine::new();
@@ -604,10 +604,10 @@ fn float_display() {
         ("0.0 / 0.0", "NaN"),
     ] {
         assert_eq!(show(src), (want.to_string(), want.to_string()), "{src}");
-        // Interpolation : même écriture.
+        // Interpolation: same text.
         assert_eq!(show(&format!("\"#{{{src}}}\"")).1, want, "{src}");
     }
-    // Chaque écriture finie se relit comme littéral et redonne exactement le nombre.
+    // Every finite rendering reads back as a literal and gives exactly the same number.
     let mut e = Engine::new();
     for src in [
         "1e300",
@@ -639,7 +639,7 @@ fn range_limits() {
     };
     let max = i64::MAX;
     let min = i64::MIN;
-    // La borne `i64::MAX` est incluse, sans débordement.
+    // The `i64::MAX` bound is included, without overflow.
     assert_eq!(
         run(&format!("({}..{max}).to_list()", max - 2)),
         format!("[{}, {}, {max}]", max - 2, max - 1)
@@ -660,7 +660,7 @@ fn range_limits() {
     );
     assert_eq!(run(&format!("(0..{max}).contains({max})")), "true");
     assert_eq!(run(&format!("(0...{max}).contains({max})")), "false");
-    // Longueur réelle 2^64 - 1 : plafonnée à i64::MAX.
+    // Actual length 2^64 - 1: capped at i64::MAX.
     assert_eq!(run(&format!("({min}..{max}).len()")), max.to_string());
     assert_eq!(run(&format!("({min}...{max}).len()")), max.to_string());
     assert_eq!(run("(3...1).len()"), "0");
@@ -670,13 +670,13 @@ fn range_limits() {
         run(&format!("({}..{max}).map(|i| i - {max})", max - 1)),
         "[-1, 0]"
     );
-    // Les allocations démesurées sont des erreurs, pas un arrêt du processus.
-    assert!(run(&format!("(0...{max}).to_list()")).contains("intervalle trop grand"));
-    assert!(run(&format!("\"ab\" * {max}")).contains("chaîne trop longue"));
-    assert!(run(&format!("\"ab\" * {}", max / 2 + 1)).contains("chaîne trop longue"));
+    // Huge allocations are errors, not a process abort.
+    assert!(run(&format!("(0...{max}).to_list()")).contains("range too large"));
+    assert!(run(&format!("\"ab\" * {max}")).contains("string too long"));
+    assert!(run(&format!("\"ab\" * {}", max / 2 + 1)).contains("string too long"));
     assert_eq!(run(&format!("\"\" * {max}")), "\"\"");
     assert_eq!(run("\"ab\" * 3"), "\"ababab\"");
-    // Parcourir un intervalle immense sans tout matérialiser.
+    // Iterating over a huge range without materializing it.
     assert_eq!(run(&format!("(0...{max}).find(|i| i > 3)")), "4");
     assert_eq!(
         run(&format!("({}..{max}).reduce(0, |a, i| a + 1)", max - 9)),
@@ -684,7 +684,7 @@ fn range_limits() {
     );
 }
 
-/// Exécute `f` dans un fil à petite pile : une récursion non maîtrisée y déborderait.
+/// Runs `f` on a thread with a small stack: unbounded recursion would overflow it.
 fn small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     std::thread::Builder::new()
         .stack_size(1 << 20)
@@ -696,8 +696,8 @@ fn small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
 
 #[test]
 fn deep_structures_do_not_overflow() {
-    // Données imbriquées 200 000 fois : construites, comparées, affichées, libérées
-    // (la libération récursive faisait déborder la pile).
+    // Data nested 200,000 times: built, compared, displayed, dropped
+    // (recursive dropping used to overflow the stack).
     let out = small_stack(|| {
         let mut out = Vec::new();
         for src in [
@@ -707,13 +707,13 @@ fn deep_structures_do_not_overflow() {
             "let h = {}\nfor i in 0...200000\n  h = {\"k\" => h}\nend\nh.len()",
             "let r = {v: 0}\nfor i in 0...200000\n  r = {v: r}\nend\nr == r",
             "let t = (0, 0)\nfor i in 0...200000\n  t = (t, i)\nend\nt.1",
-            "type N\n  suiv = nil\nend\nlet n = N()\nfor i in 0...200000\n  n = N(suiv: n)\nend\nn == n",
+            "type N\n  next_node = nil\nend\nlet n = N()\nfor i in 0...200000\n  n = N(next_node: n)\nend\nn == n",
             "let f = || 0\nfor i in 0...200000\n  let g = f\n  f = || g()\nend\n1",
             "let a = []\nfor i in 0...200000\n  a = [a, i]\nend\na.to_s().len() > 10",
         ] {
             let mut e = Engine::new();
             e.set_output(|_| {});
-            // Variables qui changent de type à chaque tour : vérification dynamique.
+            // Variables change type on each iteration: dynamic checking.
             e.set_static_checks(false);
             out.push(
                 e.eval(src)
@@ -747,9 +747,9 @@ fn deep_sources_do_not_overflow() {
             out.push(match e.eval(&src) {
                 Ok(v) => e.inspect(&v),
                 Err(err) => {
-                    // Message borné, même pour une ligne de 200 000 caractères.
+                    // Bounded message, even for a 200,000-character line.
                     let shown = err.render(&src, "test");
-                    assert!(shown.len() < 1000, "{} octets", shown.len());
+                    assert!(shown.len() < 1000, "{} bytes", shown.len());
                     err[0].message.clone()
                 }
             });
@@ -760,7 +760,7 @@ fn deep_sources_do_not_overflow() {
     assert_eq!(out[1], "1");
     assert_eq!(out[2], "false");
     assert_eq!(out[3], "\"1\"");
-    assert_eq!(out[4], "imbrication trop profonde");
+    assert_eq!(out[4], "nesting too deep");
 }
 
 #[test]
@@ -773,7 +773,7 @@ fn cyclic_and_shared_structures() {
             .map(|v| e.inspect(&v))
             .unwrap_or_else(|err| err.to_string())
     };
-    // Cycles : affichés `[…]`, comparés sans fin de récursion.
+    // Cycles: displayed `[…]`, compared without endless recursion.
     assert_eq!(run("let l = []\nl << l\nl"), "[[…]]");
     assert_eq!(run("let l = []\nl << l\nl << l\nl"), "[[…], […]]");
     assert_eq!(run("let h = {}\nh[\"x\"] = h\nh"), "{\"x\" => {…}}");
@@ -789,7 +789,7 @@ fn cyclic_and_shared_structures() {
         run("type N\n  v = nil\nend\nlet n = N()\nn.v = n\n[n, n == n, N(v: n) == N(v: n)]"),
         "[N(v: (…)), true, true]"
     );
-    // Partage : 2^40 chemins, mais peu de nœuds distincts.
+    // Sharing: 2^40 paths, but few distinct nodes.
     assert_eq!(
         run(
             "let a = [1]\nlet b = [1]\nfor i in 0...40\n  a = [a, a]\n  b = [b, b]\nend\n[a == b, a.to_s().len() > 1000]"

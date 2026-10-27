@@ -1,6 +1,6 @@
-//! Positions dans le code source.
+//! Positions in the source code.
 
-/// Intervalle d'octets `[start, end)` dans le source.
+/// Byte range `[start, end)` in the source.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Span {
     pub start: u32,
@@ -13,7 +13,7 @@ impl Span {
         Span { start, end }
     }
 
-    /// Intervalle couvrant `self` et `other`.
+    /// Range covering both `self` and `other`.
     #[inline]
     pub fn to(self, other: Span) -> Span {
         Span::new(self.start.min(other.start), self.end.max(other.end))
@@ -35,7 +35,7 @@ impl Span {
     }
 }
 
-/// Ligne et colonne (à partir de 1) d'un décalage en octets.
+/// Line and column (1-based) of a byte offset.
 pub fn line_col(src: &str, offset: u32) -> (usize, usize) {
     let offset = (offset as usize).min(src.len());
     let before = &src[..offset];

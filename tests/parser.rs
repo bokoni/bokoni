@@ -12,7 +12,7 @@ fn sexp(src: &str) -> String {
 fn err(src: &str) -> String {
     let mut i = Interner::new();
     match parser::parse(src, &mut i) {
-        Ok(p) => panic!("devrait échouer : {}", printer::program(&p, &i)),
+        Ok(p) => panic!("should fail: {}", printer::program(&p, &i)),
         Err(e) => e.to_string(),
     }
 }
@@ -211,21 +211,21 @@ fn declarations() {
 
 #[test]
 fn errors() {
-    assert!(err("1 +").contains("expression attendue"));
-    assert!(err("if x\n  1\n").contains("`end` attendu pour fermer `if` (ligne 1)"));
-    assert!(err("a < b < c").contains("ajouter des parenthèses"));
-    assert!(err("1 = 2").contains("assigner"));
-    assert!(err("{\"a\": 1}").contains("`=>` attendu"));
-    assert!(err("f(a: 1, 2)").contains("positionnel après un argument nommé"));
-    assert!(err("f(a: 1, a: 2)").contains("deux fois"));
-    assert!(err("{x: 1, x: 2}").contains("deux fois"));
-    assert!(err("while x do\nend").contains("`do` n'est pas utilisé"));
-    assert!(err("1.(").contains("nom de méthode"));
+    assert!(err("1 +").contains("expected an expression"));
+    assert!(err("if x\n  1\n").contains("expected `end` to close `if` (line 1)"));
+    assert!(err("a < b < c").contains("add parentheses"));
+    assert!(err("1 = 2").contains("cannot assign"));
+    assert!(err("{\"a\": 1}").contains("expected `=>`"));
+    assert!(err("f(a: 1, 2)").contains("positional argument after a named argument"));
+    assert!(err("f(a: 1, a: 2)").contains("twice"));
+    assert!(err("{x: 1, x: 2}").contains("twice"));
+    assert!(err("while x do\nend").contains("`do` is not used"));
+    assert!(err("1.(").contains("method or field name"));
     assert!(err("@[Tag] x = 1").contains("annotation"));
-    assert!(err("x y").contains("fin de ligne attendue"));
-    assert!(err("\"abc #{x\"").contains("non fermée"));
+    assert!(err("x y").contains("expected a line end"));
+    assert!(err("\"abc #{x\"").contains("unclosed"));
 
-    // Les erreurs en fin de source sont marquées « incomplètes » (le REPL lit la suite).
+    // Errors at the end of the source are marked "incomplete" (the REPL reads more input).
     let mut i = Interner::new();
     assert!(
         parser::parse("def f\n  1", &mut i)
@@ -238,18 +238,18 @@ fn errors() {
 
 #[test]
 fn deep_nesting_does_not_overflow() {
-    // 900 niveaux passent (la pile grandit sur le tas si besoin)…
+    // 900 levels pass (the stack grows on the heap if needed)…
     let src = "(".repeat(900) + "1" + &")".repeat(900);
     assert_eq!(sexp(&src), "1");
     let src = "[".repeat(900) + &"]".repeat(900);
     assert!(sexp(&src).starts_with("(list (list"));
-    // …au-delà de la limite, une erreur propre plutôt qu'un débordement de pile.
+    // …beyond the limit, a clean error rather than a stack overflow.
     let src = "(".repeat(10_000) + "1" + &")".repeat(10_000);
-    assert!(err(&src).contains("imbrication trop profonde"));
+    assert!(err(&src).contains("nesting too deep"));
 }
 
-/// Chaque bloc ```ruby de docs/syntax.md doit être accepté par le parseur.
-/// Sauf : les macros (`{%`, `{{`) et les blocs à trous (`…`).
+/// Every ```ruby block of docs/syntax.md must be accepted by the parser.
+/// Except: macros (`{%`, `{{`) and blocks with holes (`…`).
 #[test]
 fn spec_examples_parse() {
     let spec = include_str!("../docs/syntax.md");
@@ -257,7 +257,7 @@ fn spec_examples_parse() {
     let mut rest = spec;
     while let Some(start) = rest.find("```ruby\n") {
         let body = &rest[start + 8..];
-        let end = body.find("```").expect("bloc non fermé");
+        let end = body.find("```").expect("unclosed block");
         let code = &body[..end];
         rest = &body[end + 3..];
         if code.contains("{%") || code.contains("{{") || code.contains('…') {
@@ -266,16 +266,16 @@ fn spec_examples_parse() {
         let mut i = Interner::new();
         if let Err(e) = parser::parse(code, &mut i) {
             panic!(
-                "exemple de syntax.md refusé :\n{}\n{code}",
+                "syntax.md example rejected:\n{}\n{code}",
                 e.render(code, "syntax.md")
             );
         }
         count += 1;
     }
-    assert!(count >= 15, "seulement {count} exemples trouvés");
+    assert!(count >= 15, "only {count} examples found");
 }
 
-/// Lignes (à partir de 1) des erreurs signalées.
+/// Lines (1-based) of the reported errors.
 fn error_lines(src: &str) -> Vec<usize> {
     let mut i = Interner::new();
     match parser::parse(src, &mut i) {
@@ -315,8 +315,8 @@ print(g)
 
 #[test]
 fn recovery_skips_whole_broken_construct() {
-    // L'en-tête cassé d'un `def` / `if` / `case` : son corps et son `end` sont sautés,
-    // sans erreur en cascade.
+    // Broken header of a `def` / `if` / `case`: its body and its `end` are skipped,
+    // without cascading errors.
     assert_eq!(
         error_lines("def f(a b)\n  if a\n    1\n  end\nend\nf(1)\n"),
         [1]
@@ -325,15 +325,15 @@ fn recovery_skips_whole_broken_construct() {
         error_lines("case x y\nwhen 1 then 2\nend\nlet z = 1 +\n"),
         [1, 4]
     );
-    // `if` en modificateur dans la partie sautée : n'ouvre pas de construction.
+    // A modifier `if` in the skipped part does not open a construct.
     assert_eq!(error_lines("let a = 1 2 if b\nlet c = (\n"), [1, 2]);
-    // Un bloc `do` ouvert sur la ligne erronée est sauté jusqu'à son `end`.
+    // A `do` block opened on the faulty line is skipped up to its `end`.
     assert_eq!(error_lines("foo(1 2) do |x|\n  x\nend\nbar(\n"), [1, 4]);
 }
 
 #[test]
 fn recovery_inside_bodies() {
-    // Les erreurs dans un corps sont signalées et le reste du corps est analysé.
+    // Errors in a body are reported and the rest of the body is parsed.
     assert_eq!(error_lines("def f\n  1 +\n  let x = 2 3\n  x\nend\n"), [3]);
     assert_eq!(
         error_lines("type S\n  a: = 1\n  b: int\n  c: [int = 2\nend\nlet ok = 1\n"),
@@ -349,8 +349,8 @@ fn incomplete_source_stops_cleanly() {
     let e = parser::parse("let a = 1 2\ndef f\n  1\n", &mut i).unwrap_err();
     assert_eq!(e.len(), 2);
     assert!(e[1].incomplete);
-    // Chaîne non fermée : les erreurs du parseur situées après n'ont pas de sens.
+    // Unclosed string: parser errors after it are meaningless.
     let e = parser::parse("let a = 1 2\nlet s = \"abc\nlet b = 1 2\n", &mut i).unwrap_err();
     assert_eq!(e.len(), 2, "{e}");
-    assert!(e[1].message.contains("chaîne non fermée"));
+    assert!(e[1].message.contains("unclosed string"));
 }

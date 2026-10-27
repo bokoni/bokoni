@@ -1,6 +1,6 @@
-//! Opérations sur les valeurs : opérateurs, indexation, champs, fonctions et méthodes
-//! intégrées. Partagées par l'interpréteur de l'IR et (plus tard) par le JIT, qui les
-//! appellera pour tout ce qui n'est pas compilé en instructions machine.
+//! Operations on values: operators, indexing, fields, built-in functions and methods.
+//! Shared by the IR interpreter and by the JIT, which calls them for anything it does
+//! not compile to machine instructions.
 
 use crate::ast::BinOp;
 use crate::diagnostic::Error;
@@ -20,7 +20,7 @@ pub(crate) fn type_err<T>(msg: impl Into<String>, span: Span) -> R<T> {
     Err(Error::type_error(msg, span))
 }
 
-/// Fonctions intégrées qui ont besoin de l'interpréteur (sortie, appels…).
+/// Built-in functions that need the interpreter (output, calls…).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Builtin {
     Print,
@@ -64,7 +64,7 @@ impl Runtime {
             Some(k) => Ok(k),
             None => type_err(
                 format!(
-                    "une clé de hash doit être nil, bool, int ou str, reçu {}",
+                    "a hash key must be nil, bool, int or str, got {}",
                     v.type_name()
                 ),
                 span,
@@ -77,20 +77,20 @@ impl Runtime {
             Value::Record(rec) => match rec.borrow().get(name) {
                 Some(v) => Ok(v.clone()),
                 None => rt_err(
-                    format!("le record n'a pas de champ `{}`", self.name(name)),
+                    format!("the record has no field `{}`", self.name(name)),
                     span,
                 ),
             },
             Value::Object(_) | Value::Variant(..) => self.object_field(r, name, span),
             _ if self.methods.contains_key(&name) => rt_err(
                 format!(
-                    "`{n}` est une méthode : écrire `.{n}()`",
+                    "`{n}` is a method: write `.{n}()`",
                     n = self.name(name)
                 ),
                 span,
             ),
             _ => type_err(
-                format!("{} n'a pas de champ `{}`", r.type_name(), self.name(name)),
+                format!("{} has no field `{}`", r.type_name(), self.name(name)),
                 span,
             ),
         }
@@ -117,18 +117,18 @@ impl Runtime {
                 Ok(t[pos].clone())
             }
             _ => type_err(
-                format!("{} ne s'indexe pas avec `[…]`", r.type_name()),
+                format!("{} cannot be indexed with `[…]`", r.type_name()),
                 span,
             ),
         }
     }
 
-    // ─── Opérateurs ──────────────────────────────────────────────────────────
+    // ─── Operators ───────────────────────────────────────────────────────────
 
     pub(crate) fn binary(&self, op: BinOp, l: Value, r: Value, span: Span) -> R {
         use BinOp::*;
         use Value::{Float, Int};
-        let overflow = || Error::runtime("dépassement de capacité d'un entier", span);
+        let overflow = || Error::runtime("integer overflow", span);
         Ok(match (op, &l, &r) {
             (Eq, _, _) => Value::Bool(l.equals(&r)),
             (Ne, _, _) => Value::Bool(!l.equals(&r)),
@@ -136,7 +136,7 @@ impl Runtime {
             (Add, Int(a), Int(b)) => Int(a.checked_add(*b).ok_or_else(overflow)?),
             (Sub, Int(a), Int(b)) => Int(a.checked_sub(*b).ok_or_else(overflow)?),
             (Mul, Int(a), Int(b)) => Int(a.checked_mul(*b).ok_or_else(overflow)?),
-            (Div | Rem, Int(_), Int(0)) => return rt_err("division par zéro", span),
+            (Div | Rem, Int(_), Int(0)) => return rt_err("division by zero", span),
             (Div, Int(a), Int(b)) => Int(a.checked_div_euclid(*b).ok_or_else(overflow)?),
             (Rem, Int(a), Int(b)) => Int(a.checked_rem_euclid(*b).ok_or_else(overflow)?),
 
@@ -160,7 +160,7 @@ impl Runtime {
             (Add, Value::Str(_), _) | (Add, _, Value::Str(_)) => {
                 return type_err(
                     format!(
-                        "`+` entre {} et {} : utiliser l'interpolation \"#{{x}}\" ou `.to_s()`",
+                        "`+` between {} and {}: use interpolation \"#{{x}}\" or `.to_s()`",
                         l.type_name(),
                         r.type_name()
                     ),
@@ -169,13 +169,13 @@ impl Runtime {
             }
             (Mul, Value::Str(s), Int(n)) => {
                 if *n < 0 {
-                    return rt_err("répétition d'une chaîne par un nombre négatif", span);
+                    return rt_err("string repeated a negative number of times", span);
                 }
                 match s.len().checked_mul(*n as usize) {
                     Some(len) if len <= MAX_ALLOC => Value::Str(s.repeat(*n as usize).into()),
                     _ => {
                         return rt_err(
-                            format!("chaîne trop longue : {} × {n} octets", s.len()),
+                            format!("string too long: {} × {n} bytes", s.len()),
                             span,
                         );
                     }
@@ -200,7 +200,7 @@ impl Runtime {
                     _ => {
                         return type_err(
                             format!(
-                                "`{}` ne compare pas {} et {}",
+                                "`{}` cannot compare {} and {}",
                                 op.as_str(),
                                 l.type_name(),
                                 r.type_name()
@@ -226,7 +226,7 @@ impl Runtime {
             _ => {
                 return type_err(
                     format!(
-                        "`{}` ne s'applique pas à {} et {}",
+                        "`{}` does not apply to {} and {}",
                         op.as_str(),
                         l.type_name(),
                         r.type_name()
@@ -258,7 +258,7 @@ impl Runtime {
             Builtin::Assert => {
                 if args.is_empty() || args.len() > 2 {
                     return rt_err(
-                        "`assert(condition, message?)` attend 1 ou 2 arguments",
+                        "`assert(condition, message?)` expects 1 or 2 arguments",
                         span,
                     );
                 }
@@ -266,8 +266,8 @@ impl Runtime {
                     Ok(Value::Nil)
                 } else {
                     let msg = match args.get(1) {
-                        Some(m) => format!("assertion échouée : {}", m.to_display(&self.interner)),
-                        None => "assertion échouée".to_string(),
+                        Some(m) => format!("assertion failed: {}", m.to_display(&self.interner)),
+                        None => "assertion failed".to_string(),
                     };
                     rt_err(msg, span)
                 }
@@ -275,14 +275,14 @@ impl Runtime {
         }
     }
 
-    // ─── Méthodes intégrées ──────────────────────────────────────────────────
+    // ─── Built-in methods ────────────────────────────────────────────────────
 
     pub(crate) fn call1(&mut self, f: &Value, a: Value, span: Span) -> R {
         self.call_pos(f, [a], span)
     }
 
-    /// Appel avec des arguments positionnels : sans allocation ni liaison générique quand
-    /// `f` est une fonction du script qui a exactement ces paramètres.
+    /// Call with positional arguments: no allocation or generic binding when `f` is a
+    /// script function with exactly these parameters.
     pub(crate) fn call_pos<const N: usize>(
         &mut self,
         f: &Value,
@@ -303,7 +303,7 @@ impl Runtime {
         let Some(&(m, mname)) = self.methods.get(&name) else {
             return type_err(
                 format!(
-                    "{} n'a pas de méthode `{}`",
+                    "{} has no method `{}`",
                     recv.type_name(),
                     self.name(name)
                 ),
@@ -322,12 +322,12 @@ impl Runtime {
             }
             (M::Call, Value::Function(_)) => self.call_value(&recv, CallArgs::plain(args), span),
 
-            // ── Nombres
+            // ── Numbers
             (M::Abs, Value::Int(i)) => {
                 n(0)?;
                 match i.checked_abs() {
                     Some(v) => Ok(Value::Int(v)),
-                    None => rt_err("dépassement de capacité d'un entier", span),
+                    None => rt_err("integer overflow", span),
                 }
             }
             (M::Abs, Value::Float(f)) => {
@@ -351,7 +351,7 @@ impl Runtime {
                             _ => f.trunc(),
                         };
                         if !r.is_finite() || r.abs() > i64::MAX as f64 {
-                            return rt_err("nombre trop grand pour un entier", span);
+                            return rt_err("number too large for an integer", span);
                         }
                         Value::Int(r as i64)
                     }
@@ -366,7 +366,7 @@ impl Runtime {
                 Ok(Value::Float(as_f64(&recv).sqrt()))
             }
 
-            // ── Chaînes
+            // ── Strings
             (M::Len, Value::Str(s)) => {
                 n(0)?;
                 Ok(Value::Int(s.chars().count() as i64))
@@ -407,7 +407,7 @@ impl Runtime {
                         let sep = expect_str(sep, mname, span)?;
                         s.split(&*sep).map(Value::str).collect()
                     }
-                    _ => return rt_err("`split(séparateur?)` attend 0 ou 1 argument", span),
+                    _ => return rt_err("`split(separator?)` expects 0 or 1 argument", span),
                 };
                 Ok(Value::list(parts))
             }
@@ -429,18 +429,18 @@ impl Runtime {
                 n(0)?;
                 match s.trim().parse::<i64>() {
                     Ok(v) => Ok(Value::Int(v)),
-                    Err(_) => rt_err(format!("{s:?} n'est pas un entier"), span),
+                    Err(_) => rt_err(format!("{s:?} is not an integer"), span),
                 }
             }
             (M::ToF, Value::Str(s)) => {
                 n(0)?;
                 match s.trim().parse::<f64>() {
                     Ok(v) => Ok(Value::Float(v)),
-                    Err(_) => rt_err(format!("{s:?} n'est pas un nombre"), span),
+                    Err(_) => rt_err(format!("{s:?} is not a number"), span),
                 }
             }
 
-            // ── Listes
+            // ── Lists
             (M::Len, Value::List(l)) => {
                 n(0)?;
                 Ok(Value::Int(l.borrow().len() as i64))
@@ -474,7 +474,7 @@ impl Runtime {
                 let sep = match args.as_slice() {
                     [] => Rc::from(""),
                     [s] => expect_str(s, mname, span)?,
-                    _ => return rt_err("`join(séparateur?)` attend 0 ou 1 argument", span),
+                    _ => return rt_err("`join(separator?)` expects 0 or 1 argument", span),
                 };
                 let parts: Vec<String> = l
                     .borrow()
@@ -505,7 +505,7 @@ impl Runtime {
                     }
                 });
                 if let Some((a, b)) = err {
-                    return type_err(format!("`sort` ne compare pas {a} et {b}"), span);
+                    return type_err(format!("`sort` cannot compare {a} and {b}"), span);
                 }
                 Ok(Value::list(v))
             }
@@ -529,7 +529,7 @@ impl Runtime {
                             let Some(o) = compare(v, b) else {
                                 return type_err(
                                     format!(
-                                        "`{mname}` ne compare pas {} et {}",
+                                        "`{mname}` cannot compare {} and {}",
                                         v.type_name(),
                                         b.type_name()
                                     ),
@@ -596,7 +596,7 @@ impl Runtime {
                 Ok(acc)
             }
 
-            // ── Intervalles
+            // ── Ranges
             (M::Len, Value::Range(r)) => {
                 n(0)?;
                 Ok(Value::Int(r.len().min(i64::MAX as usize) as i64))
@@ -640,7 +640,7 @@ impl Runtime {
             }
             (M::Get, Value::Hash(h)) => {
                 if args.is_empty() || args.len() > 2 {
-                    return rt_err("`get(clé, défaut?)` attend 1 ou 2 arguments", span);
+                    return rt_err("`get(key, default?)` expects 1 or 2 arguments", span);
                 }
                 let k = self.hash_key(&args[0], span)?;
                 let found = h.borrow().get(&k).cloned();
@@ -672,7 +672,7 @@ impl Runtime {
             }
 
             _ => type_err(
-                format!("{} n'a pas de méthode `{mname}`", recv.type_name()),
+                format!("{} has no method `{mname}`", recv.type_name()),
                 span,
             ),
         }
@@ -698,27 +698,27 @@ pub(crate) fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     }
 }
 
-/// Index de liste, négatif depuis la fin.
+/// List index; negative counts from the end.
 pub(crate) fn list_index(i: &Value, len: usize, span: Span) -> R<usize> {
     let Value::Int(i) = i else {
         return type_err(
-            format!("un index doit être un entier, reçu {}", i.type_name()),
+            format!("an index must be an integer, got {}", i.type_name()),
             span,
         );
     };
     let pos = if *i < 0 { len as i64 + i } else { *i };
     if pos < 0 || pos >= len as i64 {
-        return rt_err(format!("index {i} hors limites (taille {len})"), span);
+        return rt_err(format!("index {i} out of bounds (length {len})"), span);
     }
     Ok(pos as usize)
 }
 
-/// Taille maximale d'une liste créée d'un coup (`intervalle.to_list()`), et d'une chaîne
-/// répétée (`"ab" * n`), en octets : au-delà, erreur plutôt qu'un arrêt du processus
-/// faute de mémoire.
+/// Maximum size, in bytes, of a list created in one go (`range.to_list()`) and of a
+/// repeated string (`"ab" * n`): beyond it, an error rather than the process aborting
+/// for lack of memory.
 pub(crate) const MAX_ALLOC: usize = 1 << 31;
 
-/// Éléments d'une liste ou d'un intervalle, sans copie de l'intervalle.
+/// Elements of a list or range, without materializing the range.
 fn iter_lazy(v: &Value) -> Box<dyn Iterator<Item = Value>> {
     match v {
         Value::List(l) => Box::new(l.borrow().clone().into_iter()),
@@ -733,7 +733,7 @@ fn iter_values(v: &Value, span: Span) -> R<Vec<Value>> {
     {
         return rt_err(
             format!(
-                "intervalle trop grand pour en faire une liste ({} éléments)",
+                "range too large to turn into a list ({} elements)",
                 r.len()
             ),
             span,
@@ -748,8 +748,8 @@ fn arity(name: &str, args: &[Value], n: usize, span: Span) -> R<()> {
     }
     rt_err(
         format!(
-            "`{name}` attend {n} argument{}, reçu {}",
-            if n > 1 { "s" } else { "" },
+            "`{name}` expects {n} argument{}, got {}",
+            if n == 1 { "" } else { "s" },
             args.len()
         ),
         span,
@@ -760,7 +760,7 @@ fn expect_str(v: &Value, method: &str, span: Span) -> R<Rc<str>> {
     match v {
         Value::Str(s) => Ok(s.clone()),
         _ => type_err(
-            format!("`{method}` attend une chaîne, reçu {}", v.type_name()),
+            format!("`{method}` expects a string, got {}", v.type_name()),
             span,
         ),
     }

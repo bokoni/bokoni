@@ -1,16 +1,16 @@
-//! Vérification statique : noms et types, avant l'exécution.
+//! Static checking: names and types, before execution.
 //!
-//! Typage graduel : on ne signale que les erreurs **certaines**.
-//! - Une valeur de type inconnu (`any` : paramètre non annoté, fonction Rust…) n'est
-//!   jamais une erreur ; la vérification à l'exécution s'en charge.
-//! - Pour une valeur qui peut avoir plusieurs types (`int?`, `int | str`), une opération
-//!   n'est refusée que si aucun de ces types ne la permet.
+//! Gradual typing: only **certain** errors are reported.
+//! - A value of unknown type (`any`: unannotated parameter, Rust function…) is never an
+//!   error; the runtime check takes care of it.
+//! - For a value that may have several types (`int?`, `int | str`), an operation is only
+//!   rejected if none of those types allows it.
 //!
-//! Toutes les erreurs sont collectées : l'analyse continue après chacune.
+//! All errors are collected: analysis continues after each one.
 //!
-//! Inférence : le type d'une variable est celui de sa première valeur (`let x = 1` : `int`,
-//! `x = "a"` est refusé) ; le type de retour d'une fonction non annotée est déduit de son
-//! corps ; les paramètres d'un lambda passé à `map`, `filter`… reçoivent le type des éléments.
+//! Inference: a variable's type is that of its first value (`let x = 1`: `int`, so
+//! `x = "a"` is rejected); the return type of an unannotated function is inferred from
+//! its body; the parameters of a lambda passed to `map`, `filter`… get the element type.
 
 use crate::ast::*;
 use crate::diagnostic::Error;
@@ -23,11 +23,11 @@ use crate::value::{Function, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Vérifie un programme. `globals` : variables déjà définies (fonctions Rust enregistrées,
-/// scripts exécutés avant).
+/// Checks a program. `globals`: variables already defined (registered Rust functions,
+/// scripts run before).
 ///
-/// Renvoie les erreurs, et le type déduit des variables `int` / `float` / `bool` (par
-/// position de leur déclaration) : le compilateur en fait des registres typés.
+/// Returns the errors, and the inferred type of `int` / `float` / `bool` variables (by
+/// position of their declaration): the compiler turns them into typed registers.
 pub fn check(
     program: &Program,
     interner: &Interner,
@@ -53,13 +53,13 @@ pub fn check(
     (c.errors, c.warnings, c.prims)
 }
 
-/// Types `int` / `float` / `bool` connus avec certitude, transmis au compilateur.
+/// `int` / `float` / `bool` types known for certain, passed on to the compiler.
 #[derive(Default)]
 pub struct Prims {
-    /// Variables, par position de leur déclaration.
+    /// Variables, by position of their declaration.
     pub vars: FxHashMap<u32, RegTy>,
-    /// Lectures de champ (`p.x`), par expression : champ annoté d'un `type`, dont la
-    /// valeur est vérifiée à chaque construction et affectation.
+    /// Field reads (`p.x`), by expression: annotated field of a `type`, whose value is
+    /// checked on every construction and assignment.
     pub fields: FxHashMap<u32, RegTy>,
 }
 
@@ -72,16 +72,16 @@ fn prim(t: &Ty) -> Option<RegTy> {
     }
 }
 
-// ─── Types statiques ────────────────────────────────────────────────────────
+// ─── Static types ───────────────────────────────────────────────────────────
 
 type TypeId = usize;
 type EnumId = usize;
 
 #[derive(Clone, Debug)]
 enum Ty {
-    /// Inconnu : tout est permis.
+    /// Unknown: anything goes.
     Any,
-    /// Ne produit pas de valeur (`return`, `break`).
+    /// Produces no value (`return`, `break`).
     Never,
     Nil,
     Bool,
@@ -97,9 +97,9 @@ enum Ty {
     Range,
     Union(Vec<Ty>),
     Fn(Rc<FnSig>),
-    /// Instance d'un `type` / d'une `class`.
+    /// Instance of a `type` / `class`.
     Object(TypeId),
-    /// Le type lui-même (appelable : construction).
+    /// The type itself (callable: construction).
     TypeValue(TypeId),
     Variant(EnumId),
     EnumValue(EnumId),
@@ -139,8 +139,8 @@ impl Ty {
         union(vec![t, Ty::Nil])
     }
 
-    /// Type d'une variable initialisée par une valeur de ce type : les littéraux sont
-    /// élargis (`"dev"` → `str`), et `nil` seul ne dit rien du type futur.
+    /// Type of a variable initialized with a value of this type: literals are widened
+    /// (`"dev"` → `str`), and `nil` alone says nothing about the future type.
     fn widen(self) -> Ty {
         match self {
             Ty::LitStr(_) => Ty::Str,
@@ -167,7 +167,7 @@ impl Ty {
     }
 }
 
-/// Union normalisée (aplatie, sans doublons ; `any` absorbe tout).
+/// Normalized union (flattened, no duplicates; `any` absorbs everything).
 fn union(items: Vec<Ty>) -> Ty {
     let mut out: Vec<Ty> = Vec::new();
     for t in items {
@@ -190,9 +190,9 @@ fn union(items: Vec<Ty>) -> Ty {
 #[derive(Debug)]
 struct FnSig {
     params: Vec<ParamSig>,
-    /// Retour : annoté, ou déduit après la vérification du corps.
+    /// Return type: annotated, or inferred once the body is checked.
     ret: RefCell<Ty>,
-    /// Lambda : argument manquant = nil, arguments en trop ignorés.
+    /// Lambda: missing argument = nil, extra arguments ignored.
     lenient: bool,
 }
 
@@ -211,14 +211,14 @@ struct TypeDef {
     deprecated: Option<Dep>,
 }
 
-/// `@[Deprecated(message?)]` : le message, s'il est écrit en littéral.
+/// `@[Deprecated(message?)]`: the message, if written as a literal.
 type Dep = Option<Rc<str>>;
 
 struct FieldDef {
     name: Symbol,
     ty: Ty,
     has_default: bool,
-    /// Type annoté (vérifié à l'exécution), et non déduit de la valeur par défaut.
+    /// Annotated type (checked at runtime), rather than inferred from the default value.
     annotated: bool,
     deprecated: Option<Dep>,
 }
@@ -232,7 +232,7 @@ struct EnumDef {
     variants_deprecated: Vec<Option<Dep>>,
 }
 
-// ─── Portées ────────────────────────────────────────────────────────────────
+// ─── Scopes ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum VarKind {
@@ -247,27 +247,27 @@ enum VarKind {
 struct Var {
     ty: Ty,
     kind: VarKind,
-    /// Déclarée plus loin dans le bloc (`let` pas encore atteint).
+    /// Declared further down in the block (`let` not reached yet).
     pending: bool,
 }
 
 #[derive(Default)]
 struct Scope {
     vars: FxHashMap<Symbol, Var>,
-    /// Bloc de construction (`T do … end`) : le type construit.
+    /// Construction block (`T do … end`): the type being built.
     construct: Option<TypeId>,
-    /// Niveau de fonction de la portée (0 : programme).
+    /// Function level of the scope (0: program).
     fn_level: usize,
 }
 
 #[derive(Default)]
 struct FnCtx {
-    /// Type de retour annoté.
+    /// Annotated return type.
     ret: Option<Ty>,
-    /// Types des `return` rencontrés (pour déduire le retour).
+    /// Types of the `return`s encountered (to infer the return type).
     returns: Vec<Ty>,
     loops: u32,
-    /// Type de `self` dans une méthode.
+    /// Type of `self` in a method.
     this: Option<Ty>,
 }
 
@@ -280,22 +280,22 @@ struct Checker<'a> {
     types: Vec<TypeDef>,
     enums: Vec<EnumDef>,
     fns: Vec<FnCtx>,
-    /// > 0 : erreurs non signalées (import de déclarations déjà exécutées).
+    /// > 0: errors are not reported (importing declarations already executed).
     quiet: u32,
-    /// Types et enums déjà définis à l'exécution, importés (clé : adresse du `Rc`).
+    /// Types and enums already defined at runtime, imported (key: address of the `Rc`).
     imported: FxHashMap<usize, Ty>,
     prims: Prims,
     warnings: Vec<Error>,
-    /// Fonctions et méthodes `@[Deprecated]` (clé : adresse de la signature).
+    /// `@[Deprecated]` functions and methods (key: address of the signature).
     deprecated_fns: FxHashMap<usize, Dep>,
-    /// Paramètres `@[Deprecated]` (clé : adresse de la signature, index du paramètre).
+    /// `@[Deprecated]` parameters (key: address of the signature, parameter index).
     deprecated_params: FxHashMap<(usize, usize), Dep>,
 }
 
-/// Bloc de construction d'un type inconnu : assignations libres, sans erreur en cascade.
+/// Construction block of an unknown type: free assignments, no cascading errors.
 const UNKNOWN_TYPE: TypeId = usize::MAX;
 
-/// Méthodes intégrées par type de receveur (pour les suggestions).
+/// Built-in methods by receiver type (for suggestions).
 const STR_METHODS: &[&str] = &[
     "len",
     "is_empty",
@@ -331,8 +331,8 @@ const HASH_METHODS: &[&str] = &[
     "len", "is_empty", "keys", "values", "has", "get", "delete", "each", "to_s", "inspect",
 ];
 
-/// Distance d'édition (une inversion de deux lettres compte pour une), pour proposer un
-/// nom proche d'un nom mal écrit.
+/// Edit distance (swapping two letters counts as one), to suggest a name close to a
+/// misspelled one.
 fn distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
@@ -357,8 +357,8 @@ fn distance(a: &str, b: &str) -> usize {
     d[a.len()][b.len()]
 }
 
-/// « (voulez-vous dire `len` ?) » si un candidat est proche : peu de fautes pour un nom
-/// court, ou l'un est le début de l'autre (`lenght` → `len`).
+/// " (did you mean `len`?)" if a candidate is close: few typos for a short name, or one
+/// is a prefix of the other (`lenght` → `len`).
 fn suggest<'s>(name: &str, candidates: impl IntoIterator<Item = &'s str>) -> String {
     let n = name.chars().count();
     let max = match n {
@@ -377,13 +377,13 @@ fn suggest<'s>(name: &str, candidates: impl IntoIterator<Item = &'s str>) -> Str
         })
         .min_by_key(|(d, _)| *d);
     match best {
-        Some((_, c)) => format!(" (voulez-vous dire `{c}` ?)"),
+        Some((_, c)) => format!(" (did you mean `{c}`?)"),
         None => String::new(),
     }
 }
 
 impl Checker<'_> {
-    // ─── Outils ──────────────────────────────────────────────────────────────
+    // ─── Helpers ─────────────────────────────────────────────────────────────
 
     fn name(&self, s: Symbol) -> &str {
         self.i.resolve(s)
@@ -395,9 +395,9 @@ impl Checker<'_> {
         }
     }
 
-    // ─── Déclarations obsolètes (`@[Deprecated]`) ────────────────────────────
+    // ─── Deprecated declarations (`@[Deprecated]`) ───────────────────────────
 
-    /// `@[Deprecated(message?)]` parmi les annotations source.
+    /// `@[Deprecated(message?)]` among the source annotations.
     fn ast_deprecation(&self, anns: &[AnnotationUse]) -> Option<Dep> {
         let a = anns
             .iter()
@@ -414,7 +414,7 @@ impl Checker<'_> {
         )
     }
 
-    /// `@[Deprecated(message?)]` parmi les annotations d'une déclaration déjà compilée.
+    /// `@[Deprecated(message?)]` among the annotations of an already compiled declaration.
     fn ir_deprecation(&self, anns: &crate::ir::Annotations) -> Option<Dep> {
         let a = anns
             .iter()
@@ -429,7 +429,7 @@ impl Checker<'_> {
         }
     }
 
-    /// Paramètres obsolètes d'une fonction de ce programme (annotations source).
+    /// Deprecated parameters of a function of this program (source annotations).
     fn mark_params_ast(&mut self, sig: &Rc<FnSig>, params: Option<&[Param]>) {
         for (k, p) in params.unwrap_or(&[]).iter().enumerate() {
             if let Some(d) = self.ast_deprecation(&p.annotations) {
@@ -439,8 +439,8 @@ impl Checker<'_> {
         }
     }
 
-    /// Paramètres obsolètes d'une fonction déjà compilée (annotations de l'IR : celles de
-    /// l'AST désignent le source d'un autre programme).
+    /// Deprecated parameters of an already compiled function (IR annotations: the AST ones
+    /// point into another program's source).
     fn mark_params_ir(&mut self, sig: &Rc<FnSig>, p: &crate::ir::Proto) {
         for (k, prm) in p.params.iter().enumerate() {
             if let Some(d) = self.ir_deprecation(&prm.annotations) {
@@ -450,20 +450,20 @@ impl Checker<'_> {
         }
     }
 
-    /// Avertit si la déclaration utilisée (`what`) est obsolète.
+    /// Warns if the declaration being used (`what`) is deprecated.
     fn warn_deprecated(&mut self, dep: Option<&Dep>, what: &str, span: Span) {
         let Some(dep) = dep else { return };
         if self.quiet > 0 {
             return;
         }
         let msg = match dep {
-            Some(m) => format!("{what} est obsolète : {m}"),
-            None => format!("{what} est obsolète"),
+            Some(m) => format!("{what} is deprecated: {m}"),
+            None => format!("{what} is deprecated"),
         };
         self.warnings.push(Error::warning(msg, span));
     }
 
-    /// Avertit si la valeur nommée `name` (fonction, type, enum) est obsolète.
+    /// Warns if the value named `name` (function, type, enum) is deprecated.
     fn warn_value(&mut self, ty: &Ty, name: Symbol, span: Span) {
         let dep = match ty {
             Ty::Fn(sig) => self
@@ -511,7 +511,7 @@ impl Checker<'_> {
                 let ts: Vec<String> = ts.iter().map(|t| self.show(t)).collect();
                 ts.join(" | ")
             }
-            Ty::Fn(_) => "fonction".into(),
+            Ty::Fn(_) => "function".into(),
             Ty::Object(id) => self.name(self.types[*id].name).into(),
             Ty::TypeValue(id) => format!("type {}", self.name(self.types[*id].name)),
             Ty::Variant(id) => self.name(self.enums[*id].name).into(),
@@ -519,13 +519,13 @@ impl Checker<'_> {
         }
     }
 
-    /// Type d'une valeur dans un message : littéraux élargis (`str` plutôt que `"a"`).
+    /// Type of a value in a message: literals widened (`str` rather than `"a"`).
     fn show_v(&self, t: &Ty) -> String {
         self.show(&plain(t))
     }
 
-    /// Type reçu, pour un message : `str` plutôt que `"a"`, sauf si des littéraux sont
-    /// attendus (`"dev" | "prod"`), où la valeur exacte est parlante.
+    /// Received type, for a message: `str` rather than `"a"`, unless literals are expected
+    /// (`"dev" | "prod"`), where the exact value is informative.
     fn show_got(&self, got: &Ty, expected: &Ty) -> String {
         let wants_literal = expected
             .members()
@@ -564,7 +564,7 @@ impl Checker<'_> {
         );
     }
 
-    /// Cherche une variable ; `Some((var, niveau de fonction de sa portée))`.
+    /// Looks up a variable; `Some((var, function level of its scope))`.
     fn lookup(&self, name: Symbol) -> Option<(&Var, usize)> {
         self.scopes
             .iter()
@@ -582,10 +582,10 @@ impl Checker<'_> {
         out
     }
 
-    // ─── Déclarations déjà exécutées ─────────────────────────────────────────
+    // ─── Already executed declarations ───────────────────────────────────────
 
-    /// Type d'une variable globale définie avant ce programme (script précédent, REPL,
-    /// fonction Rust) et si elle est modifiable.
+    /// Type of a global variable defined before this program (previous script, REPL, Rust
+    /// function) and whether it is mutable.
     fn global_ty(&mut self, name: Symbol) -> Option<(Ty, bool)> {
         let (v, mutable) = self.globals.get_binding(name)?;
         let ty = match &v {
@@ -686,7 +686,7 @@ impl Checker<'_> {
         id
     }
 
-    /// Signature d'une méthode déjà compilée (à partir de sa déclaration source).
+    /// Signature of an already compiled method (from its source declaration).
     fn proto_signature(&mut self, p: &crate::ir::Proto) -> Rc<FnSig> {
         match &p.decl {
             Some(d) => {
@@ -704,7 +704,7 @@ impl Checker<'_> {
         }
     }
 
-    // ─── Types des annotations ───────────────────────────────────────────────
+    // ─── Type annotations ────────────────────────────────────────────────────
 
     fn resolve(&mut self, t: &TypeExpr) -> Ty {
         match &t.kind {
@@ -738,7 +738,7 @@ impl Checker<'_> {
                     .chain(self.enums.iter().map(|e| self.name(e.name).to_string()))
                     .collect();
                 let hint = suggest(&shown, candidates.iter().map(|s| s.as_str()));
-                self.error(format!("type `{shown}` inconnu{hint}"), t.span);
+                self.error(format!("unknown type `{shown}`{hint}"), t.span);
                 Ty::Any
             }
             TypeKind::List(inner) => Ty::List(Box::new(self.resolve(inner))),
@@ -771,10 +771,10 @@ impl Checker<'_> {
         }
     }
 
-    // ─── Compatibilité ───────────────────────────────────────────────────────
+    // ─── Compatibility ───────────────────────────────────────────────────────
 
-    /// Une valeur de type `from` peut-elle être utilisée là où `to` est attendu ?
-    /// Vrai si c'est possible pour *au moins une* valeur (typage graduel).
+    /// Can a value of type `from` be used where `to` is expected?
+    /// True if it is possible for *at least one* value (gradual typing).
     fn assignable(&self, from: &Ty, to: &Ty) -> bool {
         use Ty::*;
         match (from, to) {
@@ -782,7 +782,7 @@ impl Checker<'_> {
             (Union(fs), _) => fs.iter().any(|f| self.assignable(f, to)),
             (_, Union(ts)) => ts.iter().any(|t| self.assignable(from, t)),
             (LitStr(_), Str) | (LitInt(_), Int) | (LitInt(_), Float) | (Int, Float) => true,
-            // Un `str` quelconque peut valoir `"dev"` : vérifié à l'exécution.
+            // An arbitrary `str` may be `"dev"`: checked at runtime.
             (Str, LitStr(_)) | (Int, LitInt(_)) => true,
             (List(a), List(b)) => self.assignable(a, b),
             (Hash(a, b), Hash(c, d)) => self.assignable(a, c) && self.assignable(b, d),
@@ -799,12 +799,12 @@ impl Checker<'_> {
         }
     }
 
-    /// Vérifie une expression contre un type attendu (avec conversion des littéraux).
+    /// Checks an expression against an expected type (with literal conversion).
     fn expect(&mut self, e: ExprId, to: &Ty, what: &str) -> Ty {
         let t = self.expr(e, Some(to));
         if !self.assignable(&t, to) {
             let msg = format!(
-                "type attendu `{}`{what}, reçu `{}`",
+                "expected type `{}`{what}, got `{}`",
                 self.show(to),
                 self.show_got(&t, to)
             );
@@ -813,9 +813,9 @@ impl Checker<'_> {
         t
     }
 
-    // ─── Blocs et instructions ───────────────────────────────────────────────
+    // ─── Blocks and statements ───────────────────────────────────────────────
 
-    /// Instructions d'un bloc dans la portée courante (déclarations remontées).
+    /// Statements of a block in the current scope (declarations hoisted).
     fn block_stmts(&mut self, b: &Block) -> Ty {
         self.hoist(b);
         let mut last = Ty::Nil;
@@ -832,10 +832,10 @@ impl Checker<'_> {
         t
     }
 
-    /// Déclare d'avance les types, enums, fonctions et `let` du bloc (comme l'exécution
-    /// pour les trois premiers ; les `let` sont marqués « plus loin »).
+    /// Declares the block's types, enums, functions and `let`s ahead of time (like execution
+    /// does for the first three; `let`s are marked "further down").
     fn hoist(&mut self, b: &Block) {
-        // 1. Noms des types et enums (ils peuvent se référencer entre eux).
+        // 1. Names of types and enums (they may refer to each other).
         let mut pending_types = Vec::new();
         for s in &b.stmts {
             match &s.kind {
@@ -873,7 +873,7 @@ impl Checker<'_> {
                 _ => {}
             }
         }
-        // 2. Champs et signatures des méthodes.
+        // 2. Fields and method signatures.
         for (id, t) in pending_types {
             let mut fields = Vec::new();
             let mut methods = FxHashMap::default();
@@ -881,7 +881,7 @@ impl Checker<'_> {
                 match m {
                     Member::Field(f) => {
                         let ty = f.ty.as_ref().map_or(Ty::Any, |t| self.resolve(t));
-                        // Type déduit de la valeur par défaut littérale (`port = 80`).
+                        // Type inferred from the literal default value (`port = 80`).
                         let ty = match (&f.ty, f.default) {
                             (None, Some(d)) => self.literal_ty(d),
                             _ => ty,
@@ -908,7 +908,7 @@ impl Checker<'_> {
                     Member::Stmt(_) => {}
                 }
             }
-            // `init(@champ)` déclare aussi des champs.
+            // `init(@field)` also declares fields.
             let init = self.i.get("init");
             if let Some(Member::Method(init)) = t
                 .members
@@ -961,7 +961,7 @@ impl Checker<'_> {
                     .collect();
             }
         }
-        // 3. Fonctions.
+        // 3. Functions.
         for s in &b.stmts {
             if let StmtKind::Def(f) = &s.kind {
                 let sig = self.signature(f.params.as_deref().unwrap_or(&[]), f.ret.as_ref(), false);
@@ -971,8 +971,8 @@ impl Checker<'_> {
                 self.declare(f.name, Ty::Fn(sig), VarKind::Func);
             }
         }
-        // 4. `let` à venir : visibles dans les fonctions (appelées plus tard), mais
-        //    une utilisation directe avant la déclaration est une erreur.
+        // 4. Upcoming `let`s: visible in functions (called later), but a direct use before
+        //    the declaration is an error.
         for s in &b.stmts {
             if let StmtKind::Let(l) = &s.kind {
                 let mut names = Vec::new();
@@ -989,7 +989,7 @@ impl Checker<'_> {
         }
     }
 
-    /// Type d'une expression littérale simple (valeur par défaut d'un champ non annoté).
+    /// Type of a simple literal expression (default value of an unannotated field).
     fn literal_ty(&self, e: ExprId) -> Ty {
         match self.ast.kind(e) {
             ExprKind::Int(_) => Ty::Int,
@@ -1009,7 +1009,7 @@ impl Checker<'_> {
                 has_default: p.default.is_some(),
             })
             .collect();
-        // Retour non annoté : `any` jusqu'à ce que le corps soit vérifié.
+        // Unannotated return: `any` until the body is checked.
         let ret = ret.map_or(Ty::Any, |t| self.resolve(t));
         Rc::new(FnSig {
             params,
@@ -1055,7 +1055,7 @@ impl Checker<'_> {
                 if self.scopes.len() > 1 || self.fns.len() > 1 =>
             {
                 self.error(
-                    "les déclarations `type`, `class`, `annotation` et `enum` se font au niveau principal du script",
+                    "`type`, `class`, `annotation` and `enum` declarations must be at the top level of the script",
                     s.span,
                 );
                 Ty::Nil
@@ -1085,7 +1085,7 @@ impl Checker<'_> {
                     Ty::Tuple(ts) => {
                         self.error(
                             format!(
-                                "{} valeurs attendues, le tuple en a {}",
+                                "expected {} values, the tuple has {}",
                                 items.len(),
                                 ts.len()
                             ),
@@ -1121,7 +1121,7 @@ impl Checker<'_> {
         }
     }
 
-    /// Corps d'une fonction, d'une méthode (`this`) ou d'un lambda.
+    /// Body of a function, a method (`this`) or a lambda.
     fn function(&mut self, f: &FnDecl, sig: &Rc<FnSig>, this: Option<Ty>) {
         self.annotations(&f.annotations);
         for p in f.params.iter().flatten() {
@@ -1140,7 +1140,7 @@ impl Checker<'_> {
         }
     }
 
-    /// Vérifie un corps ; renvoie son type (dernière expression et `return`).
+    /// Checks a body; returns its type (last expression and `return`s).
     fn body(
         &mut self,
         params: &[Param],
@@ -1163,7 +1163,7 @@ impl Checker<'_> {
             }
             if p.is_field && !in_method {
                 self.error(
-                    "un paramètre `@champ` ne s'utilise que dans une méthode",
+                    "an `@field` parameter can only be used inside a method",
                     p.span,
                 );
             }
@@ -1171,14 +1171,14 @@ impl Checker<'_> {
         }
         let tail = tail_expr(body);
         let last = match (tail, &ret) {
-            // Dernière expression vérifiée contre le retour annoté (conversion des littéraux).
+            // Last expression checked against the annotated return type (literal conversion).
             (Some(e), Some(r)) => {
                 self.hoist(body);
                 let n = body.stmts.len();
                 for s in &body.stmts[..n - 1] {
                     self.stmt(s);
                 }
-                self.expect(e, r, " en retour")
+                self.expect(e, r, " for the return value")
             }
             _ => self.block_stmts(body),
         };
@@ -1188,7 +1188,7 @@ impl Checker<'_> {
             Some(r) => {
                 if tail.is_none() && !self.assignable(&last, &r) {
                     let msg = format!(
-                        "type attendu `{}` en retour, reçu `{}`",
+                        "expected return type `{}`, got `{}`",
                         self.show(&r),
                         self.show(&last)
                     );
@@ -1204,7 +1204,7 @@ impl Checker<'_> {
         let Some(Ty::TypeValue(id)) = self.lookup(t.name).map(|(v, _)| v.ty.clone()) else {
             return;
         };
-        // Valeurs par défaut : elles voient les autres champs.
+        // Default values: they can see the other fields.
         self.push_scope();
         let fields: Vec<(Symbol, Ty)> = self.types[id]
             .fields
@@ -1223,7 +1223,7 @@ impl Checker<'_> {
                     .find(|(n, _)| *n == f.name)
                     .map(|(_, t)| t.clone())
                     .unwrap_or(Ty::Any);
-                self.expect(d, &ty, &format!(" pour le champ `{}`", self.name(f.name)));
+                self.expect(d, &ty, &format!(" for field `{}`", self.name(f.name)));
             }
         }
         self.pop_scope();
@@ -1234,8 +1234,8 @@ impl Checker<'_> {
                     self.function(f, &sig, Some(Ty::Object(id)));
                 }
                 Member::Stmt(s) => self.error(
-                    "seuls des champs et des méthodes sont permis dans un `type` / une `class` \
-                     (les macros arriveront plus tard)",
+                    "only fields and methods are allowed in a `type` / `class` \
+                     (macros will come later)",
                     s.span,
                 ),
                 Member::Field(f) => self.annotations(&f.annotations),
@@ -1254,7 +1254,7 @@ impl Checker<'_> {
                 self.expect(
                     x,
                     &value_ty,
-                    &format!(" pour la variante `{}`", self.name(v.name)),
+                    &format!(" for variant `{}`", self.name(v.name)),
                 );
             }
             self.annotations(&v.annotations);
@@ -1266,12 +1266,12 @@ impl Checker<'_> {
         self.annotations(&e.annotations);
     }
 
-    /// `@[Nom(args)]` : l'annotation doit être déclarée (`Deprecated` et `Doc` le sont par
-    /// le prélude), ses arguments sont vérifiés comme une construction.
+    /// `@[Name(args)]`: the annotation must be declared (`Deprecated` and `Doc` are, by the
+    /// prelude), and its arguments are checked like a construction.
     fn annotations(&mut self, anns: &[AnnotationUse]) {
         for a in anns {
             let [name] = a.path.as_slice() else { continue };
-            // Déclarée dans ce programme, ou avant (prélude, script précédent).
+            // Declared in this program, or before (prelude, previous script).
             let found = match self.lookup(*name) {
                 Some((v, _)) => Some(v.ty.clone()),
                 None => self.global_ty(*name).map(|(t, _)| t),
@@ -1281,11 +1281,11 @@ impl Checker<'_> {
                     self.construct_args(id, a.args, None, a.span);
                 }
                 Some(_) => {
-                    let msg = format!("`{}` n'est pas une annotation", self.name(*name));
+                    let msg = format!("`{}` is not an annotation", self.name(*name));
                     self.error(msg, a.span);
                 }
                 None => {
-                    let msg = format!("annotation `{}` inconnue", self.name(*name));
+                    let msg = format!("unknown annotation `{}`", self.name(*name));
                     self.error(msg, a.span);
                 }
             }
@@ -1318,7 +1318,7 @@ impl Checker<'_> {
             ExprKind::SelfRef => match self.fns.last().and_then(|f| f.this.clone()) {
                 Some(t) => t,
                 None => {
-                    self.error("`self` ne s'utilise que dans une méthode", span);
+                    self.error("`self` can only be used inside a method", span);
                     Ty::Any
                 }
             },
@@ -1334,7 +1334,7 @@ impl Checker<'_> {
                 let mut tys = Vec::new();
                 for &it in ast.get(items) {
                     tys.push(match &elem_expected {
-                        Some(t) => self.expect(it, t, " dans la liste"),
+                        Some(t) => self.expect(it, t, " in the list"),
                         None => self.expr(it, None),
                     });
                 }
@@ -1377,7 +1377,7 @@ impl Checker<'_> {
                     });
                     if !hashable {
                         let msg = format!(
-                            "une clé de hash doit être nil, bool, int ou str, reçu `{}`",
+                            "a hash key must be nil, bool, int or str, got `{}`",
                             self.show_v(&kt)
                         );
                         self.error(msg, ast.span(k));
@@ -1391,7 +1391,7 @@ impl Checker<'_> {
                 Ty::Hash(Box::new(union(ks)), Box::new(union(vs)))
             }
             ExprKind::Record(fields) => {
-                // Record littéral attendu comme un `type` : il sera converti.
+                // Record literal expected as a `type`: it will be converted.
                 if let Some(id) = expected.and_then(|t| self.data_type_in(t)) {
                     self.record_as_type(id, fields, span);
                     return Ty::Object(id);
@@ -1424,7 +1424,7 @@ impl Checker<'_> {
                             .iter()
                             .any(|m| matches!(m, Ty::Any | Ty::Int | Ty::LitInt(_) | Ty::Float));
                         if !ok {
-                            let msg = format!("`-` attend un nombre, reçu `{}`", self.show_v(&t));
+                            let msg = format!("`-` expects a number, got `{}`", self.show_v(&t));
                             self.error(msg, span);
                         }
                         match t {
@@ -1440,8 +1440,8 @@ impl Checker<'_> {
                 self.binary(op, &l, &r, span)
             }
             ExprKind::Range { lo, hi, .. } => {
-                self.expect(lo, &Ty::Int, " pour un intervalle");
-                self.expect(hi, &Ty::Int, " pour un intervalle");
+                self.expect(lo, &Ty::Int, " for a range");
+                self.expect(hi, &Ty::Int, " for a range");
                 Ty::Range
             }
             ExprKind::Assign { target, op, value } => self.assign(target, op, value),
@@ -1452,7 +1452,7 @@ impl Checker<'_> {
                 block,
             } => {
                 let f = self.expr(callee, None);
-                // Appel d'une fonction nommée : son nom dans les messages.
+                // Call to a named function: its name in the messages.
                 let label = match ast.kind(callee) {
                     ExprKind::Ident(n) => Some(format!("`{}`", self.name(n))),
                     _ => None,
@@ -1489,7 +1489,7 @@ impl Checker<'_> {
                         Some(t) => t.clone(),
                         None => {
                             self.error(
-                                format!("index {idx} hors du tuple (taille {})", ts.len()),
+                                format!("index {idx} out of tuple bounds (length {})", ts.len()),
                                 span,
                             );
                             Ty::Any
@@ -1498,7 +1498,7 @@ impl Checker<'_> {
                     Ty::Any => Ty::Any,
                     r => {
                         let msg =
-                            format!("`.{idx}` s'applique à un tuple, reçu `{}`", self.show_v(&r));
+                            format!("`.{idx}` applies to a tuple, got `{}`", self.show_v(&r));
                         self.error(msg, span);
                         Ty::Any
                     }
@@ -1528,15 +1528,15 @@ impl Checker<'_> {
                 for arm in &x.arms {
                     for &p in ast.get(arm.patterns) {
                         let pt = self.expr(p, None);
-                        // Un motif qui ne peut jamais être égal au sujet (types élargis :
-                        // `case 8080 when 80` n'est pas signalé).
+                        // A pattern that can never equal the subject (widened types:
+                        // `case 8080 when 80` is not reported).
                         let (a, b) = (pt.clone().widen(), subject.clone().widen());
                         let possible = matches!(pt, Ty::Range)
                             || self.assignable(&a, &b)
                             || self.assignable(&b, &a);
                         if !possible {
                             let msg = format!(
-                                "ce motif (`{}`) ne peut pas correspondre à une valeur de type `{}`",
+                                "this pattern (`{}`) cannot match a value of type `{}`",
                                 self.show_v(&pt),
                                 self.show_v(&subject)
                             );
@@ -1579,11 +1579,11 @@ impl Checker<'_> {
             ExprKind::Return(v) => {
                 let expected = self.fns.last().and_then(|f| f.ret.clone());
                 let t = match (v, &expected) {
-                    (Some(v), Some(r)) => self.expect(v, r, " en retour"),
+                    (Some(v), Some(r)) => self.expect(v, r, " for the return value"),
                     (Some(v), None) => self.expr(v, None),
                     (None, Some(r)) => {
                         if !self.assignable(&Ty::Nil, r) {
-                            let msg = format!("`return` sans valeur, `{}` attendu", self.show(r));
+                            let msg = format!("`return` without a value, expected `{}`", self.show(r));
                             self.error(msg, span);
                         }
                         Ty::Nil
@@ -1602,7 +1602,7 @@ impl Checker<'_> {
                     } else {
                         "next"
                     };
-                    self.error(format!("`{kw}` en dehors d'une boucle"), span);
+                    self.error(format!("`{kw}` outside of a loop"), span);
                 }
                 Ty::Never
             }
@@ -1613,7 +1613,7 @@ impl Checker<'_> {
         match self.lookup(name) {
             Some((v, level)) => {
                 if v.pending && level == self.fn_level() {
-                    let msg = format!("`{}` est utilisé avant sa déclaration", self.name(name));
+                    let msg = format!("`{}` is used before its declaration", self.name(name));
                     self.error(msg, span);
                     return Ty::Any;
                 }
@@ -1627,14 +1627,14 @@ impl Checker<'_> {
                     return t;
                 }
                 let hint = suggest(self.name(name), self.known_names());
-                let msg = format!("`{}` n'est pas défini{hint}", self.name(name));
+                let msg = format!("`{}` is not defined{hint}", self.name(name));
                 self.error(msg, span);
                 Ty::Any
             }
         }
     }
 
-    /// Type de l'objet `self` de la méthode courante, s'il en a des champs.
+    /// Type of the current method's `self` object, if it has fields.
     fn this_type(&self) -> Option<TypeId> {
         match self.fns.last()?.this {
             Some(Ty::Object(id)) => Some(id),
@@ -1645,13 +1645,13 @@ impl Checker<'_> {
     fn ivar(&mut self, name: Symbol, span: Span) -> Ty {
         let Some(this) = self.fns.last().and_then(|f| f.this.clone()) else {
             self.error(
-                "`self` et `@champ` ne s'utilisent que dans une méthode",
+                "`self` and `@field` can only be used inside a method",
                 span,
             );
             return Ty::Any;
         };
         let Ty::Object(id) = this else {
-            let msg = format!("`@{}` : `self` n'a pas de champs ici", self.name(name));
+            let msg = format!("`@{}`: `self` has no fields here", self.name(name));
             self.error(msg, span);
             return Ty::Any;
         };
@@ -1665,7 +1665,7 @@ impl Checker<'_> {
                     .collect();
                 let hint = suggest(self.name(name), names);
                 let msg = format!(
-                    "`{}` n'a pas de champ `@{}`{hint}",
+                    "`{}` has no field `@{}`{hint}",
                     self.name(self.types[id].name),
                     self.name(name)
                 );
@@ -1677,7 +1677,7 @@ impl Checker<'_> {
 
     fn path(&mut self, path: &[Symbol], span: Span) -> Ty {
         let [head, variant] = path else {
-            self.error("seuls les chemins `Enum::Variante` sont permis", span);
+            self.error("only `Enum::Variant` paths are allowed", span);
             return Ty::Any;
         };
         let head_ty = match self.lookup(*head).map(|(v, _)| v.ty.clone()) {
@@ -1698,7 +1698,7 @@ impl Checker<'_> {
                         .collect();
                     let hint = suggest(self.name(*variant), names);
                     let msg = format!(
-                        "`{}` n'a pas de variante `{}`{hint}",
+                        "`{}` has no variant `{}`{hint}",
                         self.name(*head),
                         self.name(*variant)
                     );
@@ -1709,7 +1709,7 @@ impl Checker<'_> {
             Some(Ty::Any) => Ty::Any,
             Some(t) => {
                 let msg = format!(
-                    "`{}` n'est pas un enum (`{}`)",
+                    "`{}` is not an enum (`{}`)",
                     self.name(*head),
                     self.show(&t)
                 );
@@ -1717,7 +1717,7 @@ impl Checker<'_> {
                 Ty::Any
             }
             None => {
-                let msg = format!("`{}` n'est pas défini", self.name(*head));
+                let msg = format!("`{}` is not defined", self.name(*head));
                 self.error(msg, span);
                 Ty::Any
             }
@@ -1731,7 +1731,7 @@ impl Checker<'_> {
             And | Or => return union(vec![l.clone(), r.clone()]),
             _ => {}
         }
-        // Résultat pour chaque combinaison possible ; erreur si aucune ne convient.
+        // Result for each possible combination; error if none fits.
         let mut results = Vec::new();
         for a in l.members() {
             for b in r.members() {
@@ -1747,18 +1747,18 @@ impl Checker<'_> {
                 r.members().iter().any(is_str),
             ) {
                 (Add, true, false) | (Add, false, true) => format!(
-                    "`+` entre `{}` et `{}` : utiliser l'interpolation \"#{{x}}\" ou `.to_s()`",
+                    "`+` between `{}` and `{}`: use interpolation \"#{{x}}\" or `.to_s()`",
                     self.show_v(l),
                     self.show_v(r)
                 ),
                 (Lt | Le | Gt | Ge, ..) => format!(
-                    "`{}` ne compare pas `{}` et `{}`",
+                    "`{}` cannot compare `{}` and `{}`",
                     op.as_str(),
                     self.show_v(l),
                     self.show_v(r)
                 ),
                 _ => format!(
-                    "`{}` ne s'applique pas à `{}` et `{}`",
+                    "`{}` does not apply to `{}` and `{}`",
                     op.as_str(),
                     self.show_v(l),
                     self.show_v(r)
@@ -1772,7 +1772,7 @@ impl Checker<'_> {
             && !self.assignable(r, elem)
         {
             let msg = format!(
-                "`<<` ajoute `{}` à une liste de `{}`",
+                "`<<` appends `{}` to a list of `{}`",
                 self.show_v(r),
                 self.show_v(elem)
             );
@@ -1784,18 +1784,18 @@ impl Checker<'_> {
     fn assign(&mut self, target: ExprId, op: Option<BinOp>, value: ExprId) -> Ty {
         let ast = self.ast;
         let tspan = ast.span(target);
-        // Type attendu par la cible.
+        // Type expected by the target.
         let target_ty: Option<Ty> = match ast.kind(target) {
             ExprKind::Ident(name) => match self.lookup(name).map(|(v, l)| (v.clone(), l)) {
                 Some((v, level)) => {
                     if v.pending && level == self.fn_level() {
-                        let msg = format!("`{}` est utilisé avant sa déclaration", self.name(name));
+                        let msg = format!("`{}` is used before its declaration", self.name(name));
                         self.error(msg, tspan);
                     }
                     match v.kind {
                         VarKind::Const | VarKind::Func | VarKind::Type => {
                             let msg = format!(
-                                "`{}` ne peut pas être modifié (constante, fonction ou type)",
+                                "`{}` cannot be modified (constant, function or type)",
                                 self.name(name)
                             );
                             self.error(msg, tspan);
@@ -1808,7 +1808,7 @@ impl Checker<'_> {
                     let (t, mutable) = self.global_ty(name).unwrap();
                     if !mutable {
                         let msg = format!(
-                            "`{}` ne peut pas être modifié (constante, fonction ou type)",
+                            "`{}` cannot be modified (constant, function or type)",
                             self.name(name)
                         );
                         self.error(msg, tspan);
@@ -1818,13 +1818,13 @@ impl Checker<'_> {
                 None => {
                     let n = self.name(name).to_string();
                     if op.is_none() && n.starts_with(|c: char| c.is_ascii_uppercase()) {
-                        // `NOM = valeur` : constante.
+                        // `NAME = value`: constant.
                         let t = self.expr(value, None).widen();
                         self.declare(name, t.clone(), VarKind::Const);
                         return t;
                     }
                     let construct = self.scopes.iter().rev().find_map(|s| s.construct);
-                    // Bloc d'un type inconnu (déjà signalé) : pas d'erreur en cascade.
+                    // Block of an unknown type (already reported): no cascading error.
                     if construct == Some(UNKNOWN_TYPE) {
                         let t = self.expr(value, None).widen();
                         self.declare(name, t.clone(), VarKind::Field);
@@ -1839,14 +1839,14 @@ impl Checker<'_> {
                                 .collect();
                             let hint = suggest(&n, fields);
                             format!(
-                                "`{n}` n'est ni un champ de `{}` ni une variable déclarée{hint} \
-                                 (utiliser `let {n} = …` pour une variable locale)",
+                                "`{n}` is neither a field of `{}` nor a declared variable{hint} \
+                                 (use `let {n} = …` for a local variable)",
                                 self.name(self.types[id].name)
                             )
                         }
                         None => {
                             let hint = suggest(&n, self.known_names());
-                            format!("`{n}` n'est pas déclaré : utiliser `let {n} = …`{hint}")
+                            format!("`{n}` is not declared: use `let {n} = …`{hint}")
                         }
                     };
                     self.error(msg, tspan);
@@ -1876,7 +1876,7 @@ impl Checker<'_> {
                 let result = self.binary(op, &target_ty, &v, ast.span(value).to(tspan));
                 if !self.assignable(&result, &target_ty) {
                     let msg = format!(
-                        "type attendu `{}`, reçu `{}`",
+                        "expected type `{}`, got `{}`",
                         self.show(&target_ty),
                         self.show(&result)
                     );
@@ -1887,9 +1887,9 @@ impl Checker<'_> {
         }
     }
 
-    // ─── Appels ──────────────────────────────────────────────────────────────
+    // ─── Calls ───────────────────────────────────────────────────────────────
 
-    /// Appel de `f`. `this` : receveur d'une méthode déclarée (pour les messages).
+    /// Call of `f`. `this`: receiver of a declared method (for messages).
     fn call(
         &mut self,
         f: &Ty,
@@ -1901,7 +1901,7 @@ impl Checker<'_> {
         match f {
             Ty::Fn(sig) => {
                 let sig = sig.clone();
-                self.check_args(&sig, args, block, span, method.unwrap_or("la fonction"));
+                self.check_args(&sig, args, block, span, method.unwrap_or("the function"));
                 sig.ret.borrow().clone()
             }
             Ty::TypeValue(id) => {
@@ -1924,7 +1924,7 @@ impl Checker<'_> {
                 Ty::Object(id)
             }
             Ty::Any => {
-                // Peut-être la construction d'un type inconnu : bloc analysé avec indulgence.
+                // Possibly the construction of an unknown type: block checked leniently.
                 for a in self.ast.get(args) {
                     self.expr(a.value, None);
                 }
@@ -1947,7 +1947,7 @@ impl Checker<'_> {
             }
             t => {
                 self.args_any(args, block);
-                let msg = format!("`{}` n'est pas une fonction", self.show_v(t));
+                let msg = format!("`{}` is not a function", self.show_v(t));
                 self.error(msg, span);
                 Ty::Any
             }
@@ -1978,9 +1978,9 @@ impl Checker<'_> {
         if !sig.lenient && positional > sig.params.len() {
             self.error(
                 format!(
-                    "{what} attend {} argument{}, reçu {positional}",
+                    "{what} expects {} argument{}, got {positional}",
                     sig.params.len(),
-                    if sig.params.len() > 1 { "s" } else { "" }
+                    if sig.params.len() != 1 { "s" } else { "" }
                 ),
                 span,
             );
@@ -2000,7 +2000,7 @@ impl Checker<'_> {
                         let names: Vec<&str> =
                             sig.params.iter().map(|p| self.name(p.name)).collect();
                         let hint = suggest(self.name(n), names);
-                        let msg = format!("{what} n'a pas de paramètre `{}`{hint}", self.name(n));
+                        let msg = format!("{what} has no parameter `{}`{hint}", self.name(n));
                         self.error(msg, ast.span(a.value));
                         None
                     }
@@ -2009,16 +2009,16 @@ impl Checker<'_> {
             match param {
                 Some((i, p)) => {
                     if given[i] {
-                        let msg = format!("argument `{}` donné deux fois", self.name(p.name));
+                        let msg = format!("argument `{}` given twice", self.name(p.name));
                         self.error(msg, ast.span(a.value));
                     }
                     let key = (sig as *const FnSig as usize, i);
                     if let Some(dep) = self.deprecated_params.get(&key).cloned() {
-                        let param = format!("le paramètre `{}` de {what}", self.name(p.name));
+                        let param = format!("parameter `{}` of {what}", self.name(p.name));
                         self.warn_deprecated(Some(&dep), &param, ast.span(a.value));
                     }
                     given[i] = true;
-                    let label = format!(" pour `{}`", self.name(p.name));
+                    let label = format!(" for `{}`", self.name(p.name));
                     self.expect(a.value, &p.ty.clone(), &label);
                 }
                 None => {
@@ -2037,14 +2037,14 @@ impl Checker<'_> {
         if !sig.lenient {
             for (p, g) in sig.params.iter().zip(&given) {
                 if !g && !p.has_default {
-                    let msg = format!("argument `{}` manquant pour {what}", self.name(p.name));
+                    let msg = format!("missing argument `{}` for {what}", self.name(p.name));
                     self.error(msg, span);
                 }
             }
         }
     }
 
-    /// Construction d'un `type` (ou d'une `class` sans `init`) : arguments et bloc.
+    /// Construction of a `type` (or a `class` without `init`): arguments and block.
     fn construct_args(
         &mut self,
         id: TypeId,
@@ -2065,8 +2065,8 @@ impl Checker<'_> {
                     if i >= nfields {
                         self.error(
                             format!(
-                                "`{tname}` a {nfields} champ{}, trop d'arguments",
-                                if nfields > 1 { "s" } else { "" }
+                                "`{tname}` has {nfields} field{}, too many arguments",
+                                if nfields != 1 { "s" } else { "" }
                             ),
                             ast.span(a.value),
                         );
@@ -2084,7 +2084,7 @@ impl Checker<'_> {
                             .map(|f| self.name(f.name))
                             .collect();
                         let hint = suggest(self.name(n), names);
-                        let msg = format!("`{tname}` n'a pas de champ `{}`{hint}", self.name(n));
+                        let msg = format!("`{tname}` has no field `{}`{hint}", self.name(n));
                         self.error(msg, ast.span(a.value));
                     }
                     idx
@@ -2099,7 +2099,7 @@ impl Checker<'_> {
                     };
                     let what = format!("`{tname}.{}`", self.name(fname));
                     self.warn_deprecated(dep.as_ref(), &what, ast.span(a.value));
-                    let label = format!(" pour le champ `{}`", self.name(fname));
+                    let label = format!(" for field `{}`", self.name(fname));
                     self.expect(a.value, &fty, &label);
                 }
                 None => {
@@ -2112,8 +2112,8 @@ impl Checker<'_> {
                 let l = ast.lambda(b);
                 if let Some(p) = l.params.first() {
                     self.error(
-                        "un bloc de construction ne prend pas de paramètre : les champs sont \
-                         directement accessibles",
+                        "a construction block takes no parameters: the fields are \
+                         directly accessible",
                         p.span,
                     );
                 }
@@ -2130,7 +2130,7 @@ impl Checker<'_> {
                 self.block_stmts(&l.body);
                 self.pop_scope();
             }
-            // Sans bloc, les champs obligatoires doivent être donnés.
+            // Without a block, required fields must be given.
             None => {
                 let missing: Vec<Symbol> = self.types[id]
                     .fields
@@ -2141,7 +2141,7 @@ impl Checker<'_> {
                     .collect();
                 for name in missing {
                     let msg = format!(
-                        "champ `{}` obligatoire pour construire `{tname}`",
+                        "field `{}` is required to construct `{tname}`",
                         self.name(name)
                     );
                     self.error(msg, span);
@@ -2150,7 +2150,7 @@ impl Checker<'_> {
         }
     }
 
-    /// `type` (non `class`) parmi les types possibles de `t`.
+    /// A `type` (not a `class`) among the possible types of `t`.
     fn data_type_in(&self, t: &Ty) -> Option<TypeId> {
         t.members().iter().find_map(|m| match m {
             Ty::Object(id) if self.types[*id].kind != TypeDeclKind::Class => Some(*id),
@@ -2158,7 +2158,7 @@ impl Checker<'_> {
         })
     }
 
-    /// Record littéral converti vers le `type` `id` : champs connus, types, obligatoires.
+    /// Record literal converted to `type` `id`: known fields, types, required ones.
     fn record_as_type(&mut self, id: TypeId, fields: Slice<(Symbol, ExprId)>, span: Span) {
         let ast = self.ast;
         let tname = self.name(self.types[id].name).to_string();
@@ -2172,7 +2172,7 @@ impl Checker<'_> {
             {
                 Some(fty) => {
                     given.push(n);
-                    let label = format!(" pour le champ `{}`", self.name(n));
+                    let label = format!(" for field `{}`", self.name(n));
                     self.expect(v, &fty, &label);
                 }
                 None => {
@@ -2182,7 +2182,7 @@ impl Checker<'_> {
                         .map(|f| self.name(f.name))
                         .collect();
                     let hint = suggest(self.name(n), names);
-                    let msg = format!("`{tname}` n'a pas de champ `{}`{hint}", self.name(n));
+                    let msg = format!("`{tname}` has no field `{}`{hint}", self.name(n));
                     self.error(msg, ast.span(v));
                 }
             }
@@ -2195,14 +2195,14 @@ impl Checker<'_> {
             .collect();
         for name in missing {
             let msg = format!(
-                "champ `{}` obligatoire pour construire `{tname}`",
+                "field `{}` is required to construct `{tname}`",
                 self.name(name)
             );
             self.error(msg, span);
         }
     }
 
-    /// Lambda, avec les types de paramètres attendus s'ils sont connus.
+    /// Lambda, with the expected parameter types if known.
     fn lambda(&mut self, id: LambdaId, expected: Option<&Ty>) -> Ty {
         let l = self.ast.lambda(id);
         let exp_params: Vec<Ty> = match expected {
@@ -2233,7 +2233,7 @@ impl Checker<'_> {
         Ty::Fn(Rc::new(sig))
     }
 
-    /// Signature d'un lambda attendu par une méthode intégrée : paramètres `params`.
+    /// Signature of a lambda expected by a built-in method: parameters `params`.
     fn fn_of(params: Vec<Ty>) -> Ty {
         Ty::Fn(Rc::new(FnSig {
             params: params
@@ -2257,7 +2257,7 @@ impl Checker<'_> {
         }
     }
 
-    // ─── Champs et méthodes ──────────────────────────────────────────────────
+    // ─── Fields and methods ──────────────────────────────────────────────────
 
     fn field_ty(&mut self, r: &Ty, name: Symbol, span: Span) -> Ty {
         let n = self.name(name).to_string();
@@ -2268,7 +2268,7 @@ impl Checker<'_> {
                 None => {
                     let names: Vec<&str> = fs.iter().map(|(m, _)| self.name(*m)).collect();
                     let hint = suggest(&n, names);
-                    self.error(format!("le record n'a pas de champ `{n}`{hint}"), span);
+                    self.error(format!("the record has no field `{n}`{hint}"), span);
                     Ty::Any
                 }
             },
@@ -2298,7 +2298,7 @@ impl Checker<'_> {
                     }
                     (Some(_), _) => {
                         let msg = format!(
-                            "`{n}` est un champ privé de `{}` : définir `def {n} = @{n}` pour le lire",
+                            "`{n}` is a private field of `{}`: define `def {n} = @{n}` to read it",
                             self.name(def.name)
                         );
                         self.error(msg, span);
@@ -2312,7 +2312,7 @@ impl Checker<'_> {
                             .chain(def.methods.keys().map(|m| self.name(*m)))
                             .collect();
                         let hint = suggest(&n, names);
-                        let msg = format!("`{}` n'a pas de champ `{n}`{hint}", self.name(def.name));
+                        let msg = format!("`{}` has no field `{n}`{hint}", self.name(def.name));
                         self.error(msg, span);
                         Ty::Any
                     }
@@ -2325,7 +2325,7 @@ impl Checker<'_> {
                     Some(sig) => sig.ret.borrow().clone(),
                     None => {
                         let msg = format!(
-                            "`{}` n'a pas de champ `{n}` (`.value`, `.name`)",
+                            "`{}` has no field `{n}` (`.value`, `.name`)",
                             self.name(self.enums[*id].name)
                         );
                         self.error(msg, span);
@@ -2336,9 +2336,9 @@ impl Checker<'_> {
             t => {
                 let has_method = self.builtin_methods(t).contains(&n.as_str());
                 let msg = if has_method {
-                    format!("`{n}` est une méthode : écrire `.{n}()`")
+                    format!("`{n}` is a method: write `.{n}()`")
                 } else {
-                    format!("`{}` n'a pas de champ `{n}`", self.show_v(t))
+                    format!("`{}` has no field `{n}`", self.show_v(t))
                 };
                 self.error(msg, span);
                 Ty::Any
@@ -2346,7 +2346,7 @@ impl Checker<'_> {
         }
     }
 
-    /// Type attendu par `recv.nom = valeur`.
+    /// Type expected by `recv.name = value`.
     fn field_target(&mut self, r: &Ty, name: Symbol, span: Span) -> Ty {
         let n = self.name(name).to_string();
         if let Ty::Object(id) = r {
@@ -2364,7 +2364,7 @@ impl Checker<'_> {
             {
                 {
                     let msg = format!(
-                        "`{n}` est un champ privé de `{}` : définir `def {n}=(valeur)` pour le modifier",
+                        "`{n}` is a private field of `{}`: define `def {n}=(value)` to modify it",
                         self.name(def.name)
                     );
                     self.error(msg, span);
@@ -2395,7 +2395,7 @@ impl Checker<'_> {
         span: Span,
     ) -> Ty {
         let n = self.name(name).to_string();
-        // Méthodes déclarées, champs fonctions, enums.
+        // Declared methods, function fields, enums.
         match r {
             Ty::Any | Ty::Union(_) | Ty::Never => {
                 self.args_any(args, block);
@@ -2450,7 +2450,7 @@ impl Checker<'_> {
                     "from" => Ty::optional(Ty::Variant(id)),
                     _ => {
                         let msg = format!(
-                            "`{}` n'a pas de méthode `{n}` (`values()`, `from(valeur)`)",
+                            "`{}` has no method `{n}` (`values()`, `from(value)`)",
                             self.name(self.enums[id].name)
                         );
                         self.error(msg, span);
@@ -2463,7 +2463,7 @@ impl Checker<'_> {
         self.builtin_method(r, &n, args, block, span)
     }
 
-    /// Méthodes intégrées : vérifie le nombre et le type des arguments, renvoie le résultat.
+    /// Built-in methods: checks the number and types of arguments, returns the result.
     fn builtin_method(
         &mut self,
         r: &Ty,
@@ -2477,13 +2477,13 @@ impl Checker<'_> {
         if let Some(a) = arg_list.iter().find(|a| a.name.is_some()) {
             self.error(
                 format!(
-                    "les méthodes intégrées n'acceptent pas d'argument nommé (`{}`)",
+                    "built-in methods do not accept named arguments (`{}`)",
                     self.name(a.name.unwrap())
                 ),
                 ast.span(a.value),
             );
         }
-        // Arguments : expressions, puis le bloc `do` éventuel.
+        // Arguments: expressions, then the optional `do` block.
         let mut exprs: Vec<Option<ExprId>> = arg_list.iter().map(|a| Some(a.value)).collect();
         if block.is_some() {
             exprs.push(None);
@@ -2496,7 +2496,7 @@ impl Checker<'_> {
         };
         let str_ty = matches!(r, Ty::Str | Ty::LitStr(_));
         let num = matches!(r, Ty::Int | Ty::LitInt(_) | Ty::Float);
-        // (types attendus des arguments : Some = nombre fixe, résultat)
+        // (expected argument types: Some = fixed count, result)
         let sig: Option<(Vec<Ty>, Ty)> = match (n, r) {
             ("to_s" | "inspect", _) => Some((vec![], Ty::Str)),
             ("call", Ty::Fn(f)) => {
@@ -2524,7 +2524,7 @@ impl Checker<'_> {
             }
             ("split", _) if str_ty => {
                 if count > 1 {
-                    self.error("`split(séparateur?)` attend 0 ou 1 argument", span);
+                    self.error("`split(separator?)` expects 0 or 1 argument", span);
                 }
                 if let Some(Some(e)) = exprs.first() {
                     self.expect(*e, &Ty::Str, "");
@@ -2542,7 +2542,7 @@ impl Checker<'_> {
             ("contains", Ty::Range) => Some((vec![Ty::Int], Ty::Bool)),
             ("join", Ty::List(_)) => {
                 if count > 1 {
-                    self.error("`join(séparateur?)` attend 0 ou 1 argument", span);
+                    self.error("`join(separator?)` expects 0 or 1 argument", span);
                 }
                 if let Some(Some(e)) = exprs.first() {
                     self.expect(*e, &Ty::Str, "");
@@ -2563,7 +2563,7 @@ impl Checker<'_> {
             ("map" | "filter" | "each" | "find" | "any" | "all", Ty::List(_) | Ty::Range) => {
                 let elem = elem.clone().unwrap();
                 if count != 1 {
-                    self.error(format!("`{n}` attend 1 argument, reçu {count}"), span);
+                    self.error(format!("`{n}` expects 1 argument, got {count}"), span);
                 }
                 let f = self.fn_arg(
                     exprs.first().copied().flatten(),
@@ -2582,7 +2582,7 @@ impl Checker<'_> {
                 let elem = elem.clone().unwrap();
                 if count != 2 {
                     self.error(
-                        format!("`reduce(initial, f)` attend 2 arguments, reçu {count}"),
+                        format!("`reduce(initial, f)` expects 2 arguments, got {count}"),
                         span,
                     );
                 }
@@ -2611,7 +2611,7 @@ impl Checker<'_> {
             )),
             ("get", Ty::Hash(k, v)) => {
                 if !(1..=2).contains(&count) {
-                    self.error("`get(clé, défaut?)` attend 1 ou 2 arguments", span);
+                    self.error("`get(key, default?)` expects 1 or 2 arguments", span);
                 }
                 if let Some(Some(e)) = exprs.first() {
                     self.expect(*e, k, "");
@@ -2626,7 +2626,7 @@ impl Checker<'_> {
             }
             ("each", Ty::Hash(k, v)) => {
                 if count != 1 {
-                    self.error(format!("`each` attend 1 argument, reçu {count}"), span);
+                    self.error(format!("`each` expects 1 argument, got {count}"), span);
                 }
                 self.fn_arg(
                     exprs.first().copied().flatten(),
@@ -2642,9 +2642,9 @@ impl Checker<'_> {
                 if count != params.len() {
                     self.error(
                         format!(
-                            "`{n}` attend {} argument{}, reçu {count}",
+                            "`{n}` expects {} argument{}, got {count}",
                             params.len(),
-                            if params.len() > 1 { "s" } else { "" }
+                            if params.len() != 1 { "s" } else { "" }
                         ),
                         span,
                     );
@@ -2672,14 +2672,14 @@ impl Checker<'_> {
                     self.lambda(b, None);
                 }
                 let hint = suggest(n, self.builtin_methods(r).iter().copied());
-                let msg = format!("`{}` n'a pas de méthode `{n}`{hint}", self.show_v(r));
+                let msg = format!("`{}` has no method `{n}`{hint}", self.show_v(r));
                 self.error(msg, span);
                 Ty::Any
             }
         }
     }
 
-    /// Argument fonction d'une méthode intégrée (lambda en argument ou bloc `do`).
+    /// Function argument of a built-in method (lambda argument or `do` block).
     fn fn_arg(&mut self, e: Option<ExprId>, block: Option<LambdaId>, expected: Ty) -> Ty {
         match (e, block) {
             (Some(e), _) => self.expect(e, &expected, ""),
@@ -2698,9 +2698,9 @@ impl Checker<'_> {
         if !f.lenient && exprs.len() > f.params.len() {
             self.error(
                 format!(
-                    "la fonction attend {} argument{}, reçu {}",
+                    "the function expects {} argument{}, got {}",
                     f.params.len(),
-                    if f.params.len() > 1 { "s" } else { "" },
+                    if f.params.len() != 1 { "s" } else { "" },
                     exprs.len()
                 ),
                 span,
@@ -2724,14 +2724,14 @@ impl Checker<'_> {
             Ty::Any | Ty::Union(_) => Ty::Any,
             Ty::List(t) => {
                 if !self.assignable(i, &Ty::Int) {
-                    let msg = format!("un index doit être un entier, reçu `{}`", self.show_v(i));
+                    let msg = format!("an index must be an integer, got `{}`", self.show_v(i));
                     self.error(msg, ispan);
                 }
                 (**t).clone()
             }
             Ty::Str | Ty::LitStr(_) => {
                 if !self.assignable(i, &Ty::Int) {
-                    let msg = format!("un index doit être un entier, reçu `{}`", self.show_v(i));
+                    let msg = format!("an index must be an integer, got `{}`", self.show_v(i));
                     self.error(msg, ispan);
                 }
                 Ty::Str
@@ -2743,7 +2743,7 @@ impl Checker<'_> {
                     match usize::try_from(pos).ok().and_then(|p| ts.get(p)) {
                         Some(t) => t.clone(),
                         None => {
-                            self.error(format!("index {n} hors du tuple (taille {len})"), span);
+                            self.error(format!("index {n} out of tuple bounds (length {len})"), span);
                             Ty::Any
                         }
                     }
@@ -2753,7 +2753,7 @@ impl Checker<'_> {
             Ty::Hash(k, v) => {
                 if !self.assignable(i, k) {
                     let msg = format!(
-                        "clé de type `{}` attendue, reçu `{}`",
+                        "expected key of type `{}`, got `{}`",
                         self.show(k),
                         self.show(i)
                     );
@@ -2762,14 +2762,14 @@ impl Checker<'_> {
                 Ty::optional((**v).clone())
             }
             t => {
-                let msg = format!("`{}` ne s'indexe pas avec `[…]`", self.show_v(t));
+                let msg = format!("`{}` cannot be indexed with `[…]`", self.show_v(t));
                 self.error(msg, span);
                 Ty::Any
             }
         }
     }
 
-    /// Types des variables d'un `for` selon ce qui est parcouru.
+    /// Types of a `for` loop's variables, depending on what is iterated.
     fn for_vars(&mut self, it: &Ty, n: usize, span: Span) -> Vec<Ty> {
         let elem: Ty = match it {
             Ty::List(t) => (**t).clone(),
@@ -2781,7 +2781,7 @@ impl Checker<'_> {
                     2 => vec![(**k).clone(), (**v).clone()],
                     _ => {
                         self.error(
-                            format!("un hash se parcourt avec 1 ou 2 variables, pas {n}"),
+                            format!("a hash is iterated with 1 or 2 variables, not {n}"),
                             span,
                         );
                         vec![Ty::Any; n]
@@ -2791,7 +2791,7 @@ impl Checker<'_> {
             Ty::Any | Ty::Union(_) | Ty::Tuple(_) => Ty::Any,
             t => {
                 let msg = format!(
-                    "`for` ne peut pas parcourir une valeur de type `{}`",
+                    "`for` cannot iterate over a value of type `{}`",
                     self.show_v(t)
                 );
                 self.error(msg, span);
@@ -2806,14 +2806,14 @@ impl Checker<'_> {
             Ty::Any => vec![Ty::Any; n],
             Ty::Tuple(ts) => {
                 self.error(
-                    format!("{n} variables pour des tuples de {} valeurs", ts.len()),
+                    format!("{n} variables for tuples of {} values", ts.len()),
                     span,
                 );
                 vec![Ty::Any; n]
             }
             t => {
                 let msg = format!(
-                    "{n} variables attendent un tuple à chaque tour, reçu `{}`",
+                    "{n} variables expect a tuple on each iteration, got `{}`",
                     self.show(&t)
                 );
                 self.error(msg, span);
@@ -2827,7 +2827,7 @@ fn is_str(t: &Ty) -> bool {
     matches!(t, Ty::Str | Ty::LitStr(_))
 }
 
-/// Résultat de `a op b` pour deux types précis, `None` si l'opération est impossible.
+/// Result of `a op b` for two specific types, `None` if the operation is impossible.
 fn binary_result(op: BinOp, a: &Ty, b: &Ty) -> Option<Ty> {
     use BinOp::*;
     use Ty::*;
@@ -2874,7 +2874,7 @@ fn tail_expr(b: &Block) -> Option<ExprId> {
     }
 }
 
-/// Type statique d'une valeur déjà calculée (variable globale).
+/// Static type of an already computed value (global variable).
 fn value_ty(v: &Value) -> Ty {
     match v {
         Value::Nil => Ty::Any,
@@ -2887,7 +2887,7 @@ fn value_ty(v: &Value) -> Ty {
     }
 }
 
-/// Littéraux remplacés par leur type (`"a"` → `str`), récursivement.
+/// Literals replaced by their type (`"a"` → `str`), recursively.
 fn plain(t: &Ty) -> Ty {
     match t {
         Ty::LitStr(_) => Ty::Str,

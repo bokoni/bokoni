@@ -1,9 +1,9 @@
-//! Interpréteur de l'IR.
+//! IR interpreter.
 //!
-//! Chaque appel réserve une fenêtre de registres sur une pile de valeurs partagée
-//! (`stack`), puis exécute les blocs de base de la fonction. Les registres typés
-//! contiennent toujours une valeur du bon type (`Value::Int` dans un registre `int`) :
-//! les instructions spécialisées (`IBin`) n'ont pas à vérifier le type.
+//! Each call reserves a window of registers on a shared value stack (`stack`), then runs
+//! the function's basic blocks. Typed registers always hold a value of the right type
+//! (`Value::Int` in an `int` register), so specialized instructions (`IBin`) need not
+//! check the type.
 
 use crate::ast::{BinOp, TypeDeclKind};
 use crate::diagnostic::Error;
@@ -17,24 +17,23 @@ use crate::value::{Function, HashMap, Range, Record, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Cellule d'une variable capturée par une closure.
+/// Cell of a variable captured by a closure.
 pub type Cell = Rc<RefCell<Value>>;
 
-/// Fonction ou lambda du script : son code et ses variables capturées.
+/// Script function or lambda: its code and its captured variables.
 pub struct Closure {
     pub proto: Rc<Proto>,
     pub upvals: Box<[Cell]>,
-    /// Constructions en cours au moment de la création (blocs `do` imbriqués).
+    /// Constructions in progress when it was created (nested `do` blocks).
     pub ctx: Rc<[u32]>,
 }
 
-/// Arguments évalués d'un appel.
+/// Evaluated arguments of a call.
 pub struct CallArgs {
     pub pos: Vec<Value>,
     pub named: Vec<(Symbol, Value)>,
-    /// Forme littérale de chaque argument (positionnels puis nommés), pour convertir un
-    /// record littéral vers le type attendu. Vide pour un appel depuis Rust ou une
-    /// méthode intégrée.
+    /// Literal shape of each argument (positional then named), used to convert a record
+    /// literal to the expected type. Empty for a call from Rust or a built-in method.
     pub shapes: Vec<Option<Rc<Shape>>>,
 }
 
@@ -48,7 +47,7 @@ impl CallArgs {
     }
 }
 
-/// État d'un itérateur de boucle `for` (copie des éléments au début de la boucle).
+/// State of a `for` loop iterator (elements copied when the loop starts).
 pub enum IterState {
     Values(std::vec::IntoIter<Value>),
     Range(std::ops::RangeInclusive<i64>),
@@ -56,36 +55,36 @@ pub enum IterState {
 
 const RED_ZONE: usize = 256 * 1024;
 const STACK_GROW: usize = 2 * 1024 * 1024;
-/// La pile n'est examinée qu'une fois tous les `STACK_CHECK` niveaux d'appel : la zone
-/// de réserve couvre largement ces appels (moins de 32 Kio chacun).
+/// The stack is only checked once every `STACK_CHECK` call levels: the red zone easily
+/// covers those calls (under 32 KiB each).
 const STACK_CHECK: usize = 8;
 
-/// État de l'interpréteur : noms, variables globales, sortie de `print`.
+/// Interpreter state: names, global variables, `print` output.
 pub struct Runtime {
     pub interner: Interner,
     pub globals: Globals,
     pub output: Box<dyn FnMut(&str)>,
-    /// Profondeur d'appels maximale (protège contre la récursion infinie).
+    /// Maximum call depth (guards against infinite recursion).
     pub max_depth: usize,
     pub(crate) depth: usize,
     pub(crate) methods: FxHashMap<Symbol, (Method, &'static str)>,
-    /// Constructions de `type` en cours (blocs `Server do … end` imbriqués).
+    /// `type` constructions in progress (nested `Server do … end` blocks).
     pub(crate) constructs: Vec<ConstructCtx>,
     pub(crate) next_ctx: u32,
     pub(crate) syms: Syms,
-    /// Fenêtres de registres libres, réutilisées d'un appel à l'autre (pas d'allocation
-    /// par appel en régime établi).
+    /// Free register windows, reused from one call to the next (no per-call allocation
+    /// in steady state).
     frames: Vec<Vec<Value>>,
     no_ctx: Rc<[u32]>,
-    /// Compilation native des fonctions typées (créée au premier besoin).
+    /// Native compilation of typed functions (created on first use).
     pub jit_enabled: bool,
-    /// Compilation de base dès le premier appel (tests).
+    /// Baseline compilation from the first call (tests).
     pub jit_eager: bool,
-    /// Tampon de l'interpolation de chaînes.
+    /// String interpolation buffer.
     concat_buf: String,
     #[cfg(feature = "jit")]
     jit: Option<crate::jit::Jit>,
-    /// Erreur levée pendant l'exécution de code natif de base, en attente de remontée.
+    /// Error raised while running baseline native code, waiting to be propagated.
     #[cfg(feature = "jit")]
     pending: Option<Error>,
 }
@@ -96,7 +95,7 @@ impl Default for Runtime {
     }
 }
 
-/// Rattache le source du script à une erreur qui n'en a pas encore.
+/// Attaches the script source to an error that has none yet.
 fn attach_src(mut e: Error, sc: &Script) -> Error {
     if e.src.is_none() {
         e.src = Some((sc.name.clone(), sc.src.clone()));
@@ -143,7 +142,7 @@ impl Runtime {
         self.interner.resolve(s)
     }
 
-    /// Exécute le programme principal d'un script.
+    /// Runs a script's main program.
     pub fn run(&mut self, main: &Rc<Proto>) -> Result<Value, Error> {
         self.depth = 0;
         let ctx = self.no_ctx.clone();
@@ -158,21 +157,21 @@ impl Runtime {
         .map_err(|e| attach_src(e, &main.script))
     }
 
-    // ─── Appels ──────────────────────────────────────────────────────────────
+    // ─── Calls ───────────────────────────────────────────────────────────────
 
-    /// Appelle une valeur : fonction, lambda, fonction Rust, ou type (construction).
+    /// Calls a value: function, lambda, Rust function, or type (construction).
     pub fn call_value(&mut self, f: &Value, args: CallArgs, span: Span) -> R {
         let func = match f {
             Value::Function(func) => func,
             Value::Type(info) => return self.construct(info, args, None, span),
-            _ => return type_err(format!("{} n'est pas une fonction", f.type_label()), span),
+            _ => return type_err(format!("{} is not a function", f.type_label()), span),
         };
         match &**func {
             Function::Native(n) => {
                 if let Some(&(name, _)) = args.named.first() {
                     return rt_err(
                         format!(
-                            "`{}` (fonction Rust) n'accepte pas d'argument nommé (`{}`)",
+                            "`{}` (Rust function) does not accept named arguments (`{}`)",
                             n.name,
                             self.name(name)
                         ),
@@ -186,7 +185,7 @@ impl Runtime {
         }
     }
 
-    /// Appelle une méthode déclarée (`type`, `class`, `enum`) avec `self` = `this`.
+    /// Calls a declared method (`type`, `class`, `enum`) with `self` = `this`.
     pub(crate) fn call_method(
         &mut self,
         this: Value,
@@ -198,7 +197,7 @@ impl Runtime {
         self.invoke(m, &[], &ctx, Some(this), args, span)
     }
 
-    /// Exécute une fonction : liaison des arguments, puis ses blocs.
+    /// Runs a function: binds the arguments, then runs its blocks.
     pub(crate) fn invoke(
         &mut self,
         proto: &Rc<Proto>,
@@ -213,8 +212,8 @@ impl Runtime {
         })
     }
 
-    /// Appel rapide : arguments positionnels, autant que de paramètres, lus directement
-    /// dans les registres de l'appelant.
+    /// Fast call: positional arguments, as many as parameters, read directly from the
+    /// caller's registers.
     pub(crate) fn invoke_regs(&mut self, c: &Closure, args: &[Value], span: Span) -> R {
         #[cfg(feature = "jit")]
         if let Some(r) = self.invoke_native(c, args, span) {
@@ -243,7 +242,7 @@ impl Runtime {
         if self.depth >= self.max_depth {
             return rt_err(
                 format!(
-                    "trop d'appels imbriqués ({}) : récursion infinie ?",
+                    "too many nested calls ({}): infinite recursion?",
                     self.max_depth
                 ),
                 span,
@@ -272,7 +271,7 @@ impl Runtime {
         r.map_err(|e| self.traced(e, proto, span))
     }
 
-    /// Erreur sortant de `proto` : source et appel ajoutés à la pile.
+    /// Error leaving `proto`: source and call added to the trace.
     #[cold]
     fn traced(&self, mut e: Error, proto: &Proto, span: Span) -> Error {
         if proto.kind != ProtoKind::Main {
@@ -284,9 +283,9 @@ impl Runtime {
         e
     }
 
-    /// Range les arguments dans les registres des paramètres (avec vérification des
-    /// annotations). Un paramètre absent qui a une valeur par défaut reste « non
-    /// fourni » : le début de la fonction la calcule.
+    /// Stores the arguments in the parameter registers (checking annotations). A missing
+    /// parameter that has a default value stays "not provided": the function's prologue
+    /// computes it.
     fn bind(
         &mut self,
         proto: &Proto,
@@ -301,7 +300,7 @@ impl Runtime {
         if let Some(t) = this {
             regs[0] = t;
         }
-        // Cas courant : uniquement des arguments positionnels, autant que de paramètres.
+        // Common case: only positional arguments, as many as parameters.
         if named.is_empty() && pos.len() == params.len() && shapes.iter().all(Option::is_none) {
             for (p, v) in params.iter().zip(pos) {
                 let v = match &p.ty {
@@ -315,10 +314,10 @@ impl Runtime {
         if !lenient && pos.len() > params.len() {
             return rt_err(
                 format!(
-                    "`{}` attend {} argument{}, reçu {}",
+                    "`{}` expects {} argument{}, got {}",
                     proto.name,
                     params.len(),
-                    if params.len() > 1 { "s" } else { "" },
+                    if params.len() == 1 { "" } else { "s" },
                     pos.len()
                 ),
                 span,
@@ -327,7 +326,7 @@ impl Runtime {
         for (n, _) in &named {
             if !params.iter().any(|p| p.name == *n) {
                 return rt_err(
-                    format!("`{}` n'a pas de paramètre `{}`", proto.name, self.name(*n)),
+                    format!("`{}` has no parameter `{}`", proto.name, self.name(*n)),
                     span,
                 );
             }
@@ -342,7 +341,7 @@ impl Runtime {
                 .position(|x| x.as_ref().is_some_and(|(n, _)| *n == p.name));
             if given.is_some() && named_i.is_some() {
                 return rt_err(
-                    format!("argument `{}` donné deux fois", self.name(p.name)),
+                    format!("argument `{}` given twice", self.name(p.name)),
                     span,
                 );
             }
@@ -357,7 +356,7 @@ impl Runtime {
                 (None, None) => {
                     return rt_err(
                         format!(
-                            "argument `{}` manquant pour `{}`",
+                            "missing argument `{}` for `{}`",
                             self.name(p.name),
                             proto.name
                         ),
@@ -396,7 +395,7 @@ impl Runtime {
         CallArgs { pos, named, shapes }
     }
 
-    // ─── Exécution ───────────────────────────────────────────────────────────
+    // ─── Execution ───────────────────────────────────────────────────────────
 
     fn exec(&mut self, proto: &Proto, upvals: &[Cell], ctx: &Rc<[u32]>, regs: &mut [Value]) -> R {
         let mut cells: Vec<Cell> = (0..proto.ncells)
@@ -430,7 +429,7 @@ impl Runtime {
                     else_,
                 } => {
                     let (Value::Int(x), Value::Int(y)) = (&reg!(*a), &reg!(*y)) else {
-                        unreachable!("registre int qui ne contient pas un int")
+                        unreachable!("int register that does not hold an int")
                     };
                     b = if int_cmp(*op, *x, *y) { *then } else { *else_ } as usize;
                 }
@@ -442,7 +441,7 @@ impl Runtime {
                     else_,
                 } => {
                     let Value::Int(x) = reg!(*a) else {
-                        unreachable!("registre int qui ne contient pas un int")
+                        unreachable!("int register that does not hold an int")
                     };
                     b = if int_cmp(*op, x, *k) { *then } else { *else_ } as usize;
                 }
@@ -472,10 +471,9 @@ impl Runtime {
         }
     }
 
-    /// Exécute une instruction (hors terminateur). Utilisée par la boucle de
-    /// l'interpréteur (intégrée en ligne) et par le code natif du JIT pour les
-    /// instructions qu'il ne traduit pas lui-même : la sémantique est la même par
-    /// construction.
+    /// Runs one instruction (not a terminator). Used by the interpreter loop (inlined)
+    /// and by the JIT's native code for the instructions it does not translate itself:
+    /// the semantics are the same by construction.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn step(
@@ -504,7 +502,7 @@ impl Runtime {
                 Some(v) => reg!(*d) = v.clone(),
                 None => {
                     let n = self.name(self.globals.at(*g).name).to_string();
-                    return rt_err(format!("`{n}` n'est pas défini"), span);
+                    return rt_err(format!("`{n}` is not defined"), span);
                 }
             },
             Instr::SetGlobal(g, a) => {
@@ -528,19 +526,19 @@ impl Runtime {
             }
             Instr::IBin(op, d, a, b) => {
                 let (Value::Int(x), Value::Int(y)) = (&reg!(*a), &reg!(*b)) else {
-                    unreachable!("registre int qui ne contient pas un int")
+                    unreachable!("int register that does not hold an int")
                 };
                 reg!(*d) = int_op(*op, *x, *y, span)?;
             }
             Instr::IBinK(op, d, a, k) => {
                 let Value::Int(x) = reg!(*a) else {
-                    unreachable!("registre int qui ne contient pas un int")
+                    unreachable!("int register that does not hold an int")
                 };
                 reg!(*d) = int_op(*op, x, *k, span)?;
             }
             Instr::FBin(op, d, a, b) => {
                 let (Value::Float(x), Value::Float(y)) = (&reg!(*a), &reg!(*b)) else {
-                    unreachable!("registre float qui ne contient pas un float")
+                    unreachable!("float register that does not hold a float")
                 };
                 reg!(*d) = float_op(*op, *x, *y);
             }
@@ -550,7 +548,7 @@ impl Runtime {
                 };
                 reg!(*d) = match x.checked_neg() {
                     Some(n) => Value::Int(n),
-                    None => return rt_err("dépassement de capacité d'un entier", span),
+                    None => return rt_err("integer overflow", span),
                 };
             }
             Instr::IToF(d, a) => {
@@ -561,7 +559,7 @@ impl Runtime {
             }
 
             Instr::Bin(op, d, a, b) => {
-                // Cas courant du code non annoté : deux entiers.
+                // Common case in unannotated code: two integers.
                 if let (Value::Int(x), Value::Int(y)) = (&reg!(*a), &reg!(*b))
                     && !matches!(op, BinOp::Push | BinOp::And | BinOp::Or)
                 {
@@ -588,14 +586,14 @@ impl Runtime {
             }
             Instr::FieldAt(d, a, idx) => {
                 let Value::Object(o) = &reg!(*a) else {
-                    return rt_err("`@champ` : `self` n'est pas un objet", span);
+                    return rt_err("`@field`: `self` is not an object", span);
                 };
                 let v = o.borrow().fields[*idx as usize].clone();
                 if let Value::Uninit = v {
                     let n = self
                         .name(o.borrow().info.fields[*idx as usize].name)
                         .to_string();
-                    return rt_err(format!("`@{n}` est lu avant d'être initialisé"), span);
+                    return rt_err(format!("`@{n}` is read before being initialized"), span);
                 }
                 reg!(*d) = v;
             }
@@ -608,8 +606,8 @@ impl Runtime {
             } => {
                 let site = &proto.calls[*site as usize];
                 let r = reg!(*recv).clone();
-                // Valeur sans méthode ni champ déclarés (chaîne, liste, nombre…) : méthode
-                // intégrée, directement.
+                // Value with no declared method or field (string, list, number…): built-in
+                // method, directly.
                 if !matches!(
                     r,
                     Value::Object(_) | Value::Record(_) | Value::Variant(..) | Value::Enum(_)
@@ -625,14 +623,14 @@ impl Runtime {
                 reg!(*dst) = self.call_method_named(r, *name, args, span)?;
             }
 
-            // Instructions moins fréquentes : hors de la boucle principale, pour
-            // qu'elle reste petite et bien optimisée.
+            // Less frequent instructions: outside the main loop, so that it stays small
+            // and well optimized.
             other => self.exec_slow(proto, upvals, ctx, regs, cells, other, span)?,
         }
         Ok(())
     }
 
-    /// Instruction `Call` (aussi appelée par le code natif de base).
+    /// `Call` instruction (also called by baseline native code).
     #[inline]
     pub(crate) fn call_instr(
         &mut self,
@@ -649,8 +647,8 @@ impl Runtime {
             };
         }
         let site = &proto.calls[site as usize];
-        // Cas courant : fonction du script, arguments positionnels exacts. La
-        // fonction et les arguments sont lus en place dans les registres.
+        // Common case: script function, exact positional arguments. The function and
+        // the arguments are read in place from the registers.
         if !site.block
             && site.named.is_empty()
             && let Value::Function(func) = &reg!(f)
@@ -663,7 +661,7 @@ impl Runtime {
             reg!(dst) = v;
             return Ok(());
         }
-        // Construction d'un `type` dont chaque champ est donné : directe.
+        // Construction of a `type` where every field is given: direct.
         if !site.block
             && site.shapes.iter().all(Option::is_none)
             && let Value::Type(info) = &reg!(f)
@@ -684,7 +682,7 @@ impl Runtime {
         let f = reg!(f).clone();
         let mut args = Self::call_args(proto, regs, site);
         let v = match (&f, site.block) {
-            // Construction : le bloc `do` remplit les champs.
+            // Construction: the `do` block fills the fields.
             (Value::Type(info), true) => {
                 let block = args.pos.pop().unwrap();
                 if !args.shapes.is_empty() {
@@ -745,14 +743,14 @@ impl Runtime {
                             Some(v) => v.clone(),
                             None => {
                                 return rt_err(
-                                    format!("`{}` n'est pas défini", self.name(*name)),
+                                    format!("`{}` is not defined", self.name(*name)),
                                     span,
                                 );
                             }
                         },
                         Fallback::None => {
                             return rt_err(
-                                format!("`{}` n'est pas défini", self.name(*name)),
+                                format!("`{}` is not defined", self.name(*name)),
                                 span,
                             );
                         }
@@ -782,10 +780,10 @@ impl Runtime {
                             let msg = match ctx.last().and_then(|id| self.construct_type_name(*id))
                             {
                                 Some(t) => format!(
-                                    "`{n}` n'est ni un champ de `{t}` ni une variable déclarée \
-                                             (utiliser `let {n} = …` pour une variable locale)"
+                                    "`{n}` is neither a field of `{t}` nor a declared variable \
+                                             (use `let {n} = …` for a local variable)"
                                 ),
-                                None => format!("`{n}` n'est pas déclaré : utiliser `let {n} = …`"),
+                                None => format!("`{n}` is not declared: use `let {n} = …`"),
                             };
                             return rt_err(msg, span);
                         }
@@ -793,7 +791,7 @@ impl Runtime {
                 }
             }
             Instr::CtxField(d, i) => {
-                let id = *ctx.last().expect("valeur par défaut hors construction");
+                let id = *ctx.last().expect("default value outside a construction");
                 reg!(*d) = self.field_ref_get(id, *i, span)?;
             }
             Instr::Coerce {
@@ -818,12 +816,12 @@ impl Runtime {
                 reg!(*d) = match &reg!(*a) {
                     Value::Int(n) => match n.checked_neg() {
                         Some(n) => Value::Int(n),
-                        None => return rt_err("dépassement de capacité d'un entier", span),
+                        None => return rt_err("integer overflow", span),
                     },
                     Value::Float(f) => Value::Float(-f),
                     v => {
                         return type_err(
-                            format!("`-` attend un nombre, reçu {}", v.type_label()),
+                            format!("`-` expects a number, got {}", v.type_label()),
                             span,
                         );
                     }
@@ -869,7 +867,7 @@ impl Runtime {
                     (l, h) => {
                         return type_err(
                             format!(
-                                "un intervalle attend deux entiers, reçu {} et {}",
+                                "a range expects two integers, got {} and {}",
                                 l.type_label(),
                                 h.type_label()
                             ),
@@ -879,7 +877,7 @@ impl Runtime {
                 };
             }
             Instr::Concat(d, s, n) => {
-                // Tampon réutilisé : une seule allocation, celle de la chaîne finale.
+                // Reused buffer: a single allocation, for the final string.
                 let mut out = std::mem::take(&mut self.concat_buf);
                 out.clear();
                 for k in 0..*n as usize {
@@ -930,14 +928,14 @@ impl Runtime {
                         Some(v) => v.clone(),
                         None => {
                             return rt_err(
-                                format!("index {idx} hors du tuple (taille {})", t.len()),
+                                format!("index {idx} out of tuple bounds (length {})", t.len()),
                                 span,
                             );
                         }
                     },
                     r => {
                         return type_err(
-                            format!("`.{idx}` s'applique à un tuple, reçu {}", r.type_label()),
+                            format!("`.{idx}` applies to a tuple, got {}", r.type_label()),
                             span,
                         );
                     }
@@ -954,7 +952,7 @@ impl Runtime {
                     Value::List(l) => l.borrow().clone(),
                     v => {
                         return type_err(
-                            format!("tuple ou liste attendu, reçu {}", v.type_label()),
+                            format!("expected a tuple or list, got {}", v.type_label()),
                             span,
                         );
                     }
@@ -963,8 +961,8 @@ impl Runtime {
                 if items.len() < n || (!*rest && items.len() != n) {
                     return rt_err(
                         format!(
-                            "{}{n} valeurs attendues, reçu {}",
-                            if *rest { "au moins " } else { "" },
+                            "expected {}{n} values, got {}",
+                            if *rest { "at least " } else { "" },
                             items.len()
                         ),
                         span,
@@ -1024,15 +1022,15 @@ impl Runtime {
                 self.globals
                     .set_slot(*slot, Value::Enum(Rc::new(info)), false);
             }
-            _ => unreachable!("instruction traitée dans la boucle principale"),
+            _ => unreachable!("instruction handled in the main loop"),
         }
         Ok(())
     }
 
-    /// Appel direct d'une fonction déjà compilée en code de base, sans ce dont elle n'a
-    /// pas besoin : liaison générique (paramètres non annotés), essai du JIT typé,
-    /// cellules. `None` : chemin général (dont la vérification de la pile, un niveau
-    /// d'appel sur `STACK_CHECK`).
+    /// Direct call of a function already compiled to baseline code, skipping what it
+    /// does not need: generic binding (unannotated parameters), typed JIT attempt,
+    /// cells. `None`: general path (including the stack check, one call level out of
+    /// `STACK_CHECK`).
     #[cfg(feature = "jit")]
     #[inline]
     fn invoke_native(&mut self, c: &Closure, args: &[Value], span: Span) -> Option<R> {
@@ -1061,8 +1059,8 @@ impl Runtime {
         Some(r.map_err(|e| self.traced(e, proto, span)))
     }
 
-    /// Point d'entrée du code natif de base de `proto`, compilé au deuxième appel (ou au
-    /// premier s'il contient une boucle).
+    /// Entry point of `proto`'s baseline native code, compiled on the second call (or the
+    /// first if it contains a loop).
     #[cfg(feature = "jit")]
     #[inline]
     fn dyn_entry(&mut self, proto: &Proto) -> Option<usize> {
@@ -1120,12 +1118,12 @@ impl Runtime {
             ret: 0,
             ret_shape: 0,
         };
-        // SAFETY : `entry` vient de `compile_dynamic` pour ce `proto` ; le code natif
-        // n'accède à `regs`, `cells`, `upvals` que par la fenêtre `f`.
+        // SAFETY: `entry` comes from `compile_dynamic` for this `proto`; the native code
+        // only accesses `regs`, `cells`, `upvals` through the window `f`.
         let code: extern "C" fn(*mut Runtime, *mut crate::ir::NativeFrame) -> i32 =
             unsafe { std::mem::transmute(entry) };
         if code(self, &mut f) != 0 {
-            return Err(self.pending.take().expect("erreur du code natif"));
+            return Err(self.pending.take().expect("native code error"));
         }
         let v = std::mem::replace(&mut regs[f.ret as usize], Value::Nil);
         match &proto.ret {
@@ -1138,7 +1136,7 @@ impl Runtime {
         }
     }
 
-    /// Exécute `proto` en natif s'il est (ou devient) compilé ; `None` sinon.
+    /// Runs `proto` natively if it is (or becomes) compiled; `None` otherwise.
     #[cfg(feature = "jit")]
     fn try_jit(&mut self, proto: &Rc<Proto>, regs: &[Value]) -> Option<R> {
         if !self.jit_enabled || proto.kind != ProtoKind::Function {
@@ -1148,7 +1146,7 @@ impl Runtime {
             if self.jit.is_none() {
                 self.jit = crate::jit::Jit::new();
                 if self.jit.is_none() {
-                    // Machine non prise en charge par Cranelift.
+                    // Machine not supported by Cranelift.
                     self.jit_enabled = false;
                     return None;
                 }
@@ -1169,14 +1167,14 @@ impl Runtime {
         let jit = self.jit.as_mut()?;
         let r = jit.call(code, &args, self.depth, self.max_depth);
         if r.is_none() && jit.bailed {
-            // Hypothèse non vérifiée : la fonction reste interprétée.
+            // Assumption failed: the function stays interpreted.
             drop(state);
             *proto.jit.borrow_mut() = JitState::Rejected;
         }
         r
     }
 
-    // ─── Aides de l'exécution ────────────────────────────────────────────────
+    // ─── Runtime helpers ─────────────────────────────────────────────────────
 
     fn set_global(&mut self, g: u32, v: Value, span: Span) -> R<()> {
         let slot = self.globals.at(g);
@@ -1185,13 +1183,13 @@ impl Runtime {
             (None, _) => {
                 let n = self.name(n).to_string();
                 rt_err(
-                    format!("`{n}` n'est pas déclaré : utiliser `let {n} = …`"),
+                    format!("`{n}` is not declared: use `let {n} = …`"),
                     span,
                 )
             }
             (Some(_), false) => rt_err(
                 format!(
-                    "`{}` ne peut pas être modifié (constante, fonction ou type)",
+                    "`{}` cannot be modified (constant, function or type)",
                     self.name(n)
                 ),
                 span,
@@ -1203,9 +1201,9 @@ impl Runtime {
         }
     }
 
-    /// Valeur dynamique rangée dans un registre typé.
-    /// Valeur d'un champ dont le vérificateur connaît le type. Ne peut échouer que si le
-    /// type a été redéclaré depuis la vérification (REPL).
+    /// Dynamic value stored in a typed register.
+    /// Value of a field whose type the checker knows. Can only fail if the type was
+    /// redeclared since the check (REPL).
     fn field_as(&self, v: Value, ty: RegTy, name: Symbol, span: Span) -> R {
         match (ty, &v) {
             (RegTy::Int, Value::Int(_))
@@ -1215,7 +1213,7 @@ impl Runtime {
             (RegTy::Float, Value::Int(i)) => Ok(Value::Float(*i as f64)),
             (t, v) => type_err(
                 format!(
-                    "le champ `{}` devait être un `{}`, reçu {} : son type a-t-il été redéclaré ?",
+                    "field `{}` should be of type `{}`, got {}: was its type redeclared?",
                     self.name(name),
                     t.name(),
                     v.type_label()
@@ -1234,7 +1232,7 @@ impl Runtime {
             (RegTy::Value, _) => Ok(v),
             (t, v) => type_err(
                 format!(
-                    "type attendu `{}`, reçu {} ({}) : une variable garde le type de sa première valeur",
+                    "expected type `{}`, got {} ({}): a variable keeps the type of its first value",
                     match t {
                         RegTy::Int => "int",
                         RegTy::Float => "float",
@@ -1261,7 +1259,7 @@ impl Runtime {
             }
             _ => {
                 return type_err(
-                    format!("impossible d'assigner par index sur {}", r.type_label()),
+                    format!("cannot assign by index on {}", r.type_label()),
                     span,
                 );
             }
@@ -1284,7 +1282,7 @@ impl Runtime {
                     Ok(())
                 }
                 None => rt_err(
-                    format!("le record n'a pas de champ `{}`", self.name(name)),
+                    format!("the record has no field `{}`", self.name(name)),
                     span,
                 ),
             },
@@ -1301,7 +1299,7 @@ impl Runtime {
         span: Span,
     ) -> R<()> {
         let Value::Object(o) = obj else {
-            return rt_err("`@champ` : `self` n'est pas un objet", span);
+            return rt_err("`@field`: `self` is not an object", span);
         };
         let info = o.borrow().info.clone();
         let v = match &info.fields[idx as usize].ty {
@@ -1317,12 +1315,12 @@ impl Runtime {
             Value::Enum(info) => match info.variants.iter().position(|(n, _)| *n == name) {
                 Some(i) => Ok(Value::Variant(info.clone(), i as u32)),
                 None => rt_err(
-                    format!("`{}` n'a pas de variante `{}`", info.name, self.name(name)),
+                    format!("`{}` has no variant `{}`", info.name, self.name(name)),
                     span,
                 ),
             },
             v => type_err(
-                format!("`::` s'applique à un enum, reçu {}", v.type_label()),
+                format!("`::` applies to an enum, got {}", v.type_label()),
                 span,
             ),
         }
@@ -1356,7 +1354,7 @@ impl Runtime {
             v => {
                 return type_err(
                     format!(
-                        "`for` ne peut pas parcourir une valeur de type {}",
+                        "`for` cannot iterate over a value of type {}",
                         v.type_label()
                     ),
                     span,
@@ -1365,7 +1363,7 @@ impl Runtime {
         })
     }
 
-    /// `recv.nom(args)` : champ fonction, méthode déclarée, méthode d'enum ou intégrée.
+    /// `recv.name(args)`: function field, declared method, enum method or built-in.
     fn call_method_named(&mut self, r: Value, name: Symbol, args: CallArgs, span: Span) -> R {
         let field_fn = match &r {
             Value::Record(rec) => rec.borrow().get(name).cloned(),
@@ -1390,7 +1388,7 @@ impl Runtime {
         if let Some(&(n, _)) = args.named.first() {
             return rt_err(
                 format!(
-                    "les méthodes intégrées n'acceptent pas d'argument nommé (`{}`)",
+                    "built-in methods do not accept named arguments (`{}`)",
                     self.name(n)
                 ),
                 span,
@@ -1399,12 +1397,12 @@ impl Runtime {
         self.method(r, name, args.pos, span)
     }
 
-    // ─── Vérification des types ──────────────────────────────────────────────
+    // ─── Type checks ─────────────────────────────────────────────────────────
 
-    /// Vérifie `v` contre une annotation, après conversion éventuelle :
-    /// - `int` → `float` ;
-    /// - record **littéral** (`shape`) → `type` nominal, y compris dans une liste
-    ///   littérale et pour `T?` / `A | B`.
+    /// Checks `v` against an annotation, after any conversion:
+    /// - `int` → `float`;
+    /// - record **literal** (`shape`) → nominal `type`, including inside a list literal
+    ///   and for `T?` / `A | B`.
     #[inline]
     pub(crate) fn coerce(
         &mut self,
@@ -1413,7 +1411,7 @@ impl Runtime {
         shape: Option<&Shape>,
         span: Span,
     ) -> R {
-        // Cas courant : type simple déjà respecté.
+        // Common case: simple type already satisfied.
         match (&*ty.ty, &v) {
             (RtType::Any, _)
             | (RtType::Int, Value::Int(_))
@@ -1470,7 +1468,7 @@ impl Runtime {
             Ok(true) => Ok(v),
             Ok(false) => type_err(
                 format!(
-                    "type attendu `{}`, reçu {} ({})",
+                    "expected type `{}`, got {} ({})",
                     ty.shown,
                     v.type_label(),
                     short(&v.inspect(&self.interner))
@@ -1481,7 +1479,7 @@ impl Runtime {
         }
     }
 
-    /// `type` (non `class`) désigné par un type nommé.
+    /// `type` (not `class`) named by a named type.
     fn data_type(&self, rt: &RtType) -> Option<Rc<TypeInfo>> {
         match rt {
             RtType::Named(slot, _) if *slot != u32::MAX => match &self.globals.at(*slot).value {
@@ -1539,7 +1537,7 @@ impl Runtime {
                         matches!(v, Value::Object(o) if Rc::ptr_eq(&o.borrow().info, info))
                     }
                     Some(Value::Enum(e)) => matches!(v, Value::Variant(x, _) if Rc::ptr_eq(x, e)),
-                    _ => return Err(format!("type `{}` inconnu", self.name(*name))),
+                    _ => return Err(format!("unknown type `{}`", self.name(*name))),
                 }
             }
             RtType::List(inner) => match v {
@@ -1616,7 +1614,7 @@ impl Runtime {
         let mut values = explicit.iter();
         let mut variants = Vec::with_capacity(e.variants.len());
         for (i, (name, has)) in e.variants.iter().zip(&e.explicit).enumerate() {
-            // Sans `= valeur` : le nom pour un enum `: str`, sinon l'index.
+            // Without `= value`: the name for a `: str` enum, otherwise the index.
             let value = if *has {
                 values.next().cloned().unwrap_or(Value::Nil)
             } else if e.repr_is_str {
@@ -1629,7 +1627,7 @@ impl Runtime {
             {
                 return type_err(
                     format!(
-                        "la valeur de `{}` doit être de type `{}`, reçu {}",
+                        "the value of `{}` must be of type `{}`, got {}",
                         self.name(*name),
                         repr.shown,
                         value.type_label()
@@ -1652,19 +1650,19 @@ impl Runtime {
 
 fn init_check(v: Value, span: Span) -> R {
     match v {
-        Value::Uninit => rt_err("variable utilisée avant sa déclaration", span),
+        Value::Uninit => rt_err("variable used before its declaration", span),
         v => Ok(v),
     }
 }
 
 fn int_op(op: BinOp, x: i64, y: i64, span: Span) -> R {
     use BinOp::*;
-    let overflow = || Error::runtime("dépassement de capacité d'un entier", span);
+    let overflow = || Error::runtime("integer overflow", span);
     Ok(match op {
         Add => Value::Int(x.checked_add(y).ok_or_else(overflow)?),
         Sub => Value::Int(x.checked_sub(y).ok_or_else(overflow)?),
         Mul => Value::Int(x.checked_mul(y).ok_or_else(overflow)?),
-        Div | Rem if y == 0 => return rt_err("division par zéro", span),
+        Div | Rem if y == 0 => return rt_err("division by zero", span),
         Div => Value::Int(x.checked_div_euclid(y).ok_or_else(overflow)?),
         Rem => Value::Int(x.checked_rem_euclid(y).ok_or_else(overflow)?),
         Eq => Value::Bool(x == y),
@@ -1673,7 +1671,7 @@ fn int_op(op: BinOp, x: i64, y: i64, span: Span) -> R {
         Le => Value::Bool(x <= y),
         Gt => Value::Bool(x > y),
         Ge => Value::Bool(x >= y),
-        And | Or | Push => unreachable!("opération non entière"),
+        And | Or | Push => unreachable!("non-integer operation"),
     })
 }
 
@@ -1686,7 +1684,7 @@ fn int_cmp(op: BinOp, x: i64, y: i64) -> bool {
         BinOp::Le => x <= y,
         BinOp::Gt => x > y,
         BinOp::Ge => x >= y,
-        _ => unreachable!("comparaison attendue"),
+        _ => unreachable!("expected a comparison"),
     }
 }
 
@@ -1704,7 +1702,7 @@ fn float_op(op: BinOp, x: f64, y: f64) -> Value {
         Le => Value::Bool(x <= y),
         Gt => Value::Bool(x > y),
         Ge => Value::Bool(x >= y),
-        And | Or | Push => unreachable!("opération non décimale"),
+        And | Or | Push => unreachable!("non-float operation"),
     }
 }
 
@@ -1730,7 +1728,7 @@ impl TypeInfo {
     }
 }
 
-/// Avance l'itérateur du registre `iter` : `true` et l'élément dans `dst`, ou `false`.
+/// Advances the iterator in register `iter`: `true` and the element in `dst`, or `false`.
 #[inline]
 pub(crate) fn iter_next(regs: &mut [Value], iter: Reg, dst: Reg) -> bool {
     let Value::Iter(it) = &regs[iter as usize] else {
@@ -1749,14 +1747,14 @@ pub(crate) fn iter_next(regs: &mut [Value], iter: Reg, dst: Reg) -> bool {
     }
 }
 
-/// Agrandit le vecteur vide `regs` à `n` registres `nil`. `Value::Nil` est fait d'octets
-/// nuls (`repr(C, u8)`, étiquette 0) : une mise à zéro suffit, sans boucle de copies.
+/// Grows the empty vector `regs` to `n` `nil` registers. `Value::Nil` is all zero bytes
+/// (`repr(C, u8)`, tag 0): zeroing is enough, no copy loop.
 #[inline]
 fn fill_nil(regs: &mut Vec<Value>, n: usize) {
     debug_assert!(regs.is_empty());
     regs.reserve(n);
-    // SAFETY : la capacité est d'au moins `n` ; des octets nuls forment `Value::Nil`
-    // (vérifié par `value::tests::native_layout`), une valeur valide qui ne possède rien.
+    // SAFETY: the capacity is at least `n`; zero bytes form `Value::Nil` (checked by
+    // `value::tests::native_layout`), a valid value that owns nothing.
     unsafe {
         std::ptr::write_bytes(regs.as_mut_ptr(), 0, n);
         regs.set_len(n);

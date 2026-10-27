@@ -1,4 +1,4 @@
-//! Bokoni : langage de script intégré à Rust, syntaxe à la Ruby, typage graduel.
+//! Bokoni: a scripting language embedded in Rust, with Ruby-like syntax and gradual typing.
 //!
 //! ```
 //! use bokoni::Engine;

@@ -1,23 +1,23 @@
-//! Lexer : source → jetons.
+//! Lexer: source → tokens.
 //!
-//! Travaille sur les octets, ne fait aucune allocation par jeton : un jeton n'est qu'un
-//! type et un intervalle ; le texte (nombre, nom, chaîne) est relu dans le source par le
-//! parseur quand il en a besoin.
+//! Works on bytes and allocates nothing per token: a token is just a kind and a range;
+//! the text (number, name, string) is read back from the source by the parser when it
+//! needs it.
 //!
-//! Chaînes interpolées : `"a #{x} b #{y} c"` donne
+//! Interpolated strings: `"a #{x} b #{y} c"` gives
 //! `StrHead("a #{)`, `x`, `StrMid(} b #{)`, `y`, `StrTail(} c")`.
-//! Une chaîne sans interpolation donne un seul jeton `Str`.
+//! A string without interpolation gives a single `Str` token.
 //!
-//! Fins de ligne : un `Newline` termine une instruction. Il est supprimé après un jeton qui
-//! ne peut pas finir une expression (opérateur, `,`, `(`…), ou si la ligne suivante commence
-//! par `.` (chaînage de méthodes).
+//! Line ends: a `Newline` ends a statement. It is dropped after a token that cannot end
+//! an expression (operator, `,`, `(`…), or when the next line starts with `.` (method
+//! chaining).
 
 use crate::diagnostic::{Error, Result};
 use crate::span::Span;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TokenKind {
-    // Littéraux et noms
+    // Literals and names
     Int,
     Float,
     Str,
@@ -25,10 +25,10 @@ pub enum TokenKind {
     StrMid,
     StrTail,
     Ident,
-    /// `@nom`
+    /// `@name`
     IVar,
 
-    // Mots-clés
+    // Keywords
     Let,
     Def,
     End,
@@ -59,7 +59,7 @@ pub enum TokenKind {
     Not,
     SelfKw,
 
-    // Ponctuation
+    // Punctuation
     LParen,
     RParen,
     LBracket,
@@ -79,7 +79,7 @@ pub enum TokenKind {
     Question,
     FatArrow,
 
-    // Opérateurs
+    // Operators
     Eq,
     EqEq,
     NotEq,
@@ -104,7 +104,7 @@ pub enum TokenKind {
 }
 
 impl TokenKind {
-    /// Après ces jetons, une fin de ligne ne termine pas l'instruction.
+    /// After these tokens, a line end does not end the statement.
     fn continues_line(self) -> bool {
         use TokenKind::*;
         matches!(
@@ -146,16 +146,16 @@ impl TokenKind {
         )
     }
 
-    /// Nom lisible, pour les messages d'erreur.
+    /// Readable name, for error messages.
     pub fn describe(self) -> &'static str {
         use TokenKind::*;
         match self {
-            Int => "un entier",
-            Float => "un nombre décimal",
-            Str | StrHead => "une chaîne",
-            StrMid | StrTail => "la suite d'une chaîne",
-            Ident => "un identifiant",
-            IVar => "un attribut `@…`",
+            Int => "an integer",
+            Float => "a float",
+            Str | StrHead => "a string",
+            StrMid | StrTail => "the rest of a string",
+            Ident => "an identifier",
+            IVar => "an `@…` attribute",
             Let => "`let`",
             Def => "`def`",
             End => "`end`",
@@ -220,8 +220,8 @@ impl TokenKind {
             StarEq => "`*=`",
             SlashEq => "`/=`",
             PercentEq => "`%=`",
-            Newline => "une fin de ligne",
-            Eof => "la fin du fichier",
+            Newline => "a line end",
+            Eof => "end of file",
         }
     }
 }
@@ -235,7 +235,7 @@ pub struct Token {
 #[inline]
 fn keyword(s: &[u8]) -> Option<TokenKind> {
     use TokenKind::*;
-    // Rejet rapide : les mots-clés font 2 à 10 lettres et commencent par l'une de celles-ci.
+    // Fast reject: keywords are 2 to 10 letters long and start with one of these.
     if !(2..=10).contains(&s.len())
         || !matches!(
             s[0],
@@ -278,10 +278,10 @@ fn keyword(s: &[u8]) -> Option<TokenKind> {
     })
 }
 
-/// Découpe tout le source en jetons. Le dernier jeton est toujours `Eof`.
+/// Splits the whole source into tokens. The last token is always `Eof`.
 ///
-/// Le parseur n'utilise pas cette fonction : il lit les jetons un par un avec
-/// [`Lexer::next_token`], ce qui garde le flux de jetons dans le cache du processeur.
+/// The parser does not use this function: it reads tokens one by one with
+/// [`Lexer::next_token`], which keeps the token stream in the CPU cache.
 pub fn tokenize(src: &str) -> Result<Vec<Token>> {
     let mut lx = Lexer::new(src);
     let mut tokens = Vec::with_capacity(src.len() / 4 + 16);
@@ -303,18 +303,18 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>> {
     }
 }
 
-/// Lexer à la demande : chaque appel à [`next_token`](Lexer::next_token) produit un jeton.
+/// On-demand lexer: each call to [`next_token`](Lexer::next_token) produces one token.
 pub struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
-    /// Profondeur d'accolades de chaque interpolation `#{` ouverte.
+    /// Brace depth of each open `#{` interpolation.
     interp: Vec<u32>,
-    /// Type du dernier jeton produit (règles des fins de ligne). `Newline` au départ :
-    /// les lignes vides en tête de fichier sont ignorées.
+    /// Kind of the last token produced (line-end rules). `Newline` at the start: blank
+    /// lines at the top of the file are skipped.
     last: TokenKind,
-    /// Erreurs locales (caractère inconnu, `&&`…) : signalées, puis le lexer continue.
+    /// Local errors (unknown character, `&&`…): reported, then the lexer continues.
     pub errors: Vec<Error>,
-    /// Erreur fatale (chaîne non fermée…) : le lexer ne produit ensuite plus que `Eof`.
+    /// Fatal error (unclosed string…): the lexer then only produces `Eof`.
     pub error: Option<Error>,
 }
 
@@ -330,14 +330,14 @@ impl<'a> Lexer<'a> {
         };
         if src.len() > u32::MAX as usize {
             lx.error = Some(Error::syntax(
-                "source trop grand (4 Gio max)",
+                "source too large (4 GiB max)",
                 Span::new(0, 0),
             ));
         }
         lx
     }
 
-    /// Jeton suivant. Après une erreur (rangée dans `error`) ou la fin, renvoie `Eof`.
+    /// Next token. After an error (stored in `error`) or the end, returns `Eof`.
     #[inline]
     pub fn next_token(&mut self) -> Token {
         if self.error.is_none() {
@@ -371,7 +371,7 @@ impl Lexer<'_> {
         }
     }
 
-    /// Signale une erreur locale ; le lexer continue.
+    /// Reports a local error; the lexer continues.
     fn report(&mut self, msg: impl Into<String>, start: usize) {
         self.errors.push(Error::syntax(
             msg,
@@ -379,8 +379,8 @@ impl Lexer<'_> {
         ));
     }
 
-    /// Longueur en octets du caractère d'identifiant à `pos`, 0 si ce n'en est pas un.
-    /// Identifiants : lettres (Unicode comprises : `é`, `ß`, `π`), `_`, puis chiffres.
+    /// Byte length of the identifier character at `pos`, 0 if it is not one.
+    /// Identifiers: letters (Unicode included: `é`, `ß`, `π`), `_`, then digits.
     #[inline]
     fn ident_char(&self, pos: usize, first: bool) -> usize {
         match self.src.get(pos) {
@@ -473,7 +473,7 @@ impl Lexer<'_> {
                         self.skip_ident();
                         return Ok(self.token(IVar, start));
                     }
-                    self.report("`@` doit être suivi d'un nom ou de `[`", start);
+                    self.report("`@` must be followed by a name or `[`", start);
                 }
                 _ if self.ident_char(self.pos, true) > 0 => {
                     self.skip_ident();
@@ -489,18 +489,18 @@ impl Lexer<'_> {
         }
     }
 
-    /// Fin du source : `Newline` final si besoin, puis `Eof`.
+    /// End of source: a final `Newline` if needed, then `Eof`.
     fn finish(&mut self) -> Result<Token> {
         use TokenKind::*;
         if !self.interp.is_empty() {
             let mut e = Error::syntax(
-                "interpolation `#{` non fermée",
+                "unclosed `#{` interpolation",
                 Span::new(self.pos as u32, self.pos as u32),
             );
             e.incomplete = true;
             return Err(e);
         }
-        // Pas de fin de ligne finale après un opérateur : l'expression est incomplète.
+        // No final line end after an operator: the expression is incomplete.
         let kind = if matches!(self.last, Newline | Eof) || self.last.continues_line() {
             Eof
         } else {
@@ -509,12 +509,12 @@ impl Lexer<'_> {
         Ok(self.token(kind, self.pos))
     }
 
-    /// Une fin de ligne (déjà consommée) termine-t-elle l'instruction ?
+    /// Does a line end (already consumed) end the statement?
     fn newline_ends_stmt(&self) -> bool {
         if self.last == TokenKind::Newline || self.last.continues_line() {
             return false;
         }
-        // Ligne suivante qui commence par `.` (et pas `..`) : chaînage de méthodes.
+        // Next line starts with `.` (and not `..`): method chaining.
         let mut p = self.pos;
         loop {
             match self.src.get(p) {
@@ -530,14 +530,14 @@ impl Lexer<'_> {
         !(self.src.get(p) == Some(&b'.') && self.src.get(p + 1) != Some(&b'.'))
     }
 
-    /// Lit un segment de chaîne, après `"` (`from_quote`) ou après le `}` d'une interpolation.
+    /// Reads a string segment, after `"` (`from_quote`) or after the `}` of an interpolation.
     fn string(&mut self, start: usize, from_quote: bool) -> Result<Token> {
         use TokenKind::*;
         loop {
             match self.src.get(self.pos) {
                 None => {
                     let mut e = Error::syntax(
-                        "chaîne non fermée",
+                        "unclosed string",
                         Span::new(start as u32, self.pos as u32),
                     );
                     e.incomplete = true;
@@ -565,7 +565,7 @@ impl Lexer<'_> {
             }
         };
         digits(self);
-        // `t.0.1` : après un `.`, seul un entier est possible (index de tuple).
+        // `t.0.1`: after a `.`, only an integer is possible (tuple index).
         let after_dot = self.last == TokenKind::Dot;
         let mut float = false;
         if !after_dot && self.peek_at(0) == b'.' && self.peek_at(1).is_ascii_digit() {
@@ -588,14 +588,14 @@ impl Lexer<'_> {
         };
         let number = self.token(kind, start);
         if self.ident_char(self.pos, true) > 0 {
-            // `12abc` : signalé, puis lu comme le nombre `12`.
+            // `12abc`: reported, then read as the number `12`.
             self.skip_ident();
-            self.report("nombre mal formé", start);
+            self.report("malformed number", start);
         }
         Ok(number)
     }
 
-    /// Ponctuation ; `None` pour un caractère inconnu (signalé et sauté).
+    /// Punctuation; `None` for an unknown character (reported and skipped).
     fn punct(&mut self, start: usize, b: u8) -> Option<Token> {
         use TokenKind::*;
         let next = self.peek_at(1);
@@ -632,19 +632,19 @@ impl Lexer<'_> {
             (b'/', _) => (Slash, 1),
             (b'%', b'=') => (PercentEq, 2),
             (b'%', _) => (Percent, 1),
-            // Signalés, puis lus comme leur équivalent pour continuer l'analyse.
+            // Reported, then read as their equivalent so parsing can go on.
             (b'!', _) => {
                 self.pos += 1;
-                self.report("`!` n'existe pas : utiliser `not`", start);
+                self.report("`!` does not exist: use `not`", start);
                 return Some(self.token(Not, start));
             }
             (b'&', b'&') => {
                 self.pos += 2;
-                self.report("`&&` n'existe pas : utiliser `and`", start);
+                self.report("`&&` does not exist: use `and`", start);
                 return Some(self.token(And, start));
             }
             _ => {
-                // Caractère complet (UTF-8) pour le message.
+                // Whole (UTF-8) character for the message.
                 let len = match b {
                     0xF0.. => 4,
                     0xE0.. => 3,
@@ -654,7 +654,7 @@ impl Lexer<'_> {
                 let end = (start + len).min(self.src.len());
                 let ch = String::from_utf8_lossy(&self.src[start..end]).into_owned();
                 self.pos = end;
-                self.report(format!("caractère inattendu `{ch}`"), start);
+                self.report(format!("unexpected character `{ch}`"), start);
                 return None;
             }
         };
@@ -707,12 +707,12 @@ mod tests {
 
     #[test]
     fn newlines() {
-        // Lignes vides et commentaires fusionnés, continuation après un opérateur.
+        // Blank lines and comments merged, continuation after an operator.
         assert_eq!(
             kinds("a +\n  b\n\n# c\nd"),
             [Ident, Plus, Ident, Newline, Ident, Newline, Eof]
         );
-        // Chaînage de méthodes sur la ligne suivante.
+        // Method chaining on the next line.
         assert_eq!(
             kinds("xs\n  .map(f)"),
             [Ident, Dot, Ident, LParen, Ident, RParen, Newline, Eof]
@@ -734,7 +734,7 @@ mod tests {
             tokenize("5 € 2")
                 .unwrap_err()
                 .message
-                .contains("caractère inattendu `€`")
+                .contains("unexpected character `€`")
         );
     }
 

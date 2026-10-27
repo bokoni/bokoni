@@ -1,245 +1,235 @@
-# Feuille de route
+# Roadmap
 
-Objectif final : un langage de script intégré à Rust, avec un JIT (Cranelift) pour le code typé.
+End goal: a scripting language embedded in Rust, with a JIT (Cranelift) for typed code.
 
-## Architecture visée
+## Target architecture
 
 ```
-source ─► lexer ─► parseur ─► AST ─► vérificateur de types ─► IR typée ─┬─► interpréteur
-                                                                         └─► JIT (Cranelift)
+source ─► lexer ─► parser ─► AST ─► type checker ─► typed IR ─┬─► interpreter
+                                                               └─► JIT (Cranelift)
 ```
 
-- **IR typée** : représentation intermédiaire simple où chaque valeur a un type connu.
-  Une fonction entièrement typée (`int`, `float`, `bool`) est compilée en code natif ;
-  le code `any` manipule des valeurs génériques (« boxées ») vérifiées à l'exécution.
-- **L'interpréteur reste** même avec le JIT : exécution du code `any`, plateformes sans JIT
-  (WebAssembly, iOS), et référence pour tester le JIT (mêmes résultats).
+- **Typed IR**: a simple intermediate representation where every value has a known type.
+  A fully typed function (`int`, `float`, `bool`) is compiled to native code; `any` code
+  handles generic ("boxed") values checked at run time.
+- **The interpreter stays** even with the JIT: it runs `any` code, platforms without a
+  JIT (WebAssembly, iOS), and is the reference for testing the JIT (same results).
 
-## Paliers
+## Milestones
 
-### v0.1 — Cœur exécutable
+### v0.1 — Executable core
 
-- [x] Lexer écrit à la main : octets, à la demande (un jeton d'avance), interpolation `"#{…}"`
-- [x] Parseur écrit à la main (descente récursive + Pratt pour les opérateurs)
-- [x] AST compact : expressions dans un `Vec`, désignées par index (`ExprId`), 32 octets
-      chacune, positions source sur chaque nœud, affichable (S-expressions)
-- [x] Pas de débordement de pile possible (parseur et interpréteur : `stacker`)
-- [x] Le parseur accepte toute la syntaxe de `syntax.md` (y compris `type`, `class`, `enum`, `@[…]`)
-- [x] Messages d'erreur avec ligne, colonne et extrait du source
-- [x] Interpréteur sur l'AST : `let`, `def`, `if`, `case`, `while`, `for`, lambdas, blocs `do`
-- [x] Valeurs : `int`, `float`, `str`, `bool`, `nil`, listes, hash, records, tuples, intervalles
-- [x] Annotations de type vérifiées à l'exécution (`let`, paramètres, retour)
-- [x] API `Engine` pour Rust : `eval`, `register_fn` avec conversion automatique des types
-- [x] Exécutable : exécuter un fichier, REPL, `--ast` pour afficher l'arbre
-- [x] Récupération d'erreurs dans le parseur (toutes les erreurs en une passe) — fait en v0.2
+- [x] Hand-written lexer: bytes, on demand (one token of lookahead), `"#{…}"` interpolation
+- [x] Hand-written parser (recursive descent + Pratt for operators)
+- [x] Compact AST: expressions in a `Vec`, referenced by index (`ExprId`), 32 bytes each,
+      source positions on every node, printable (S-expressions)
+- [x] No stack overflow possible (parser and interpreter: `stacker`)
+- [x] The parser accepts all of the `syntax.md` syntax (including `type`, `class`, `enum`, `@[…]`)
+- [x] Error messages with line, column and source excerpt
+- [x] AST interpreter: `let`, `def`, `if`, `case`, `while`, `for`, lambdas, `do` blocks
+- [x] Values: `int`, `float`, `str`, `bool`, `nil`, lists, hashes, records, tuples, ranges
+- [x] Type annotations checked at run time (`let`, parameters, return)
+- [x] `Engine` API for Rust: `eval`, `register_fn` with automatic type conversion
+- [x] Command line: run a file, REPL, `--ast` to print the tree
+- [x] Error recovery in the parser (all errors in one pass) — done in v0.2
 
-### v0.2 — Typage statique
+### v0.2 — Static typing
 
-- [x] Toutes les erreurs signalées en une passe : le lexer et le parseur reprennent après
-      une erreur (saut jusqu'au `end` des constructions ouvertes, sans cascade)
-- [x] Vérification des noms (portées, `let`, constantes, utilisation avant déclaration,
-      champs des blocs de construction), avec suggestions (`len` pour `lenght`)
-- [x] Vérificateur de types : inférence locale, `any`, `T?`, unions, types littéraux ;
-      seules les erreurs certaines sont signalées (typage graduel)
-- [x] Les déclarations des scripts précédents (REPL) sont connues du vérificateur
-- [x] `type`, `enum`, `class` à l'exécution ; blocs `Server do … end`
-- [x] Conversion record littéral → type nominal
-- [ ] Types génériques (`[T]` dans les signatures), héritage / interfaces, modules
+- [x] All errors reported in one pass: the lexer and the parser resume after an error
+      (skipping to the `end` of the open constructs, without cascades)
+- [x] Name checking (scopes, `let`, constants, use before declaration, fields of
+      construction blocks), with suggestions (`len` for `lenght`)
+- [x] Type checker: local inference, `any`, `T?`, unions, literal types; only certain
+      errors are reported (gradual typing)
+- [x] Declarations from previous scripts (REPL) are known to the checker
+- [x] `type`, `enum`, `class` at run time; `Server do … end` blocks
+- [x] Record literal → nominal type conversion
+- [ ] Generic types (`[T]` in signatures), inheritance / interfaces, modules
 
-### v0.3 — IR typée
+### v0.3 — Typed IR
 
-- [x] IR à registres en blocs de base (`src/ir.rs`), registres typés `int` / `float` /
-      `bool` / `valeur` ; affichage lisible : `bokoni --ir fichier.bk`
-- [x] Compilation AST → IR (`src/compile.rs`) : analyse des captures (variables
-      capturées dans des cellules, les autres en registres), globales dans des cases
-      résolues à la compilation
-- [x] Registres typés d'après les annotations et les types déduits par le vérificateur ;
-      une valeur dynamique n'y entre que par une garde (typage graduel sûr)
-- [x] Optimisations : écriture directe dans la variable, opérandes immédiats (`i + 1`),
-      comparaison et branchement fusionnés, sauts court-circuités, blocs fusionnés
-- [x] L'interpréteur exécute l'IR (`src/vm.rs`) ; l'interpréteur sur l'AST est retiré
-- [x] `type`, `class`, `enum` : déclarations au niveau principal du script
+- [x] Register-based IR in basic blocks (`src/ir.rs`), registers typed `int` / `float` /
+      `bool` / `value`; readable output: `bokoni --ir file.bk`
+- [x] AST → IR compilation (`src/compile.rs`): capture analysis (captured variables in
+      cells, the others in registers), globals in slots resolved at compile time
+- [x] Registers typed from annotations and from the types inferred by the checker; a
+      dynamic value only enters them through a guard (safe gradual typing)
+- [x] Optimizations: direct write into the variable, immediate operands (`i + 1`), fused
+      compare-and-branch, short-circuited jumps, merged blocks
+- [x] The interpreter runs the IR (`src/vm.rs`); the AST interpreter is removed
+- [x] `type`, `class`, `enum`: declarations at the top level of the script
 
-| Programme (`cargo run --release --example bench_interp`) | AST (v0.2) | IR (v0.3) |
+| Program (`cargo run --release --example bench_interp`)    | AST (v0.2) | IR (v0.3) |
 |-----------------------------------------------------------|-----------:|----------:|
-| `fib(25)` récursif                                         | 57 ms      | 28 ms     |
-| boucle `while`, 1 M tours                                  | 115 ms     | 29 ms     |
-| `for` sur un intervalle, 1 M tours                         | 56 ms      | 20 ms     |
-| listes : `map` / `filter` / `sum` (100 k)                  | 19 ms      | 17 ms     |
-| closures et compteur (300 k appels)                        | 36 ms      | 27 ms     |
-| objets : construction et champs (100 k)                    | 30 ms      | 17 ms     |
-| chaînes : interpolation (100 k)                            | 16 ms      | 12 ms     |
+| recursive `fib(25)`                                        | 57 ms      | 28 ms     |
+| `while` loop, 1 M iterations                               | 115 ms     | 29 ms     |
+| `for` over a range, 1 M iterations                         | 56 ms      | 20 ms     |
+| lists: `map` / `filter` / `sum` (100 k)                    | 19 ms      | 17 ms     |
+| closures and counter (300 k calls)                         | 36 ms      | 27 ms     |
+| objects: construction and fields (100 k)                   | 30 ms      | 17 ms     |
+| strings: interpolation (100 k)                             | 16 ms      | 12 ms     |
 
-Les programmes dominés par les fonctions intégrées (listes) ou par les appels gagnent peu :
-c'est le travail du JIT (appels directs, valeurs non boxées).
+Programs dominated by built-in functions (lists) or by calls gain little: that is the
+JIT's job (direct calls, unboxed values).
 
-### v0.4 — JIT Cranelift
+### v0.4 — Cranelift JIT
 
-- [x] Compilation native (`src/jit.rs`, Cranelift 0.136) des fonctions dont paramètres et
-      retour sont annotés `int` / `float` / `bool` et dont le corps ne fait que calculer,
-      comparer, brancher et appeler d'autres fonctions compilables (récursion comprise)
-- [x] Analyse de l'IR : les registres `valeur` sont typés (résultat d'un appel à une
-      fonction `: int`…) ; sinon, la fonction reste interprétée
-- [x] Mêmes résultats et mêmes erreurs que l'interpréteur : dépassement de capacité,
-      division euclidienne, division par zéro, profondeur d'appels, pile d'appels
-      (vérifié par des tests d'équivalence)
-- [x] Appels directs natif → natif ; redéfinition d'une fonction globale : le code qui
-      l'appelle est invalidé et recompilé au besoin
-- [x] Compilation au premier appel ; une fonction appelée une seule fois mais qui boucle
-      en profite aussi
-- [x] Pile native insuffisante (récursion très profonde) : l'appel est refait par
-      l'interpréteur (sans risque : les fonctions compilées n'ont pas d'effet de bord)
-- [x] Fonctionnalité Cargo `jit` (par défaut) ; `Engine::set_jit(false)`, `bokoni --no-jit`
-- [ ] Compiler davantage : méthodes, listes, chaînes, appels à l'interpréteur depuis le
-      code natif (valeurs boxées)
+- [x] Native compilation (`src/jit.rs`, Cranelift 0.136) of functions whose parameters and
+      return are annotated `int` / `float` / `bool` and whose body only computes,
+      compares, branches and calls other compilable functions (recursion included)
+- [x] IR analysis: `value` registers are typed (result of a call to a `: int`
+      function…); otherwise the function stays interpreted
+- [x] Same results and same errors as the interpreter: overflow, Euclidean division,
+      division by zero, call depth, call stack (verified by equivalence tests)
+- [x] Direct native → native calls; redefining a global function invalidates the code
+      that calls it, which is recompiled when needed
+- [x] Compilation on the first call; a function called only once but that loops
+      benefits too
+- [x] Insufficient native stack (very deep recursion): the call is redone by the
+      interpreter (safe: compiled functions have no side effects)
+- [x] Cargo feature `jit` (on by default); `Engine::set_jit(false)`, `bokoni --no-jit`
+- [ ] Compile more: methods, lists, strings, calls into the interpreter from native code
+      (boxed values)
 
-| Programme (`cargo run --release --example bench_interp`) | Interpréteur | JIT    |
-|-----------------------------------------------------------|-------------:|-------:|
-| `fib(25)` récursif                                         | 28 ms        | 0,5 ms |
-| boucle `while`, 1 M tours                                  | 29 ms        | 1,2 ms |
-| `for` sur un intervalle, 1 M tours                         | 20 ms        | 0,5 ms |
-| `float` : série harmonique, 1 M tours                      | 33 ms        | 0,9 ms |
-| listes, closures, objets, chaînes                          | inchangé (interprété) | |
+| Program (`cargo run --release --example bench_interp`)    | Interpreter | JIT    |
+|-----------------------------------------------------------|------------:|-------:|
+| recursive `fib(25)`                                        | 28 ms       | 0.5 ms |
+| `while` loop, 1 M iterations                               | 29 ms       | 1.2 ms |
+| `for` over a range, 1 M iterations                         | 20 ms       | 0.5 ms |
+| `float`: harmonic series, 1 M iterations                   | 33 ms       | 0.9 ms |
+| lists, closures, objects, strings                          | unchanged (interpreted) | |
 
-Temps compilation comprise.
+Times include compilation.
 
-### v0.5 — JIT pour le code non typé et les objets
+### v0.5 — JIT for untyped code and objects
 
-- [x] Compilation de base de toute fonction (deuxième appel, ou premier s'il y a une
-      boucle) : registres `Value` en mémoire (disposition fixe `repr(C, u8)`), constantes,
-      copies, arithmétique et comparaisons `int` / `float`, branchements et `for` en
-      code natif ; le reste appelle l'instruction de l'interpréteur (`Runtime::step`),
-      donc même sémantique par construction
-- [x] Appels plus légers (interpréteur et JIT) : registres remis à zéro d'un coup,
-      `map` / `filter` / `each` / `reduce` sans allocation ni liaison générique, noms de
-      méthodes sans allocation, construction directe d'un `type` dont tous les champs
-      sont donnés
-- [x] Tests d'équivalence sur du code non typé (closures, listes, objets, erreurs), avec
-      compilation dès le premier appel
-- [x] Fonctions d'aide dédiées au lieu de l'interpréteur pour les instructions
-      fréquentes : variables capturées et cellules, globales, appels ; gardes de type
-      en code natif
-- [x] Accès aux champs avec cache par emplacement (dernier type vu, position du champ)
-- [x] Construction d'un `type` directement depuis les registres de l'appel ; pile
-      examinée tous les 8 niveaux d'appel ; observateurs du JIT rangés dans les cases
-      des globales
-- Essayé et abandonné : champs d'objet dans l'objet (`SmallVec`) — pas plus rapide,
-  les petites allocations coûtent peu
-- [x] Champs typés dans l'IR : `p.x` d'un champ **annoté** d'un `type` donne un registre
-      `int` / `float` / `bool` (instruction `FieldAs`) ; un champ au type seulement déduit
-      (`port = 80`) n'est pas vérifié à l'exécution, il reste générique
-- [x] JIT typé : paramètres d'un type déclaré (`def dot(a: V, b: V): float`), passés par
-      pointeur ; type de l'objet vérifié une fois à l'entrée, champs lus directement à
-      leur position ; transmis tels quels aux fonctions natives de même annotation
-- [x] Hypothèse non vérifiée (type redéclaré) : l'appel est refait par l'interpréteur ;
-      la redéclaration du type recompile la fonction pour la nouvelle disposition
-- [x] Analyse de vivacité : un `nil` jamais lu (valeur d'un `while`) n'empêche plus la
-      compilation typée
-- [x] JIT typé : listes en paramètre (`[int]`, `[float]`, `[P]`…) — `for x in xs`,
-      `xs[i]` (index négatif compris), `xs.len()`, transmission aux fonctions natives ;
-      cas limite (index hors limites…) : l'interpréteur reprend l'appel et produit
-      l'erreur exacte
-- [x] JIT typé : création d'objets (`V(x: …, y: …)`) et de listes littérales, objets et
-      listes renvoyés (`def add(a: V, b: V): V`). Registres possédants : une case du cadre
-      natif, libérée à toutes les sorties (retour, erreur, abandon) ; registres
-      empruntés (paramètres, éléments d'une liste reçue) : simple pointeur. Testé par
-      les compteurs de références après des milliers d'appels
-- [x] Typage des registres selon le flot du programme (un type par registre et par point,
-      une variable native par couple) : la réutilisation d'un temporaire pour des types
-      différents n'empêche plus la compilation (remplace l'analyse des `nil` morts)
-- [x] Appel direct d'une fonction déjà compilée en code de base ; interpolation de
-      chaînes avec un tampon réutilisé ; méthodes intégrées appelées directement
-- Non fait, volontairement : typer les paramètres des lambdas d'après la liste
-  (`xs.map(|x| …)`) — une liste `[int]` peut recevoir une autre valeur depuis du code
-  non typé, et le coût restant est celui de l'appel, pas du calcul
+- [x] Baseline compilation of any function (second call, or first if it has a loop):
+      `Value` registers in memory (fixed `repr(C, u8)` layout), constants, copies,
+      `int` / `float` arithmetic and comparisons, branches and `for` in native code;
+      everything else calls the interpreter's instruction (`Runtime::step`), so the
+      semantics are the same by construction
+- [x] Lighter calls (interpreter and JIT): registers cleared in one go, `map` / `filter` /
+      `each` / `reduce` without allocation or generic binding, method names without
+      allocation, direct construction of a `type` when all its fields are given
+- [x] Equivalence tests on untyped code (closures, lists, objects, errors), compiled from
+      the first call
+- [x] Dedicated helper functions instead of the interpreter for frequent instructions:
+      captured variables and cells, globals, calls; type guards in native code
+- [x] Field access with a per-site cache (last type seen, field position)
+- [x] Construction of a `type` directly from the call's registers; stack checked every 8
+      call levels; JIT watchers stored in the globals' slots
+- Tried and dropped: object fields stored inline (`SmallVec`) — not faster, small
+  allocations are cheap
+- [x] Typed fields in the IR: `p.x` of an **annotated** field of a `type` yields an
+      `int` / `float` / `bool` register (`FieldAs` instruction); a field whose type is only
+      inferred (`port = 80`) is not checked at run time, so it stays generic
+- [x] Typed JIT: parameters of a declared type (`def dot(a: V, b: V): float`), passed by
+      pointer; the object's type is checked once on entry, fields are read directly at
+      their offset; passed as is to native functions with the same annotation
+- [x] Unverified assumption (redeclared type): the call is redone by the interpreter;
+      redeclaring the type recompiles the function for the new layout
+- [x] Liveness analysis: a `nil` that is never read (value of a `while`) no longer
+      prevents typed compilation
+- [x] Typed JIT: lists as parameters (`[int]`, `[float]`, `[P]`…) — `for x in xs`,
+      `xs[i]` (negative index included), `xs.len()`, passing to native functions; edge
+      cases (index out of bounds…): the interpreter takes over the call and produces the
+      exact error
+- [x] Typed JIT: creating objects (`V(x: …, y: …)`) and list literals, returning objects
+      and lists (`def add(a: V, b: V): V`). Owning registers: a slot in the native frame,
+      released on every exit (return, error, bail-out); borrowed registers (parameters,
+      elements of a received list): a plain pointer. Tested with reference counts after
+      thousands of calls
+- [x] Flow-sensitive register typing (one type per register and per point, one native
+      variable per pair): reusing a temporary for different types no longer prevents
+      compilation (replaces the dead-`nil` analysis)
+- [x] Direct call to a function already compiled to baseline code; string interpolation
+      with a reused buffer; built-in methods called directly
+- Deliberately not done: typing lambda parameters from the list (`xs.map(|x| …)`) — an
+  `[int]` list may receive another value from untyped code, and the remaining cost is the
+  call, not the computation
 
-| Programme                               | v0.4    | maintenant | gain |
-|-----------------------------------------|--------:|-----------:|-----:|
-| listes : map / filter / sum (100 k)     | 16,9 ms | 8,0 ms     | ×2,1 |
-| closures et compteur (300 k appels)     | 27,4 ms | 13,6 ms    | ×2,0 |
-| objets : construction et champs (100 k) | 17,9 ms | 9,2 ms     | ×1,9 |
-| chaînes : interpolation (100 k)         | 11,2 ms | 6,0 ms     | ×1,9 |
-| objets typés : produit scalaire (1 M)   | 172 ms  | 3,2 ms     | ×54  |
-| boucle typée sur 100 k objets (`wsum`)  | ~6,4 ms | 0,47 ms    | ×14  |
-| vecteurs créés en code typé (1 M)       | 409 ms  | 73 ms      | ×5,6 |
-| `fib(25)` interprété (`--no-jit`)       | 28 ms   | 18 ms      | ×1,6 |
+| Program                                  | v0.4    | now     | gain |
+|------------------------------------------|--------:|--------:|-----:|
+| lists: map / filter / sum (100 k)        | 16.9 ms | 8.0 ms  | ×2.1 |
+| closures and counter (300 k calls)       | 27.4 ms | 13.6 ms | ×2.0 |
+| objects: construction and fields (100 k) | 17.9 ms | 9.2 ms  | ×1.9 |
+| strings: interpolation (100 k)           | 11.2 ms | 6.0 ms  | ×1.9 |
+| typed objects: dot product (1 M)         | 172 ms  | 3.2 ms  | ×54  |
+| typed loop over 100 k objects (`wsum`)   | ~6.4 ms | 0.47 ms | ×14  |
+| vectors created in typed code (1 M)      | 409 ms  | 73 ms   | ×5.6 |
+| interpreted `fib(25)` (`--no-jit`)       | 28 ms   | 18 ms   | ×1.6 |
 
 ### v0.6 — Annotations
 
-- [x] Arguments vérifiés avant l'exécution (comme une construction de `type`), y compris
-      pour les annotations déclarées dans un script précédent
-- [x] Conservées sur toutes les cibles (type, class, enum, variante, champ, méthode,
-      fonction, paramètre) : chaque `@[…]` est compilé en une petite fonction évaluée à
-      la lecture
-- [x] API Rust : `Engine::type_info` / `function_info` / `enum_info`, descriptions avec
-      `annotation(nom)`, `annotations(nom)`, `doc()`, `deprecated()`,
-      `Annotation::get::<T>(champ)` (module `reflect`)
-- [x] `Deprecated` et `Doc` déclarées par un prélude ; avertissement à chaque utilisation
-      d'une déclaration `@[Deprecated]` (`ErrorKind::Warning`, `Engine::take_warnings`,
-      `Engine::set_warning_handler`, affichés par l'exécutable)
-- [x] Paramètre `@[Deprecated]` : avertissement quand l'argument est passé (par
-      position ou par nom)
+- [x] Arguments checked before running (like a `type` construction), including for
+      annotations declared in a previous script
+- [x] Kept on every target (type, class, enum, variant, field, method, function,
+      parameter): each `@[…]` is compiled into a small function evaluated when read
+- [x] Rust API: `Engine::type_info` / `function_info` / `enum_info`, descriptions with
+      `annotation(name)`, `annotations(name)`, `doc()`, `deprecated()`,
+      `Annotation::get::<T>(field)` (`reflect` module)
+- [x] `Deprecated` and `Doc` declared by a prelude; a warning on every use of an
+      `@[Deprecated]` declaration (`ErrorKind::Warning`, `Engine::take_warnings`,
+      `Engine::set_warning_handler`, printed by the command line)
+- [x] `@[Deprecated]` parameter: a warning when the argument is passed (by position or
+      by name)
 
-### Ensuite
+### Next
 
-- Macros à la Crystal (v3 de `syntax.md`)
+- Crystal-style macros (v3 of `syntax.md`)
 
-## Décisions qui engagent le JIT
+## Decisions that commit the JIT
 
-| Sujet                    | Choix v0.1                                          |
+| Topic                    | v0.1 choice                                         |
 |--------------------------|-----------------------------------------------------|
-| Représentation des valeurs | `enum Value` (24 octets), types de base sans allocation ; NaN-boxing (8 octets) à étudier pour le JIT |
-| Mémoire                  | comptage de références (`Rc`), pas de ramasse-miettes |
-| Fonctions Rust           | convention unique `Fn(&[Value]) -> Result<Value, String>` |
-| Noms                     | interning : `Symbol(u32)`, comparaisons en O(1)      |
-| Positions                | `Span { start: u32, end: u32 }` en octets            |
-| AST                      | compact, nœuds désignés par index : une closure ne garde que `Rc<Script>` + index |
+| Value representation     | `enum Value` (24 bytes), basic types without allocation; NaN-boxing (8 bytes) to be studied for the JIT |
+| Memory                   | reference counting (`Rc`), no garbage collector     |
+| Rust functions           | single convention `Fn(&[Value]) -> Result<Value, String>` |
+| Names                    | interning: `Symbol(u32)`, O(1) comparisons          |
+| Positions                | `Span { start: u32, end: u32 }` in bytes            |
+| AST                      | compact, nodes referenced by index: a closure only keeps `Rc<Script>` + index |
 
-## Performances du parseur
+## Parser performance
 
-`cargo run --release --example bench_parser` compare le parseur à une grammaire
-[`peg`](https://crates.io/crates/peg) équivalente (sous-ensemble commun : `let`, assignation,
-opérateurs, appels, champs, index, listes, chaînes). La version peg fait *moins* de travail
-(pas de positions, pas d'interning).
+`cargo run --release --example bench_parser` compares the parser with an equivalent
+[`peg`](https://crates.io/crates/peg) grammar (common subset: `let`, assignment,
+operators, calls, fields, indexing, lists, strings). The peg version does *less* work
+(no positions, no interning).
 
-| Mesure                                  | bokoni        | peg          |
+| Measure                                 | bokoni        | peg          |
 |-----------------------------------------|---------------|--------------|
-| Fichier de 150 000 lignes (9 Mo)        | ~60 ms (150 Mo/s) | ~93 ms (100 Mo/s) |
-| Petit script (60 lignes) × 20 000       | ~400 ms       | ~820 ms      |
-| Allocations par ligne                   | 0,34          | 14,7         |
+| 150,000-line file (9 MB)                | ~60 ms (150 MB/s) | ~93 ms (100 MB/s) |
+| Small script (60 lines) × 20,000        | ~400 ms       | ~820 ms      |
+| Allocations per line                    | 0.34          | 14.7         |
 
-Ce qui comptait, mesuré au profileur : la quantité de mémoire touchée. Passer d'une `Box`
-par nœud à l'AST compact a divisé le temps de parsing par deux (120 ms → 60 ms) ; les autres
-optimisations (lexer à la demande, interning des noms courts) n'ont apporté que quelques %.
+What mattered, as measured with the profiler: the amount of memory touched. Moving from
+one `Box` per node to the compact AST halved parsing time (120 ms → 60 ms); the other
+optimizations (on-demand lexer, interning of short names) only brought a few %.
 
-## Robustesse
+## Robustness
 
-- Fuzzing (`tests/fuzz.rs`) : textes aléatoires, mutations de programmes valides,
-  programmes générés ; interpréteur, JIT et code de base, avec et sans vérification
-  statique : ni panique, ni blocage, mêmes résultats. Campagnes longues :
+- Fuzzing (`tests/fuzz.rs`): random text, mutations of valid programs, generated
+  programs; interpreter, JIT and baseline code, with and without static checking: no
+  panic, no hang, same results. Long campaigns:
   `BK_FUZZ=50 BK_FUZZ_SEED=3 cargo test --release --test fuzz`
-- Aucune récursion sur la pile pour des entrées démesurées : source imbriqué (limite
-  d'imbrication du parseur, longues chaînes d'opérateurs), données imbriquées des
-  centaines de milliers de fois (libération itérative de `Value`, comparaison sur une
-  pile qui grandit sur le tas)
-- Allocations démesurées refusées par une erreur plutôt qu'un arrêt du processus :
-  chaîne répétée au-delà de 2 Gio, intervalle converti en liste au-delà de 2^27
-  éléments ; `map` / `filter` / `each` / `reduce` / `find` parcourent un intervalle
-  sans le copier
-- Structures cycliques et très partagées : affichage `[…]` pour un cycle, au plus un
-  million de nœuds affichés ; égalité par bisimulation (une paire de conteneurs revue
-  compte comme égale) : termine, et en temps borné par le nombre de paires distinctes
-- Messages d'erreur bornés : seule une fenêtre de 120 caractères d'une longue ligne est
-  affichée
-- `Value` implémente `Drop` (libération itérative) : depuis Rust, lier ses champs par
-  référence (`if let Value::List(ref l) = v`) ou les cloner ; coût mesuré de 3 à 8 % sur
-  les programmes qui allouent beaucoup
+- No recursion on the stack for oversized inputs: nested source (parser nesting limit,
+  long operator chains), data nested hundreds of thousands of times (iterative release
+  of `Value`, comparison on a stack that grows on the heap)
+- Oversized allocations are refused with an error rather than aborting the process:
+  string repeated beyond 2 GiB, range converted to a list beyond 2^27 elements; `map` /
+  `filter` / `each` / `reduce` / `find` walk a range without copying it
+- Cyclic and heavily shared structures: `[…]` displayed for a cycle, at most one million
+  nodes displayed; equality by bisimulation (a pair of containers seen again counts as
+  equal): terminates, in time bounded by the number of distinct pairs
+- Bounded error messages: only a 120-character window of a long line is displayed
+- `Value` implements `Drop` (iterative release): from Rust, bind its fields by reference
+  (`if let Value::List(ref l) = v`) or clone them; measured cost of 3 to 8% on programs
+  that allocate a lot
 
-## Limites connues (v0.1)
+## Known limitations (v0.1)
 
-- Cycles de références : une fonction locale qui se capture elle-même n'est jamais libérée
-  (les fonctions globales le sont, à la destruction de l'`Engine`).
-- Une boucle `for` copie la liste parcourue avant de commencer (sûr, mais coûteux pour
-  une très grande liste).
-- Un registre typé n'est utilisé que pour une variable locale ; les globales (niveau
-  principal) restent dynamiques.
+- Reference cycles: a local function that captures itself is never freed (global
+  functions are, when the `Engine` is dropped).
+- A `for` loop copies the list it walks before starting (safe, but costly for a very
+  large list).
+- A typed register is only used for a local variable; globals (top level) stay dynamic.

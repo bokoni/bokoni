@@ -1,14 +1,14 @@
-//! Épreuve du JIT : programmes générés au hasard (graine fixe, donc reproductibles) sur
-//! des valeurs limites. Chaque appel est exécuté par l'interpréteur, par le JIT typé et
-//! par le code natif de base (compilé dès le premier appel) : résultats et messages
-//! d'erreur doivent être identiques.
+//! JIT stress test: randomly generated programs (fixed seed, so reproducible) on edge
+//! values. Each call is run by the interpreter, by the typed JIT and by the baseline
+//! native code (compiled from the first call): results and error messages must be
+//! identical.
 //!
-//! `BK_STRESS=<n>` multiplie le nombre de programmes (par défaut 1).
+//! `BK_STRESS=<n>` multiplies the number of programs (default 1).
 #![cfg(feature = "jit")]
 
 use bokoni::Engine;
 
-/// Générateur pseudo-aléatoire (xorshift64*) : sans dépendance, reproductible.
+/// Pseudo-random generator (xorshift64*): no dependency, reproducible.
 struct Rng(u64);
 
 impl Rng {
@@ -68,7 +68,7 @@ const FLOATS: &[&str] = &[
     "9007199254740993.0",
 ];
 
-/// Trois moteurs : interpréteur, JIT (typé et de base), code de base dès le premier appel.
+/// Three engines: interpreter, JIT (typed and baseline), baseline code from the first call.
 struct Trio([Engine; 3]);
 
 impl Trio {
@@ -81,7 +81,7 @@ impl Trio {
             e.set_max_call_depth(400);
             if let Err(err) = e.eval(defs) {
                 panic!(
-                    "définitions refusées :\n{}\n{defs}",
+                    "definitions rejected:\n{}\n{defs}",
                     err.render(defs, "defs")
                 );
             }
@@ -90,7 +90,7 @@ impl Trio {
         Trio([mk(false, false), mk(true, false), mk(true, true)])
     }
 
-    /// Évalue `call` dans les trois moteurs ; résultats identiques, sinon échec.
+    /// Evaluates `call` in the three engines; fails unless the results are identical.
     fn check(&mut self, defs: &str, call: &str) -> String {
         let mut outs: Vec<String> = self
             .0
@@ -102,8 +102,8 @@ impl Trio {
             .collect();
         assert!(
             outs[0] == outs[1] && outs[0] == outs[2],
-            "résultats différents pour `{call}`\n\
-             interpréteur : {}\nJIT : {}\nbase : {}\n--- définitions ---\n{defs}",
+            "different results for `{call}`\n\
+             interpreter: {}\nJIT: {}\nbaseline: {}\n--- definitions ---\n{defs}",
             outs[0],
             outs[1],
             outs[2]
@@ -119,7 +119,7 @@ fn scale() -> usize {
         .unwrap_or(1)
 }
 
-/// Expression entière sur `a`, `b`, `c`.
+/// Integer expression over `a`, `b`, `c`.
 fn int_expr(r: &mut Rng, depth: u32) -> String {
     if depth == 0 || r.below(4) == 0 {
         return match r.below(3) {
@@ -147,7 +147,7 @@ fn int_expr(r: &mut Rng, depth: u32) -> String {
     }
 }
 
-/// Expression décimale sur `x`, `y` (avec des entiers mêlés).
+/// Float expression over `x`, `y` (with integers mixed in).
 fn float_expr(r: &mut Rng, depth: u32) -> String {
     if depth == 0 || r.below(4) == 0 {
         return match r.below(5) {
@@ -181,15 +181,15 @@ fn random_integer_arithmetic() {
     let mut r = Rng(0x9E37_79B9_7F4A_7C15);
     for _ in 0..150 * scale() {
         let e = int_expr(&mut r, 4);
-        // Même expression : fonction typée (JIT typé) et non typée (code de base).
+        // Same expression: typed function (typed JIT) and untyped one (baseline code).
         let defs = format!("def f(a: int, b: int, c: int): int = {e}\ndef g(a, b, c) = {e}\n");
         let mut t = Trio::new(&defs);
         for _ in 0..4 {
             let (a, b, c) = (r.pick(INTS), r.pick(INTS), r.pick(INTS));
             let typed = t.check(&defs, &format!("f({a}, {b}, {c})"));
             let untyped = t.check(&defs, &format!("g({a}, {b}, {c})"));
-            // Hors erreurs (dont la pile d'appels nomme la fonction), même valeur.
-            if !typed.contains("erreur") {
+            // Apart from errors (whose call stack names the function), same value.
+            if !typed.contains("error") {
                 assert_eq!(typed, untyped, "{defs}");
             }
         }
@@ -207,7 +207,7 @@ fn random_float_arithmetic() {
             let (x, y) = (r.pick(FLOATS), r.pick(FLOATS));
             t.check(&defs, &format!("f({x}, {y})"));
             t.check(&defs, &format!("g({x}, {y})"));
-            // `int` passé à un paramètre `float`.
+            // `int` passed to a `float` parameter.
             t.check(&defs, &format!("f({}, {y})", r.pick(INTS)));
         }
     }
@@ -215,7 +215,7 @@ fn random_float_arithmetic() {
 
 #[test]
 fn random_mixed_comparisons() {
-    // Entiers comparés à des décimaux : conversions et égalité `int` / `float`.
+    // Integers compared with floats: conversions and `int` / `float` equality.
     let mut r = Rng(0x0123_4567_89AB_CDEF);
     let ops = ["<", "<=", ">", ">=", "==", "!="];
     for _ in 0..40 * scale() {

@@ -1,6 +1,6 @@
-//! Affichage de l'AST en S-expressions : `(+ 1 (* 2 3))`.
+//! Prints the AST as S-expressions: `(+ 1 (* 2 3))`.
 //!
-//! Sert aux tests du parseur et à `bokoni --ast`.
+//! Used by the parser tests and by `bokoni --ast`.
 
 use crate::ast::*;
 use crate::intern::{Interner, Symbol};

@@ -1,17 +1,17 @@
-//! Arbre syntaxique compact.
+//! Compact syntax tree.
 //!
-//! Les expressions (l'essentiel des nœuds) sont rangées dans un seul `Vec` de l'[`Ast`] et
-//! désignées par un [`ExprId`] (u32). Les listes de longueur variable (arguments, éléments,
-//! champs…) sont des tranches [`Slice`] de réserves partagées. Conséquences :
+//! Expressions (most of the nodes) live in a single `Vec` of the [`Ast`] and are referred
+//! to by an [`ExprId`] (u32). Variable-length lists (arguments, elements, fields…) are
+//! [`Slice`]s of shared pools. Consequences:
 //!
-//! - aucune allocation par nœud, et une destruction qui ne libère que quelques `Vec` ;
-//! - 32 octets par expression, rangées dans l'ordre du source (bonne localité de cache) ;
-//! - un nœud se désigne par un entier : une closure de l'interpréteur ne garde qu'un
-//!   index, et l'AST se sérialise facilement (prévu pour les macros).
+//! - no allocation per node, and dropping the tree only frees a few `Vec`s;
+//! - 32 bytes per expression, stored in source order (good cache locality);
+//! - a node is identified by an integer: an interpreter closure only keeps an index, and
+//!   the AST is easy to serialize (planned for macros).
 //!
-//! Les déclarations et les blocs (`def`, `type`, `if`…), bien moins nombreux, restent des
-//! structures possédées classiques. Chaque nœud porte son `Span` ; les noms et les chaînes
-//! littérales sont des `Symbol` internés.
+//! Declarations and blocks (`def`, `type`, `if`…), far less numerous, remain ordinary
+//! owned structures. Every node carries its `Span`; names and string literals are
+//! interned `Symbol`s.
 
 use crate::intern::Symbol;
 use crate::span::Span;
@@ -21,7 +21,7 @@ use std::num::NonZeroU32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ExprId(pub u32);
 
-/// Index d'un lambda (bloc `do` ou `|x| …`). `NonZeroU32` : `Option<LambdaId>` fait 4 octets.
+/// Index of a lambda (`do` block or `|x| …`). `NonZeroU32`: `Option<LambdaId>` is 4 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LambdaId(NonZeroU32);
 
@@ -32,11 +32,11 @@ impl LambdaId {
     }
 }
 
-/// Index d'une structure de contrôle (`if`, `case`, `while`, `for`).
+/// Index of a control structure (`if`, `case`, `while`, `for`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ControlId(pub u32);
 
-/// Tranche `[start, start + len)` d'une réserve de l'[`Ast`].
+/// Range `[start, start + len)` of an [`Ast`] pool.
 pub struct Slice<T> {
     pub start: u32,
     pub len: u32,
@@ -77,7 +77,7 @@ impl<T> std::fmt::Debug for Slice<T> {
     }
 }
 
-/// Réserves de nœuds d'un programme.
+/// Node pools of a program.
 #[derive(Clone, Debug, Default)]
 pub struct Ast {
     exprs: Vec<Expr>,
@@ -91,7 +91,7 @@ pub struct Ast {
     controls: Vec<Control>,
 }
 
-/// Une réserve de l'AST, adressable par `Slice<T>`.
+/// An AST pool, addressable by `Slice<T>`.
 pub trait Pool<T> {
     fn pool(&self) -> &Vec<T>;
     fn pool_mut(&mut self) -> &mut Vec<T>;
@@ -146,7 +146,7 @@ impl Ast {
         id
     }
 
-    /// Éléments d'une tranche.
+    /// Elements of a slice.
     #[inline]
     pub fn get<T>(&self, s: Slice<T>) -> &[T]
     where
@@ -155,7 +155,7 @@ impl Ast {
         &self.pool()[s.range()]
     }
 
-    /// Copie `items` dans la réserve et renvoie la tranche.
+    /// Copies `items` into the pool and returns the slice.
     pub fn alloc<T: Clone>(&mut self, items: &[T]) -> Slice<T>
     where
         Self: Pool<T>,
@@ -201,32 +201,32 @@ impl Ast {
     pub fn if_(&self, id: ControlId) -> &If {
         match self.control(id) {
             Control::If(x) => x,
-            _ => unreachable!("ControlId ne désigne pas un `if`"),
+            _ => unreachable!("ControlId does not refer to an `if`"),
         }
     }
 
     pub fn case(&self, id: ControlId) -> &Case {
         match self.control(id) {
             Control::Case(x) => x,
-            _ => unreachable!("ControlId ne désigne pas un `case`"),
+            _ => unreachable!("ControlId does not refer to a `case`"),
         }
     }
 
     pub fn while_(&self, id: ControlId) -> &While {
         match self.control(id) {
             Control::While(x) => x,
-            _ => unreachable!("ControlId ne désigne pas un `while`"),
+            _ => unreachable!("ControlId does not refer to a `while`"),
         }
     }
 
     pub fn for_(&self, id: ControlId) -> &For {
         match self.control(id) {
             Control::For(x) => x,
-            _ => unreachable!("ControlId ne désigne pas un `for`"),
+            _ => unreachable!("ControlId does not refer to a `for`"),
         }
     }
 
-    /// Nombre d'expressions.
+    /// Number of expressions.
     pub fn len(&self) -> usize {
         self.exprs.len()
     }
@@ -235,7 +235,7 @@ impl Ast {
         self.exprs.is_empty()
     }
 
-    /// Peut se trouver à gauche d'un `=`.
+    /// Can appear on the left of an `=`.
     pub fn is_assignable(&self, id: ExprId) -> bool {
         matches!(
             self.kind(id),
@@ -271,7 +271,7 @@ pub enum StmtKind {
     Enum(Box<EnumDecl>),
 }
 
-/// `let motif(: type)? = valeur`
+/// `let pattern(: type)? = value`
 #[derive(Clone, Debug, PartialEq)]
 pub struct Let {
     pub pattern: Pattern,
@@ -303,7 +303,7 @@ impl Pattern {
     }
 }
 
-/// `@[Nom(args)]`
+/// `@[Name(args)]`
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnnotationUse {
     pub path: Vec<Symbol>,
@@ -314,7 +314,7 @@ pub struct AnnotationUse {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Param {
     pub name: Symbol,
-    /// `@nom` dans un constructeur : déclare et assigne le champ.
+    /// `@name` in a constructor: declares and assigns the field.
     pub is_field: bool,
     pub ty: Option<TypeExpr>,
     pub default: Option<ExprId>,
@@ -324,10 +324,10 @@ pub struct Param {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FnDecl {
-    /// Pour un setter `def nom=(v)`, le nom est `nom=`.
+    /// For a setter `def name=(v)`, the name is `name=`.
     pub name: Symbol,
     pub name_span: Span,
-    /// `None` pour une méthode déclarée sans parenthèses (`def to_s: str = …`).
+    /// `None` for a method declared without parentheses (`def to_s: str = …`).
     pub params: Option<Vec<Param>>,
     pub ret: Option<TypeExpr>,
     pub body: Block,
@@ -342,7 +342,7 @@ pub enum TypeDeclKind {
     Annotation,
 }
 
-/// `type`, `class` ou `annotation`.
+/// `type`, `class` or `annotation`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypeDecl {
     pub kind: TypeDeclKind,
@@ -357,11 +357,11 @@ pub struct TypeDecl {
 pub enum Member {
     Field(Field),
     Method(FnDecl),
-    /// Autre instruction dans le corps (appel de macro, type imbriqué…).
+    /// Any other statement in the body (macro call, nested type…).
     Stmt(Stmt),
 }
 
-/// `nom: type = défaut`, `nom: type` ou `nom = défaut`
+/// `name: type = default`, `name: type` or `name = default`
 #[derive(Clone, Debug, PartialEq)]
 pub struct Field {
     pub name: Symbol,
@@ -428,14 +428,14 @@ pub struct Expr {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Arg {
-    /// Argument nommé : `f(nom: valeur)`
+    /// Named argument: `f(name: value)`
     pub name: Option<Symbol>,
     pub value: ExprId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum StrPart {
-    /// Texte littéral (interné).
+    /// Literal text (interned).
     Lit(Symbol),
     Expr(ExprId),
 }
@@ -475,7 +475,7 @@ pub enum BinOp {
     Ge,
     And,
     Or,
-    /// `<<` : ajout à une liste
+    /// `<<`: append to a list
     Push,
 }
 
@@ -501,7 +501,7 @@ impl BinOp {
     }
 }
 
-/// Expression. `Copy` : les enfants sont des index, pas des pointeurs possédés.
+/// Expression. `Copy`: children are indices, not owned pointers.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ExprKind {
     Int(i64),
@@ -512,7 +512,7 @@ pub enum ExprKind {
     Nil,
     SelfRef,
     Ident(Symbol),
-    /// `@nom`
+    /// `@name`
     IVar(Symbol),
     /// `Protocol::Tcp`
     Path(Slice<Symbol>),
@@ -529,27 +529,27 @@ pub enum ExprKind {
         hi: ExprId,
         inclusive: bool,
     },
-    /// `cible = valeur`, `cible += valeur` (`op = Some(Add)`)
+    /// `target = value`, `target += value` (`op = Some(Add)`)
     Assign {
         target: ExprId,
         op: Option<BinOp>,
         value: ExprId,
     },
 
-    /// `f(args)` ou `Server do … end` ; le bloc `do` est passé en dernier argument.
+    /// `f(args)` or `Server do … end`; the `do` block is passed as the last argument.
     Call {
         callee: ExprId,
         args: Slice<Arg>,
         block: Option<LambdaId>,
     },
-    /// `recv.nom(args)`
+    /// `recv.name(args)`
     MethodCall {
         recv: ExprId,
         name: Symbol,
         args: Slice<Arg>,
         block: Option<LambdaId>,
     },
-    /// `recv.nom`
+    /// `recv.name`
     Field(ExprId, Symbol),
     /// `recv.0`
     TupleIndex(ExprId, u32),
@@ -594,7 +594,7 @@ pub struct For {
     pub body: Block,
 }
 
-/// Structures de contrôle, rangées à part car elles contiennent des blocs.
+/// Control structures, stored separately because they contain blocks.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Control {
     If(If),

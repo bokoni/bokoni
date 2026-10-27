@@ -1,10 +1,10 @@
-//! Compilation native : mêmes résultats et mêmes erreurs que l'interpréteur.
+//! Native compilation: same results and same errors as the interpreter.
 #![cfg(feature = "jit")]
 
 use bokoni::Engine;
 use std::rc::Rc;
 
-/// Résultat (ou message d'erreur affiché, pile d'appels comprise) d'un programme.
+/// Result (or displayed error message, call stack included) of a program.
 fn outcome(src: &str, jit: bool) -> String {
     let mut e = Engine::new();
     e.set_output(|_| {});
@@ -15,10 +15,10 @@ fn outcome(src: &str, jit: bool) -> String {
     }
 }
 
-/// Le programme donne la même chose avec et sans JIT.
+/// The program gives the same thing with and without the JIT.
 fn same(src: &str) -> String {
     let (a, b) = (outcome(src, false), outcome(src, true));
-    assert_eq!(a, b, "JIT différent de l'interpréteur pour :\n{src}");
+    assert_eq!(a, b, "JIT differs from the interpreter for:\n{src}");
     b
 }
 
@@ -61,7 +61,7 @@ fn float_operations_match_the_interpreter() {
             }
         }
     }
-    // `int` passé à un paramètre `float`, `int` mêlé à un `float`.
+    // `int` passed to a `float` parameter, `int` mixed with a `float`.
     same("def h(x: float): float = x * 2 + 1\nh(3)");
     same(
         "def s(n: int): float\n  let t = 0.0\n  for i in 1..n\n    t += 1.0 / i\n  end\n  t\nend\ns(1000)",
@@ -82,26 +82,26 @@ fn programs_match_and_are_compiled() {
     e.eval(&format!("{src}fib(5)\neven(3)\ncollatz(6)"))
         .unwrap();
     for f in ["fib", "even", "odd", "collatz"] {
-        assert!(e.is_native(f), "`{f}` devrait être compilée");
+        assert!(e.is_native(f), "`{f}` should be compiled");
     }
-    // Non compilées : paramètre non annoté, retour non annoté, fonction intégrée.
+    // Not compiled: unannotated parameter, unannotated return, built-in function.
     e.eval("def untyped(x) = x + 1\nuntyped(1)\ndef noret(x: int) = x\nnoret(1)\ndef pr(x: int): int\n  print(x)\n  x\nend").unwrap();
     for f in ["untyped", "noret", "pr"] {
-        assert!(!e.is_native(f), "`{f}` ne devrait pas être compilée");
+        assert!(!e.is_native(f), "`{f}` should not be compiled");
     }
 }
 
 #[test]
 fn errors_match_the_interpreter() {
-    // Message, position et pile d'appels identiques.
+    // Identical message, position and call stack.
     let e = same(
         "def a(x: int): int = b(x) + 1\ndef b(x: int): int = c(x) * 2\ndef c(x: int): int = 10 / x\na(0)",
     );
-    assert!(e.contains("division par zéro"), "{e}");
-    assert!(e.contains("dans `c` appelé depuis <eval>:2:22"), "{e}");
-    assert!(e.contains("dans `a` appelé depuis <eval>:4:1"), "{e}");
+    assert!(e.contains("division by zero"), "{e}");
+    assert!(e.contains("in `c` called from <eval>:2:22"), "{e}");
+    assert!(e.contains("in `a` called from <eval>:4:1"), "{e}");
     let e = same("def inf(n: int): int = inf(n + 1)\ninf(0)");
-    assert!(e.contains("trop d'appels imbriqués (1000)"), "{e}");
+    assert!(e.contains("too many nested calls (1000)"), "{e}");
     same("def big(n: int): int = n * n * n * n * n\nbig(10000)");
 }
 
@@ -113,11 +113,11 @@ fn redefinition_invalidates_native_code() {
         .unwrap();
     assert_eq!(e.eval_as::<i64>("f(3)").unwrap(), 10);
     assert!(e.is_native("f"));
-    // Nouvelle version de `sq` : `f` est recompilée et l'utilise.
+    // New version of `sq`: `f` is recompiled and uses it.
     e.eval("def sq(x: int): int = x * x * x").unwrap();
     assert_eq!(e.eval_as::<i64>("f(3)").unwrap(), 28);
     assert!(e.is_native("f"));
-    // `sq` n'est plus compilable : `f` est interprétée, toujours correcte.
+    // `sq` can no longer be compiled: `f` is interpreted, still correct.
     e.eval("def sq(x) = x").unwrap();
     assert_eq!(e.eval_as::<i64>("f(3)").unwrap(), 4);
     assert!(!e.is_native("f"));
@@ -125,25 +125,25 @@ fn redefinition_invalidates_native_code() {
 
 #[test]
 fn deep_recursion_beyond_the_native_stack() {
-    // La pile native ne suffit pas pour 200 000 appels : l'interpréteur prend le relais
-    // (sa pile grandit sur le tas), avec le même résultat.
+    // The native stack is not enough for 200,000 calls: the interpreter takes over (its
+    // stack grows on the heap), with the same result.
     let src = "def down(n: int): int = if n == 0 then 0 else 1 + down(n - 1) end\ndown(200000)";
     let mut e = Engine::new();
     e.set_max_call_depth(1_000_000);
     assert_eq!(e.eval_as::<i64>(src).unwrap(), 200_000);
-    // Et la limite de l'utilisateur est respectée, en natif comme ailleurs.
+    // And the user's limit is respected, natively as elsewhere.
     let mut e = Engine::new();
     e.set_max_call_depth(50);
     let err = e
         .eval("def down(n: int): int = if n == 0 then 0 else 1 + down(n - 1) end\ndown(100)")
         .unwrap_err();
     assert!(
-        err.to_string().contains("trop d'appels imbriqués (50)"),
+        err.to_string().contains("too many nested calls (50)"),
         "{err}"
     );
 }
 
-/// Comme `same`, avec la compilation de base dès le premier appel de chaque fonction.
+/// Like `same`, with baseline compilation from the first call of each function.
 fn same_eager(src: &str) -> String {
     let interp = outcome(src, false);
     let mut e = Engine::new();
@@ -153,14 +153,14 @@ fn same_eager(src: &str) -> String {
         Ok(v) => e.inspect(&v),
         Err(err) => err.render(src, "test"),
     };
-    assert_eq!(interp, native, "code natif de base différent pour :\n{src}");
+    assert_eq!(interp, native, "baseline native code differs for:\n{src}");
     native
 }
 
 #[test]
 fn untyped_code_matches_the_interpreter() {
     let programs = [
-        // Arithmétique générique : entiers, décimaux, mélanges, chaînes, cas limites.
+        // Generic arithmetic: integers, floats, mixes, strings, edge cases.
         "def f(a, b) = [a + b, a - b, a * b, a / b, a % b, a < b, a == b]\n[f(7, -2), f(-7.5, 2.0), f(3, 0.5), f(-7, 2)]",
         &format!("def f(a, b) = a + b\nf({}, 1)", i64::MAX),
         &format!("def f(a, b) = a / b\nf({}, -1)", i64::MIN),
@@ -168,15 +168,15 @@ fn untyped_code_matches_the_interpreter() {
         "def f(a, b) = a + b\n[f(\"a\", \"b\"), f([1], [2])]",
         "def f(a) = not a\n[f(nil), f(false), f(0), f(\"\"), f([])]",
         "def f(a) = if a then 1 else 2 end\n[f(nil), f(false), f(true), f(0), f([1])]",
-        // Closures, captures modifiées, compteurs.
+        // Closures, modified captures, counters.
         "def counter()\n  let n = 0\n  || n += 1\nend\nlet c = counter()\nlet last = 0\nfor i in 0...1000\n  last = c()\nend\nlast",
         "def make(k) = |x| x * k\nlet fs = [make(2), make(3.5)]\nfs.map(|f| f(4))",
         "def f()\n  let fs = []\n  for i in 0..3\n    fs << || i * i\n  end\n  fs.map(|g| g())\nend\nf()",
-        // Listes, itérateurs, hash.
+        // Lists, iterators, hashes.
         "let xs = (0...200).to_list()\nxs.map(|x| x * 2).filter(|x| x % 3 == 0).sum()",
         "let t = 0\nfor x in [1, 2.5, 3]\n  t = t + x\nend\nt",
         "let h = {\"a\" => 1, \"b\" => 2}\nlet s = 0\nh.each do |k, v|\n  s += v\nend\ns",
-        // Objets, classes, enum.
+        // Objects, classes, enums.
         "type P\n  x: int = 0\n  y: int = 0\nend\nlet s = 0\nfor i in 0...500\n  let p = P(x: i, y: 2)\n  s += p.x + p.y\nend\ns",
         "type P\n  x: int = 0\n  y = x + 1\nend\n[P(x: 3), P(), P(4, 5), P do\n  x = 9\nend]",
         "type P\n  x: int\nend\nP(x: \"a\")",
@@ -184,26 +184,26 @@ fn untyped_code_matches_the_interpreter() {
         "type P\n  x: int\nend\nP(z: 1)",
         "type P\n  x: int\nend\nP()",
         "class C\n  def init(@n: int)\n  end\n  def get() = @n\nend\nlet c = C(4)\nc.get() + C(5).get()",
-        // Erreurs à l'exécution dans du code non typé, avec la pile d'appels.
+        // Runtime errors in untyped code, with the call stack.
         "def a(x) = b(x) + 1\ndef b(x) = x.nope()\na(1)",
         "def a(x) = x + \"s\"\na(1)",
         "def f()\n  let g = || x\n  g()\n  let x = 5\nend\nf()",
         "def any(x) = x\ndef f()\n  let n = 0\n  n = any(\"a\")\nend\nf()",
         "def inf(n) = inf(n + 1)\ninf(0)",
-        // Accès aux champs (cache) : plusieurs types au même endroit, champ à une autre
-        // position, classe (getter), record, variante, valeur modifiée entre deux lectures.
+        // Field access (cache): several types at the same site, field at another
+        // position, class (getter), record, variant, value modified between two reads.
         "type A\n  x: int = 1\nend\ntype B\n  y: int = 2\n  x: int = 3\nend\ndef gx(o) = o.x\nlet t = 0\nfor i in 0...20\n  t += gx(if i % 3 == 0 then A() else B() end)\nend\nt",
         "class C\n  def init(@x: int)\n  end\n  def x = @x * 10\nend\ntype A\n  x: int = 1\nend\ndef gx(o) = o.x\n[gx(A()), gx(C(4)), gx(A()), gx({x: 7})]",
         "class C\n  def init(@x: int)\n  end\nend\ndef gx(o) = o.x\ngx(C(1))",
         "type A\n  x: int = 1\nend\ndef gx(o) = o.x\nlet a = A()\nlet r = [gx(a)]\na.x = 5\nr << gx(a)\nr",
         "type A\n  x: int = 1\nend\ndef gx(o) = o.y\ngx(A())",
-        // Globales et variables capturées : cas d'erreur.
+        // Globals and captured variables: error cases.
         "def f() = g + 1\nf()",
         "def f()\n  undefined_x = 1\nend\nf()",
         "def f()\n  print = 1\nend\nf()",
         "def f()\n  let g = || y\n  let r = g()\n  let y = 1\n  r\nend\nf()",
         "def f()\n  let n = 0\n  let inc = || n += 1\n  for i in 0...10\n    inc()\n  end\n  n\nend\nf()",
-        // Chaînes.
+        // Strings.
         "let s = \"\"\nfor i in 0...50\n  s = \"#{s}#{i % 10}\"\nend\ns.len()",
     ];
     for src in programs {
@@ -214,7 +214,7 @@ fn untyped_code_matches_the_interpreter() {
 
 #[test]
 fn construction_errors_at_run_time() {
-    // Sans vérification statique, les erreurs viennent de l'exécution.
+    // Without static checks, the errors come from execution.
     let run = |src: &str| {
         let mut e = Engine::new();
         e.set_static_checks(false);
@@ -223,19 +223,19 @@ fn construction_errors_at_run_time() {
             .unwrap_or_else(|err| err.to_string())
     };
     let ty = "type P\n  x: int = 0\n  y: int = 0\nend\n";
-    assert!(run(&format!("{ty}P(z: 1, y: 2)")).contains("`P` n'a pas de champ `z`"));
-    assert!(run(&format!("{ty}P(1, x: 2)")).contains("champ `x` donné deux fois"));
+    assert!(run(&format!("{ty}P(z: 1, y: 2)")).contains("`P` has no field `z`"));
+    assert!(run(&format!("{ty}P(1, x: 2)")).contains("field `x` given twice"));
     assert!(
-        run(&format!("{ty}P(y: \"a\", x: 1)")).contains("type attendu `int`, reçu str (\"a\")")
+        run(&format!("{ty}P(y: \"a\", x: 1)")).contains("expected type `int`, got str (\"a\")")
     );
-    assert!(run(&format!("{ty}P(1, 2, 3)")).contains("`P` a 2 champs, reçu 3 arguments"));
+    assert!(run(&format!("{ty}P(1, 2, 3)")).contains("`P` has 2 fields, got 3 arguments"));
     assert_eq!(run(&format!("{ty}P(y: 1, x: 2)")), "P(x: 2, y: 1)");
 }
 
 #[test]
 fn deep_untyped_recursion() {
-    // Récursion profonde par tous les chemins d'appel : directe, à travers `map`, une
-    // méthode, une closure. La pile grandit sur le tas, sans débordement.
+    // Deep recursion through every call path: direct, through `map`, a method, a
+    // closure. The stack grows on the heap, without overflowing.
     let programs = [
         "def down(n) = if n == 0 then 0 else 1 + down(n - 1) end\ndown(100000)",
         "def down(n) = if n == 0 then 0 else [n].map(|x| down(x - 1))[0] + 1 end\ndown(30000)",
@@ -277,19 +277,19 @@ fn typed_functions_over_objects() {
         "{src}[score(P(x: 3, y: 2)), score(P(x: 1, ok: false)), dot(P(x: 2), P(x: 5, y: 4))]"
     ));
     assert_eq!(r, "[13.0, 0.0, 12.0]");
-    // Erreur dans du code natif sur un objet : même message, même pile.
+    // Error in native code on an object: same message, same stack.
     same(&format!("{src}bad(P(x: 3))"));
     let mut e = Engine::new();
     e.eval(&format!("{src}score(P(x: 1))")).unwrap();
     assert!(
         e.is_native("score") && e.is_native("dot"),
-        "fonctions sur objets compilées"
+        "functions on objects compiled"
     );
 }
 
 #[test]
 fn redeclared_type_falls_back_to_the_interpreter() {
-    // `f` est compilée en supposant `P.x : int` ; `P` est ensuite redéclaré avec `x: str`.
+    // `f` is compiled assuming `P.x: int`; `P` is then redeclared with `x: str`.
     let mut e = Engine::new();
     e.set_output(|_| {});
     e.eval("type P\n  x: int = 1\nend\ndef f(p: P): int = p.x + 1\nf(P())")
@@ -298,11 +298,11 @@ fn redeclared_type_falls_back_to_the_interpreter() {
     e.eval("type P\n  x: str = \"a\"\nend").unwrap();
     let err = e.eval("f(P())").unwrap_err().to_string();
     assert!(
-        err.contains("le champ `x` devait être un `int`, reçu str"),
+        err.contains("field `x` should be of type `int`, got str"),
         "{err}"
     );
     assert!(!e.is_native("f"));
-    // Redéclaré avec la même forme, puis une autre disposition : recompilé, correct.
+    // Redeclared with the same shape, then another layout: recompiled, correct.
     e.eval("type P\n  x: int = 2\nend").unwrap();
     assert_eq!(e.eval_as::<i64>("f(P())").unwrap(), 3);
     e.eval("type P\n  pad: str = \"\"\n  x: int = 7\nend")
@@ -313,8 +313,8 @@ fn redeclared_type_falls_back_to_the_interpreter() {
 
 #[test]
 fn typed_fields_in_untyped_code() {
-    // Champs typés lus dans des fonctions que le JIT typé ne compile pas (retour non
-    // annoté, boucle sur une liste, objet local) : code de base, même résultat.
+    // Typed fields read in functions the typed JIT does not compile (unannotated
+    // return, loop over a list, local object): baseline code, same result.
     let ty = "type P\n  x: int = 0\n  y: float = 1.5\n  name: str = \"p\"\nend\n";
     for body in [
         "def f(p: P) = p.x + p.y\nf(P(x: 2))",
@@ -340,7 +340,7 @@ fn typed_functions_over_lists() {
     let cases = [
         "[total([1, 2, 3]), total([]), mean([1.0, 2, 4.5]), wsum([P(x: 2), P(x: 3, w: 0.5)])]",
         "[at([5, 6, 7], 1), at([5, 6, 7], -1), first([P(x: 9), P(x: 1)]), pass([4, 5])]",
-        // Cas limites : l'interpréteur reprend la main, mêmes erreurs.
+        // Edge cases: the interpreter takes over again, same errors.
         "at([5, 6, 7], 3)",
         "at([5, 6, 7], -4)",
         "first([])",
@@ -355,19 +355,19 @@ fn typed_functions_over_lists() {
     e.eval(cases[0]).unwrap();
     e.eval(cases[1]).unwrap();
     for f in ["total", "mean", "wsum", "at", "first", "pass"] {
-        assert!(e.is_native(f), "`{f}` devrait être compilée");
+        assert!(e.is_native(f), "`{f}` should be compiled");
     }
 }
 
 #[test]
 fn list_with_unexpected_values_falls_back() {
-    // Une liste annotée `[int]` qui reçoit ensuite une chaîne (code non typé) : refusée
-    // à l'appel (l'annotation vérifie les éléments), en natif comme en interprété.
+    // A list annotated `[int]` that later receives a string (untyped code): rejected at
+    // the call (the annotation checks the elements), natively as when interpreted.
     let src = "def total(xs: [int]): int\n  let t = 0\n  for x in xs\n    t += x\n  end\n  t\nend\n\
                def push(l, v) = l << v\n\
                let xs: [int] = [1, 2]\ntotal(xs)\npush(xs, \"a\")\ntotal(xs)";
     let r = same(src);
-    assert!(r.contains("type attendu `[int]`"), "{r}");
+    assert!(r.contains("expected type `[int]`"), "{r}");
 }
 
 #[test]
@@ -376,12 +376,12 @@ fn interpolation() {
               type Q\n  def to_s = 1 / 0\nend\n";
     assert_eq!(
         same_eager(&format!(
-            "{ty}let w = \"mot\"\n\"#{{1}} #{{-2.5}} #{{0.1}} #{{nil}} #{{true}} #{{[1, w]}} #{{w}} #{{P(x: 3)}}\""
+            "{ty}let w = \"word\"\n\"#{{1}} #{{-2.5}} #{{0.1}} #{{nil}} #{{true}} #{{[1, w]}} #{{w}} #{{P(x: 3)}}\""
         )),
-        "\"1 -2.5 0.1 nil true [1, \\\"mot\\\"] mot P<3|[3, 1.5]>\""
+        "\"1 -2.5 0.1 nil true [1, \\\"word\\\"] word P<3|[3, 1.5]>\""
     );
-    // Erreur pendant l'affichage, puis une interpolation normale : rien ne reste du
-    // texte commencé.
+    // Error during display, then a normal interpolation: nothing remains of the text
+    // that was started.
     let mut e = Engine::new();
     e.eval(ty).unwrap();
     assert!(e.eval("\"a #{Q()} b\"").is_err());
@@ -421,14 +421,14 @@ fn typed_functions_create_objects_and_lists() {
     for f in [
         "run", "add", "scale", "id", "pick", "pair", "both", "firsts",
     ] {
-        assert!(e.is_native(f), "`{f}` devrait être compilée");
+        assert!(e.is_native(f), "`{f}` should be compiled");
     }
 }
 
 #[test]
 fn native_allocations_are_freed() {
-    // Les valeurs créées ou copiées par le code natif sont libérées exactement une fois :
-    // le compteur de références des valeurs partagées revient à sa valeur de départ.
+    // Values created or copied by native code are freed exactly once: the reference
+    // count of shared values returns to its starting value.
     let mut e = Engine::new();
     e.set_output(|_| {});
     e.eval(VEC).unwrap();
@@ -463,7 +463,7 @@ fn native_allocations_are_freed() {
         "bail([1])",
     ] {
         let _ = e.eval(call);
-        assert_eq!(counts(&mut e), before, "après `{call}`");
+        assert_eq!(counts(&mut e), before, "after `{call}`");
     }
     assert!(e.is_native("loop2") && e.is_native("keep") && e.is_native("again"));
 }

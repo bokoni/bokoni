@@ -1,15 +1,15 @@
-//! `type`, `class` et `enum` à l'exécution : construction, champs, méthodes.
+//! `type`, `class` and `enum` at runtime: construction, fields, methods.
 //!
-//! - Un `type` décrit des données : champs publics, valeurs par défaut, égalité par valeur.
-//!   Il se construit par arguments (`Route(path: "/")`) ou par bloc (`Server do … end`).
-//! - Une `class` a des champs privés (`@x`), un constructeur `init` et des méthodes ;
-//!   deux instances ne sont égales que si c'est le même objet.
-//! - Un `enum` a des variantes (`Protocol::Tcp`) avec une valeur (`.value`).
+//! - A `type` describes data: public fields, default values, equality by value. It is
+//!   built from arguments (`Route(path: "/")`) or from a block (`Server do … end`).
+//! - A `class` has private fields (`@x`), an `init` constructor and methods; two
+//!   instances are equal only if they are the same object.
+//! - An `enum` has variants (`Protocol::Tcp`) with a value (`.value`).
 //!
-//! Construction par bloc : dans le bloc, un nom de champ désigne le champ en construction
-//! (instructions `GetNamed` / `SetNamed`). Un champ lu reçoit d'abord sa valeur par
-//! défaut ; les champs jamais touchés reçoivent la leur après le bloc, quand les autres
-//! champs sont connus (`port` peut dépendre de `protocol`).
+//! Block construction: inside the block, a field name refers to the field under
+//! construction (`GetNamed` / `SetNamed` instructions). A field that is read first gets
+//! its default value; fields never touched get theirs after the block, once the other
+//! fields are known (`port` may depend on `protocol`).
 
 use crate::ast::TypeDeclKind;
 use crate::intern::{FxHashMap, Interner, Symbol};
@@ -21,7 +21,7 @@ use crate::vm::{CallArgs, Closure, Runtime};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Un `type`, une `class` ou une `annotation` déclarés.
+/// A declared `type`, `class` or `annotation`.
 pub struct TypeInfo {
     pub name: Rc<str>,
     pub kind: TypeDeclKind,
@@ -34,7 +34,7 @@ pub struct TypeInfo {
 pub struct FieldInfo {
     pub name: Symbol,
     pub ty: Option<TypeRef>,
-    /// Valeur par défaut, calculée par une petite fonction compilée.
+    /// Default value, computed by a small compiled function.
     pub default: Option<Rc<Proto>>,
     pub annotations: crate::ir::Annotations,
 }
@@ -45,7 +45,7 @@ impl TypeInfo {
     }
 }
 
-/// Instance d'un `type` ou d'une `class` : un champ par `FieldInfo`, dans l'ordre.
+/// Instance of a `type` or `class`: one field per `FieldInfo`, in order.
 pub struct Object {
     pub info: Rc<TypeInfo>,
     pub fields: Vec<Value>,
@@ -53,25 +53,25 @@ pub struct Object {
 
 pub struct EnumInfo {
     pub name: Rc<str>,
-    /// (nom, valeur) de chaque variante.
+    /// (name, value) of each variant.
     pub variants: Vec<(Symbol, Value)>,
     pub methods: FxHashMap<Symbol, Rc<Proto>>,
     pub script: Rc<Script>,
     pub annotations: crate::ir::Annotations,
-    /// Annotations de chaque variante.
+    /// Annotations of each variant.
     pub variant_annotations: Vec<crate::ir::Annotations>,
 }
 
-/// Construction en cours d'un `type` (arguments, puis bloc, puis valeurs par défaut).
+/// A `type` under construction (arguments, then block, then default values).
 pub(crate) struct ConstructCtx {
     id: u32,
     info: Rc<TypeInfo>,
     values: Vec<Option<Value>>,
-    /// Valeur par défaut en cours de calcul (détection des dépendances circulaires).
+    /// Default value being computed (detects circular dependencies).
     computing: Vec<bool>,
 }
 
-/// Noms utilisés par l'exécution, internés une fois.
+/// Names used by the runtime, interned once.
 pub(crate) struct Syms {
     pub init: Symbol,
     pub to_s: Symbol,
@@ -96,7 +96,7 @@ impl Syms {
     }
 }
 
-/// Une méthode appelable sans argument (getter) ?
+/// Is this a method callable without arguments (a getter)?
 fn is_getter(m: &Proto) -> bool {
     m.params.iter().all(|p| p.has_default)
 }
@@ -104,7 +104,7 @@ fn is_getter(m: &Proto) -> bool {
 impl Runtime {
     // ─── Construction ────────────────────────────────────────────────────────
 
-    /// Construit une instance : `Server(port: 80)`, `Server do … end`, `User("x")`.
+    /// Builds an instance: `Server(port: 80)`, `Server do … end`, `User("x")`.
     pub(crate) fn construct(
         &mut self,
         info: &Rc<TypeInfo>,
@@ -120,7 +120,7 @@ impl Runtime {
         }
         let id = self.push_ctx(info);
         let r = self.construct_inner(id, info, args, block, span);
-        let ctx = self.constructs.pop().expect("construction en cours");
+        let ctx = self.constructs.pop().expect("construction in progress");
         r?;
         let fields = ctx
             .values
@@ -133,9 +133,9 @@ impl Runtime {
         }))))
     }
 
-    /// Construction sans bloc où chaque champ est donné une fois : aucune valeur par
-    /// défaut à calculer, donc pas de construction en cours à suivre. Mêmes vérifications,
-    /// dans le même ordre, que le chemin général.
+    /// Construction without a block where each field is given once: no default value to
+    /// compute, so no construction in progress to track. Same checks, in the same order,
+    /// as the general path.
     fn construct_direct(&mut self, info: &Rc<TypeInfo>, args: CallArgs, span: Span) -> R {
         let CallArgs { pos, named, shapes } = args;
         let args = pos
@@ -145,8 +145,8 @@ impl Runtime {
         self.construct_fields(info, args, &shapes, span)
     }
 
-    /// Construction directe depuis les registres d'un appel (`P(x: 1, y: 2)`), sans
-    /// passer par `CallArgs`.
+    /// Direct construction from a call's registers (`P(x: 1, y: 2)`), without going
+    /// through `CallArgs`.
     pub(crate) fn construct_regs(
         &mut self,
         info: &Rc<TypeInfo>,
@@ -162,7 +162,7 @@ impl Runtime {
         self.construct_fields(info, args, &[], span)
     }
 
-    /// Arguments positionnels (`None`) puis nommés, un par champ.
+    /// Positional (`None`) then named arguments, one per field.
     fn construct_fields(
         &mut self,
         info: &Rc<TypeInfo>,
@@ -191,7 +191,7 @@ impl Runtime {
         }
         let fields = fields
             .into_iter()
-            .map(|v| v.expect("chaque champ est donné"))
+            .map(|v| v.expect("every field is given"))
             .collect();
         Ok(Value::Object(Rc::new(RefCell::new(Object {
             info: info.clone(),
@@ -201,8 +201,8 @@ impl Runtime {
 
     fn construct_reported(&mut self, info: &Rc<TypeInfo>, span: Span, name: Symbol) -> R {
         let msg = match info.field_index(name) {
-            Some(_) => format!("champ `{}` donné deux fois", self.name(name)),
-            None => format!("`{}` n'a pas de champ `{}`", info.name, self.name(name)),
+            Some(_) => format!("field `{}` given twice", self.name(name)),
+            None => format!("`{}` has no field `{}`", info.name, self.name(name)),
         };
         rt_err(msg, span)
     }
@@ -231,10 +231,10 @@ impl Runtime {
         if pos.len() > info.fields.len() {
             return rt_err(
                 format!(
-                    "`{}` a {} champ{}, reçu {} arguments",
+                    "`{}` has {} field{}, got {} arguments",
                     info.name,
                     info.fields.len(),
-                    if info.fields.len() > 1 { "s" } else { "" },
+                    if info.fields.len() == 1 { "" } else { "s" },
                     pos.len()
                 ),
                 span,
@@ -248,12 +248,12 @@ impl Runtime {
         for (j, (name, v)) in named.into_iter().enumerate() {
             let Some(i) = info.field_index(name) else {
                 return rt_err(
-                    format!("`{}` n'a pas de champ `{}`", info.name, self.name(name)),
+                    format!("`{}` has no field `{}`", info.name, self.name(name)),
                     span,
                 );
             };
             if self.ctx(id).values[i].is_some() {
-                return rt_err(format!("champ `{}` donné deux fois", self.name(name)), span);
+                return rt_err(format!("field `{}` given twice", self.name(name)), span);
             }
             let shape = shapes.get(npos + j).cloned().flatten();
             self.set_ctx_field(id, i, v, shape.as_deref(), span)?;
@@ -261,8 +261,8 @@ impl Runtime {
         if let Some(c) = block {
             if let Some(p) = c.proto.params.first() {
                 return rt_err(
-                    "un bloc de construction ne prend pas de paramètre : les champs sont \
-                     directement accessibles",
+                    "a construction block takes no parameters: the fields are directly \
+                     accessible",
                     p.span,
                 );
             }
@@ -287,15 +287,15 @@ impl Runtime {
             .iter()
             .rev()
             .find(|c| c.id == id)
-            .expect("construction en cours")
+            .expect("construction in progress")
     }
 
     fn ctx_mut(&mut self, id: u32) -> Option<&mut ConstructCtx> {
         self.constructs.iter_mut().rev().find(|c| c.id == id)
     }
 
-    /// Champ `name` d'une des constructions en cours visibles (`ctx`, la plus proche
-    /// d'abord) : (construction, index du champ).
+    /// Field `name` of one of the visible constructions in progress (`ctx`, innermost
+    /// first): (construction, field index).
     pub(crate) fn ctx_lookup(&self, ctx: &[u32], name: Symbol) -> Option<(u32, u32)> {
         for &id in ctx.iter().rev() {
             let Some(c) = self.constructs.iter().rev().find(|c| c.id == id) else {
@@ -315,7 +315,7 @@ impl Runtime {
             .map(|c| c.info.name.clone())
     }
 
-    /// Range la valeur d'un champ en construction, après vérification de son type.
+    /// Stores the value of a field under construction, after checking its type.
     fn set_ctx_field(
         &mut self,
         id: u32,
@@ -335,7 +335,7 @@ impl Runtime {
         Ok(())
     }
 
-    /// Valeur d'un champ en construction ; calcule sa valeur par défaut si besoin.
+    /// Value of a field under construction; computes its default value if needed.
     fn ensure_field(&mut self, id: u32, i: usize, span: Span) -> R {
         let ctx = self.ctx(id);
         if let Some(v) = &ctx.values[i] {
@@ -346,7 +346,7 @@ impl Runtime {
         if ctx.computing[i] {
             return rt_err(
                 format!(
-                    "valeur par défaut circulaire pour le champ `{}` de `{}`",
+                    "circular default value for field `{}` of `{}`",
                     self.name(field.name),
                     info.name
                 ),
@@ -356,7 +356,7 @@ impl Runtime {
         let Some(default) = &field.default else {
             return rt_err(
                 format!(
-                    "champ `{}` obligatoire pour construire `{}`",
+                    "field `{}` is required to construct `{}`",
                     self.name(field.name),
                     info.name
                 ),
@@ -376,7 +376,7 @@ impl Runtime {
     pub(crate) fn field_ref_get(&mut self, id: u32, i: u32, span: Span) -> R {
         if !self.constructs.iter().any(|c| c.id == id) {
             return rt_err(
-                "champ d'une construction terminée : il n'est plus accessible ici",
+                "field of a finished construction: it is no longer accessible here",
                 span,
             );
         }
@@ -401,7 +401,7 @@ impl Runtime {
         block: Option<&Closure>,
         span: Span,
     ) -> R {
-        // Valeurs par défaut des champs (elles peuvent se référencer entre elles).
+        // Field default values (they may refer to each other).
         let id = self.push_ctx(info);
         let mut defaults = Ok(());
         for (i, f) in info.fields.iter().enumerate() {
@@ -436,12 +436,12 @@ impl Runtime {
             Some(init) => {
                 self.call_method(this.clone(), &init, args, span)?;
             }
-            // Sans `init` : les arguments nommés remplissent les champs.
+            // Without `init`: named arguments fill the fields.
             None => {
                 if !args.pos.is_empty() {
                     return rt_err(
                         format!(
-                            "`{}` n'a pas de `init` : utiliser des arguments nommés",
+                            "`{}` has no `init`: use named arguments",
                             info.name
                         ),
                         span,
@@ -450,7 +450,7 @@ impl Runtime {
                 for (name, v) in args.named {
                     let Some(i) = info.field_index(name) else {
                         return rt_err(
-                            format!("`{}` n'a pas de champ `{}`", info.name, self.name(name)),
+                            format!("`{}` has no field `{}`", info.name, self.name(name)),
                             span,
                         );
                     };
@@ -470,7 +470,7 @@ impl Runtime {
         if let Some(i) = missing {
             return rt_err(
                 format!(
-                    "le champ `@{}` de `{}` n'est pas initialisé (valeur par défaut ou `init`)",
+                    "field `@{}` of `{}` is not initialized (default value or `init`)",
                     self.name(info.fields[i].name),
                     info.name
                 ),
@@ -480,9 +480,9 @@ impl Runtime {
         Ok(this)
     }
 
-    // ─── Champs et méthodes ──────────────────────────────────────────────────
+    // ─── Fields and methods ──────────────────────────────────────────────────
 
-    /// Méthode déclarée d'une valeur (objet ou variante d'enum).
+    /// Declared method of a value (object or enum variant).
     pub(crate) fn user_method(&self, v: &Value, name: Symbol) -> Option<Rc<Proto>> {
         match v {
             Value::Object(o) => o.borrow().info.methods.get(&name).cloned(),
@@ -491,7 +491,7 @@ impl Runtime {
         }
     }
 
-    /// `obj.champ` sur un objet ou une variante.
+    /// `obj.field` on an object or a variant.
     pub(crate) fn object_field(&mut self, v: &Value, name: Symbol, span: Span) -> R {
         match v {
             Value::Object(o) => {
@@ -499,7 +499,7 @@ impl Runtime {
                     let o = o.borrow();
                     (o.info.clone(), o.info.field_index(name))
                 };
-                // `type` : champs publics. `class` : uniquement par un getter.
+                // `type`: public fields. `class`: only through a getter.
                 if info.kind != TypeDeclKind::Class
                     && let Some(i) = idx
                 {
@@ -514,14 +514,14 @@ impl Runtime {
                     let n = self.name(name);
                     return rt_err(
                         format!(
-                            "`{n}` est un champ privé de `{}` : définir `def {n} = @{n}` pour le lire",
+                            "`{n}` is a private field of `{}`: define `def {n} = @{n}` to read it",
                             info.name
                         ),
                         span,
                     );
                 }
                 rt_err(
-                    format!("`{}` n'a pas de champ `{}`", info.name, self.name(name)),
+                    format!("`{}` has no field `{}`", info.name, self.name(name)),
                     span,
                 )
             }
@@ -540,7 +540,7 @@ impl Runtime {
                 }
                 rt_err(
                     format!(
-                        "`{}` n'a pas de champ `{}` (`.value`, `.name`)",
+                        "`{}` has no field `{}` (`.value`, `.name`)",
                         e.name,
                         self.name(name)
                     ),
@@ -548,13 +548,13 @@ impl Runtime {
                 )
             }
             _ => type_err(
-                format!("{} n'a pas de champ `{}`", v.type_label(), self.name(name)),
+                format!("{} has no field `{}`", v.type_label(), self.name(name)),
                 span,
             ),
         }
     }
 
-    /// `obj.champ = v` : champ public d'un `type`, ou setter `champ=` d'une `class`.
+    /// `obj.field = v`: public field of a `type`, or `field=` setter of a `class`.
     pub(crate) fn object_set_field(
         &mut self,
         obj: &Value,
@@ -565,7 +565,7 @@ impl Runtime {
     ) -> R<()> {
         let Value::Object(o) = obj else {
             return type_err(
-                format!("impossible d'assigner un champ sur {}", obj.type_label()),
+                format!("cannot assign a field on {}", obj.type_label()),
                 span,
             );
         };
@@ -588,20 +588,20 @@ impl Runtime {
                 let n = self.name(name);
                 rt_err(
                     format!(
-                        "`{n}` est un champ privé de `{}` : définir `def {n}=(valeur)` pour le modifier",
+                        "`{n}` is a private field of `{}`: define `def {n}=(value)` to modify it",
                         info.name
                     ),
                     span,
                 )
             }
             None => rt_err(
-                format!("`{}` n'a pas de champ `{}`", info.name, self.name(name)),
+                format!("`{}` has no field `{}`", info.name, self.name(name)),
                 span,
             ),
         }
     }
 
-    /// Méthodes des enums eux-mêmes : `Protocol.values()`, `Protocol.from("TCP")`.
+    /// Methods of enums themselves: `Protocol.values()`, `Protocol.from("TCP")`.
     pub(crate) fn enum_method(
         &mut self,
         e: &Rc<EnumInfo>,
@@ -621,7 +621,7 @@ impl Runtime {
         }
         rt_err(
             format!(
-                "`{}` n'a pas de méthode `{}` (`values()`, `from(valeur)`)",
+                "`{}` has no method `{}` (`values()`, `from(value)`)",
                 e.name,
                 self.name(name)
             ),
@@ -629,7 +629,7 @@ impl Runtime {
         )
     }
 
-    /// Texte d'une valeur pour `print` et l'interpolation : utilise `to_s` s'il est défini.
+    /// Text of a value for `print` and interpolation: uses `to_s` if defined.
     pub(crate) fn display(&mut self, v: &Value, span: Span) -> R<String> {
         if let Some(m) = self.user_method(v, self.syms.to_s)
             && is_getter(&m)

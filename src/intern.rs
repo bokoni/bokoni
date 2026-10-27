@@ -1,4 +1,4 @@
-//! Interning des identifiants : chaque nom devient un `Symbol` (u32) comparable en O(1).
+//! Identifier interning: each name becomes a `Symbol` (u32) comparable in O(1).
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -6,28 +6,27 @@ use std::hash::{BuildHasherDefault, Hasher};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Symbol(pub u32);
 
-/// Table des symboles.
+/// Symbol table.
 ///
-/// Toutes les chaînes sont concaténées dans une seule arène (pas d'allocation par nom).
+/// All strings are concatenated into a single arena (no allocation per name).
 ///
-/// - Noms courts (1 à 8 octets, presque tous les identifiants) : le nom tient dans un `u64`
-///   complété par des zéros. Un identifiant ne contient jamais d'octet nul, donc ce mot
-///   l'identifie exactement : la recherche est une multiplication et une comparaison
-///   d'entiers, sans lire l'arène.
-/// - Noms longs : table qui stocke 32 bits de hachage à côté du symbole ; l'arène n'est lue
-///   qu'en cas d'égalité des hachages.
+/// - Short names (1 to 8 bytes, almost every identifier): the name fits in a zero-padded
+///   `u64`. An identifier never contains a NUL byte, so this word identifies it exactly:
+///   lookup is one integer multiplication and comparison, without reading the arena.
+/// - Long names: a table storing 32 bits of hash next to the symbol; the arena is read
+///   only when the hashes are equal.
 pub struct Interner {
     arena: String,
-    /// `Symbol` → (début, longueur) dans `arena`.
+    /// `Symbol` → (start, length) in `arena`.
     spans: Vec<(u32, u32)>,
-    /// Noms courts : `(mot, symbole)`, mot `0` = libre. Taille : puissance de 2.
+    /// Short names: `(word, symbol)`, word `0` = free. Size: power of 2.
     short: Vec<(u64, u32)>,
     short_shift: u32,
-    /// Noms longs : `(hachage << 32) | symbole`, `EMPTY` si libre. Taille : puissance de 2.
+    /// Long names: `(hash << 32) | symbol`, `EMPTY` if free. Size: power of 2.
     table: Vec<u64>,
-    /// `64 - log2(table.len())` : l'index est pris dans les bits de poids fort du hachage.
+    /// `64 - log2(table.len())`: the index is taken from the high bits of the hash.
     shift: u32,
-    /// Nombre de noms longs (taux de remplissage de `table`).
+    /// Number of long names (load factor of `table`).
     long_count: usize,
 }
 
@@ -53,7 +52,7 @@ impl Interner {
         }
     }
 
-    /// Mot de 8 octets complété par des zéros, si `s` est un nom court sans octet nul.
+    /// Zero-padded 8-byte word, if `s` is a short name without a NUL byte.
     #[inline]
     fn short_word(s: &str) -> Option<u64> {
         let b = s.as_bytes();
@@ -70,7 +69,7 @@ impl Interner {
         (word.wrapping_mul(SEED) >> self.short_shift) as usize
     }
 
-    /// Cherche un nom court ; renvoie le symbole ou l'emplacement libre.
+    /// Looks up a short name; returns the symbol or the free slot.
     #[inline]
     fn find_short(&self, word: u64) -> Result<Symbol, usize> {
         let mask = self.short.len() - 1;
@@ -121,7 +120,7 @@ impl Interner {
         &self.arena[start as usize..(start + len) as usize]
     }
 
-    /// Cherche `s` ; renvoie le symbole ou l'emplacement libre où l'insérer.
+    /// Looks up `s`; returns the symbol or the free slot to insert it into.
     #[inline]
     fn find(&self, s: &str, hash: u64) -> Result<Symbol, usize> {
         let mask = self.table.len() - 1;
@@ -148,7 +147,7 @@ impl Interner {
             };
             let sym = self.push_str(s);
             self.short[slot] = (word, sym);
-            // Taux de remplissage max 1/2 (approché par le nombre total de noms).
+            // Max load factor 1/2 (approximated by the total number of names).
             if (self.spans.len() - self.long_count) * 2 > self.short.len() {
                 self.grow_short();
             }
@@ -190,7 +189,7 @@ impl Interner {
         }
     }
 
-    /// Cherche un symbole sans l'ajouter.
+    /// Looks up a symbol without adding it.
     pub fn get(&self, s: &str) -> Option<Symbol> {
         match Self::short_word(s) {
             Some(word) => self.find_short(word).ok(),
@@ -212,7 +211,7 @@ impl Interner {
     }
 }
 
-/// FxHash d'une suite d'octets, mot de 8 octets par mot de 8 octets.
+/// FxHash of a byte sequence, one 8-byte word at a time.
 #[inline]
 pub fn fx_hash(bytes: &[u8]) -> u64 {
     let mut h = FxHasher::default();
@@ -221,7 +220,7 @@ pub fn fx_hash(bytes: &[u8]) -> u64 {
     h.hash
 }
 
-/// Hachage FxHash (rustc) : bien plus rapide que SipHash pour des clés courtes.
+/// FxHash hashing (rustc): much faster than SipHash for short keys.
 #[derive(Default, Clone, Copy)]
 pub struct FxHasher {
     hash: u64,
@@ -287,7 +286,7 @@ mod tests {
     #[test]
     fn intern_and_resolve() {
         let mut i = Interner::new();
-        let names: Vec<String> = (0..10_000).map(|n| format!("nom{n}")).collect();
+        let names: Vec<String> = (0..10_000).map(|n| format!("name{n}")).collect();
         let syms: Vec<Symbol> = names.iter().map(|n| i.intern(n)).collect();
         for (n, s) in names.iter().zip(&syms) {
             assert_eq!(i.intern(n), *s);
@@ -296,10 +295,10 @@ mod tests {
         }
         assert_eq!(i.len(), 10_000);
         assert_eq!(i.get("absent"), None);
-        // Noms longs (> 8 octets) et noms contenant un octet nul : table générale.
-        let long = i.intern("un_nom_assez_long");
-        assert_eq!(i.intern("un_nom_assez_long"), long);
-        assert_eq!(i.resolve(long), "un_nom_assez_long");
+        // Long names (> 8 bytes) and names containing a NUL byte: general table.
+        let long = i.intern("a_fairly_long_name");
+        assert_eq!(i.intern("a_fairly_long_name"), long);
+        assert_eq!(i.resolve(long), "a_fairly_long_name");
         let nul = i.intern("a\0b");
         assert_ne!(nul, i.intern("a"));
         assert_eq!(i.intern("a\0b"), nul);

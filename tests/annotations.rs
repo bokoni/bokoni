@@ -1,4 +1,4 @@
-//! Annotations : déclaration, application, vérification, lecture depuis Rust.
+//! Annotations: declaration, application, checking, reading from Rust.
 
 use bokoni::{DeclKind, Engine, Value};
 
@@ -17,24 +17,24 @@ annotation Tag
 end
 
 @[Tag]
-@[Doc("Un serveur HTTP")]
+@[Doc("An HTTP server")]
 type Server
   @[Validate(min: 1, max: 65535)]
   port: int = 80
 
   @[Column(name: "host_name")]
-  @[Deprecated("utiliser address")]
+  @[Deprecated("use address")]
   host: str = "localhost"
 
   @[Validate(0, 10)]
   @[Validate(max: 5)]
   retries: int = 3
 
-  @[Doc("Adresse complète")]
+  @[Doc("Full address")]
   def address(): str = "#{self.host}:#{self.port}"
 end
 
-@[Deprecated("utiliser add")]
+@[Deprecated("use add")]
 def plus(a: int, b: int): int = a + b
 
 def connect(@[Validate(min: 0)] timeout: int, host = "x")
@@ -64,13 +64,13 @@ fn types_fields_and_methods() {
     assert_eq!(ty.name, "Server");
     assert_eq!(ty.kind, DeclKind::Type);
     assert!(ty.annotation("Tag").is_some());
-    assert_eq!(ty.doc(), Some("Un serveur HTTP"));
+    assert_eq!(ty.doc(), Some("An HTTP server"));
     assert_eq!(ty.all_annotations().len(), 2);
 
     let names: Vec<&str> = ty.fields().iter().map(|f| f.name.as_str()).collect();
     assert_eq!(names, ["port", "host", "retries"]);
 
-    // Exemple de la spécification.
+    // Example from the specification.
     for field in ty.fields() {
         if let Some(v) = field.annotation("Validate") {
             let min: Option<i64> = v.get("min").unwrap();
@@ -86,7 +86,7 @@ fn types_fields_and_methods() {
     assert!(
         v.get::<i64>("nope")
             .unwrap_err()
-            .contains("pas de champ `nope`")
+            .contains("has no field `nope`")
     );
     assert!(v.get::<String>("min").is_err());
 
@@ -94,10 +94,10 @@ fn types_fields_and_methods() {
     let col = host.annotation("Column").unwrap();
     assert_eq!(col.get::<String>("name").unwrap(), "host_name");
     assert!(!col.get::<bool>("primary").unwrap());
-    assert_eq!(host.deprecated(), Some(Some("utiliser address")));
+    assert_eq!(host.deprecated(), Some(Some("use address")));
     assert_eq!(port.deprecated(), None);
 
-    // Positionnels dans l'ordre des champs ; plusieurs fois la même : la dernière.
+    // Positional in field order; the same one several times: the last one wins.
     let retries = ty.field("retries").unwrap();
     let all: Vec<_> = retries.annotations("Validate").collect();
     assert_eq!(all.len(), 2);
@@ -109,14 +109,14 @@ fn types_fields_and_methods() {
 
     let m = ty.method("address").unwrap();
     assert_eq!(m.ret.as_deref(), Some("str"));
-    assert_eq!(m.doc(), Some("Adresse complète"));
+    assert_eq!(m.doc(), Some("Full address"));
 }
 
 #[test]
 fn functions_params_and_enums() {
     let mut e = engine();
     let f = e.function_info("plus").unwrap();
-    assert_eq!(f.deprecated(), Some(Some("utiliser add")));
+    assert_eq!(f.deprecated(), Some(Some("use add")));
     let ps: Vec<(&str, Option<&str>)> = f
         .params
         .iter()
@@ -146,7 +146,7 @@ fn functions_params_and_enums() {
     let a = e.type_info("Validate").unwrap();
     assert_eq!(a.kind, DeclKind::Annotation);
 
-    // Introuvable.
+    // Not found.
     assert!(e.type_info("Nope").is_err());
     assert!(e.function_info("Server").is_err());
     assert!(e.enum_info("plus").is_err());
@@ -170,12 +170,12 @@ fn arguments_are_checked() {
         let full = format!("annotation Validate\n  min: int? = nil\nend\n{src}");
         e.eval(&full).unwrap_err().to_string()
     };
-    assert!(err("@[Nope]\ndef f() = 1").contains("annotation `Nope` inconnue"));
+    assert!(err("@[Nope]\ndef f() = 1").contains("unknown annotation `Nope`"));
     assert!(err("@[Validate(min: \"a\")]\ndef f() = 1").contains("int"));
     assert!(err("@[Validate(mini: 1)]\ndef f() = 1").contains("mini"));
     assert!(err("@[Doc()]\ndef f() = 1").contains("text"));
     assert!(err("@[Doc(1)]\ndef f() = 1").contains("str"));
-    assert!(err("type T\nend\n@[T]\ndef f() = 1").contains("n'est pas une annotation"));
+    assert!(err("type T\nend\n@[T]\ndef f() = 1").contains("is not an annotation"));
     assert!(err("@[plus]\ndef f() = 1").contains("plus"));
 }
 
@@ -184,35 +184,35 @@ fn constants_and_later_scripts() {
     let mut e = Engine::new();
     e.eval("annotation Limit\n  n: int\nend\nlet MAX = 40\n")
         .unwrap();
-    // Annotation déclarée dans un script précédent ; argument calculé avec une globale.
+    // Annotation declared in an earlier script; argument computed from a global.
     e.eval("@[Limit(MAX + 2)]\ndef f() = 1").unwrap();
     let f = e.function_info("f").unwrap();
     assert_eq!(f.annotation("Limit").unwrap().get::<i64>("n").unwrap(), 42);
-    // Les arguments sont évalués à la lecture.
+    // Arguments are evaluated when read.
     e.eval("MAX = 0").unwrap();
     let f = e.function_info("f").unwrap();
     assert_eq!(f.annotation("Limit").unwrap().get::<i64>("n").unwrap(), 2);
-    // Erreur pendant l'évaluation : signalée à la lecture.
+    // Error during evaluation: reported when read.
     e.eval("@[Limit(10 / MAX)]\ndef g() = 1").unwrap();
     let err = e.function_info("g").unwrap_err().to_string();
-    assert!(err.contains("division par zéro"), "{err}");
+    assert!(err.contains("division by zero"), "{err}");
 }
 
 #[test]
 fn deprecated_uses_are_warned() {
     let mut e = Engine::new();
     e.set_output(|_| {});
-    // Déclarations dans un premier script…
+    // Declarations in a first script…
     e.eval(SPEC).unwrap();
-    // Une déclaration n'est pas une utilisation ; `address` lit bien `host`.
+    // A declaration is not a use; `address` does read `host`.
     let w: Vec<String> = e
         .take_warnings()
         .iter()
         .map(|w| w.message.clone())
         .collect();
-    assert_eq!(w, ["`Server.host` est obsolète : utiliser address"]);
-    // …utilisations dans le suivant (déclarations importées) : avertissements, et le
-    // script s'exécute.
+    assert_eq!(w, ["`Server.host` is deprecated: use address"]);
+    // …uses in the next one (imported declarations): warnings, and the
+    // script runs.
     let v = e
         .eval("let s = Server(host: \"a\")\n[plus(1, 2), s.host, Protocol::Ftp.value, Protocol::Tcp.value, s.port]")
         .unwrap();
@@ -225,25 +225,25 @@ fn deprecated_uses_are_warned() {
     assert_eq!(
         w,
         [
-            "`Server.host` est obsolète : utiliser address",
-            "`plus` est obsolète : utiliser add",
-            "`Server.host` est obsolète : utiliser address",
-            "`Protocol::Ftp` est obsolète",
+            "`Server.host` is deprecated: use address",
+            "`plus` is deprecated: use add",
+            "`Server.host` is deprecated: use address",
+            "`Protocol::Ftp` is deprecated",
         ]
     );
     assert!(e.take_warnings().is_empty());
 
-    // Dans le même script, avec un gestionnaire : appelé avant l'exécution.
+    // In the same script, with a handler: called before execution.
     let mut e = Engine::new();
     let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let (l1, l2) = (log.clone(), log.clone());
     e.set_output(move |s| l1.borrow_mut().push(format!("print {s}")));
     e.set_warning_handler(move |w| l2.borrow_mut().push(w.to_string()));
-    e.eval("@[Deprecated(\"non\")]\ndef old() = 1\nclass C\n  @[Deprecated]\n  def m() = 2\nend\nprint(old() + C().m())").unwrap();
+    e.eval("@[Deprecated(\"no\")]\ndef old() = 1\nclass C\n  @[Deprecated]\n  def m() = 2\nend\nprint(old() + C().m())").unwrap();
     let log = log.borrow();
     assert_eq!(log.len(), 3, "{log:?}");
-    assert!(log[0].contains("`old` est obsolète : non"), "{log:?}");
-    assert!(log[1].contains("`C.m` est obsolète"), "{log:?}");
+    assert!(log[0].contains("`old` is deprecated: no"), "{log:?}");
+    assert!(log[1].contains("`C.m` is deprecated"), "{log:?}");
     assert!(log[2].starts_with("print 3"), "{log:?}");
 }
 
@@ -251,7 +251,7 @@ fn deprecated_uses_are_warned() {
 fn deprecated_parameters_are_warned_when_passed() {
     let mut e = Engine::new();
     e.set_output(|_| {});
-    let src = "def connect(host: str, @[Deprecated(\"utiliser timeout_ms\")] timeout: int = 0, timeout_ms: int = 0) = host\n";
+    let src = "def connect(host: str, @[Deprecated(\"use timeout_ms\")] timeout: int = 0, timeout_ms: int = 0) = host\n";
     e.eval(&format!("{src}connect(\"a\")\nconnect(\"a\", 5)\nconnect(\"a\", timeout_ms: 5)\nconnect(\"a\", timeout: 1)")).unwrap();
     let w: Vec<String> = e
         .take_warnings()
@@ -261,11 +261,11 @@ fn deprecated_parameters_are_warned_when_passed() {
     assert_eq!(
         w,
         [
-            "le paramètre `timeout` de `connect` est obsolète : utiliser timeout_ms",
-            "le paramètre `timeout` de `connect` est obsolète : utiliser timeout_ms",
+            "parameter `timeout` of `connect` is deprecated: use timeout_ms",
+            "parameter `timeout` of `connect` is deprecated: use timeout_ms",
         ]
     );
-    // Fonction d'un script précédent : même avertissement.
+    // Function from an earlier script: same warning.
     e.eval("connect(\"b\", timeout: 2)").unwrap();
     assert_eq!(e.take_warnings().len(), 1);
 }

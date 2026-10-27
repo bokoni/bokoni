@@ -1,9 +1,9 @@
-//! Fuzzing : textes aléatoires, mutations de programmes valides et programmes générés.
-//! Pour chacun, aucun plantage (panique), aucun blocage, et le même résultat — ou le
-//! même message d'erreur — avec l'interpréteur, le JIT et le code natif de base.
+//! Fuzzing: random text, mutations of valid programs and generated programs. For each
+//! one: no crash (panic), no hang, and the same result — or the same error message —
+//! with the interpreter, the JIT and the baseline native code.
 //!
-//! Graine fixe : un échec se reproduit. `BK_FUZZ=<n>` multiplie le nombre de cas,
-//! `BK_FUZZ_SEED=<n>` change la graine (autres programmes).
+//! Fixed seed: a failure reproduces. `BK_FUZZ=<n>` multiplies the number of cases,
+//! `BK_FUZZ_SEED=<n>` changes the seed (other programs).
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -27,7 +27,7 @@ impl Rng {
     }
 }
 
-/// Graine du générateur : `base`, modifiée par `BK_FUZZ_SEED`.
+/// Generator seed: `base`, modified by `BK_FUZZ_SEED`.
 fn seed(base: u64) -> Rng {
     let extra: u64 = std::env::var("BK_FUZZ_SEED")
         .ok()
@@ -36,8 +36,8 @@ fn seed(base: u64) -> Rng {
     Rng(base ^ extra.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
 }
 
-/// Nombre de cas : `n` (un cinquième en debug, pour que `cargo test` reste rapide),
-/// multiplié par `BK_FUZZ`.
+/// Number of cases: `n` (a fifth in debug, so that `cargo test` stays fast),
+/// multiplied by `BK_FUZZ`.
 fn count(n: usize) -> usize {
     match std::env::var("BK_FUZZ")
         .ok()
@@ -49,7 +49,7 @@ fn count(n: usize) -> usize {
     }
 }
 
-/// Résultat d'un programme dans un mode : valeur affichée ou erreurs.
+/// Result of a program in one mode: displayed value or errors.
 fn outcome(src: &str, jit: bool, eager: bool, checks: bool) -> String {
     let mut e = bokoni::Engine::new();
     e.set_output(|_| {});
@@ -65,10 +65,10 @@ fn outcome(src: &str, jit: bool, eager: bool, checks: bool) -> String {
     }
 }
 
-/// Exécute `src` dans les trois modes (interpréteur, JIT, code de base dès le premier
-/// appel), avec puis sans vérification statique (le code mal typé atteint alors
-/// l'exécution), dans un fil séparé (délai maximal, pile large) ; échoue en cas de
-/// panique, de blocage ou de résultats différents.
+/// Runs `src` in the three modes (interpreter, JIT, baseline code from the first call),
+/// with then without static checks (ill-typed code then reaches execution), on a
+/// separate thread (timeout, large stack); fails on a panic, a hang or different
+/// results.
 fn run(src: &str) {
     let code = src.to_string();
     let (tx, rx) = mpsc::channel();
@@ -97,12 +97,12 @@ fn run(src: &str) {
             for [a, b, c] in modes {
                 assert!(
                     a == b && a == c,
-                    "résultats différents pour :\n{src}\n--- interpréteur ---\n{a}\n--- JIT ---\n{b}\n--- base ---\n{c}"
+                    "different results for:\n{src}\n--- interpreter ---\n{a}\n--- JIT ---\n{b}\n--- baseline ---\n{c}"
                 );
             }
         }
-        Ok(Err(msg)) => panic!("plantage ({msg}) pour :\n{src}"),
-        Err(_) => panic!("bloqué (plus de 20 s) :\n{src}"),
+        Ok(Err(msg)) => panic!("crash ({msg}) for:\n{src}"),
+        Err(_) => panic!("hung (more than 20 s):\n{src}"),
     }
 }
 
@@ -201,8 +201,8 @@ const VOCAB: &[&str] = &[
     "print",
 ];
 
-/// Programmes valides servant de base aux mutations. Sans `while` : une mutation en fait
-/// facilement une boucle infinie, indiscernable d'un blocage.
+/// Valid programs used as a base for mutations. No `while`: a mutation easily turns it
+/// into an infinite loop, indistinguishable from a hang.
 const CORPUS: &[&str] = &[
     "let a = 1\nlet b = a + 2\nb * 3",
     "def f(x: int): int = if x < 2 then x else f(x - 1) + f(x - 2) end\nf(10)",
@@ -216,18 +216,18 @@ const CORPUS: &[&str] = &[
     "enum E: str\n  A = \"a\"\n  B = \"b\"\nend\n[E::A.value, E::B, E.values()]",
     "def k()\n  let n = 0\n  let inc = || n += 1\n  inc()\n  inc()\n  n\nend\nk()",
     "let t = 0\nfor v in [1, 2, 3]\n  t += v\nend\nt",
-    "case 3\nwhen 1 then \"un\"\nwhen 3 then \"trois\"\nelse \"autre\"\nend",
+    "case 3\nwhen 1 then \"one\"\nwhen 3 then \"three\"\nelse \"other\"\nend",
     "let (a, b) = (1, \"x\")\nlet [c, ...d] = [1, 2, 3]\n[a, b, c, d]",
     "def m(xs: [int]): int\n  let t = 0\n  for x in xs\n    t += x * x\n  end\n  t\nend\nm([1, 2, 3])",
     "type V\n  x: float = 0.0\nend\ndef add(a: V, b: V): V = V(x: a.x + b.x)\nadd(V(x: 1.0), V(x: 2.0)).x",
-    "annotation A\n  n: int = 0\nend\n@[A(n: 2)]\ndef f() = \"#{1 + 1} et #{[1, 2]}\"\nf()",
+    "annotation A\n  n: int = 0\nend\n@[A(n: 2)]\ndef f() = \"#{1 + 1} and #{[1, 2]}\"\nf()",
     "let l: [any] = [1]\nl << l\nlet m: [any] = [1]\nm << m\n[l == m, l.len(), \"#{l}\"]",
     "let h: {str => any} = {\"a\" => 1}\nh[\"self\"] = h\n[h == h, h.keys(), h]",
     "let n = 9223372036854775807\n[n - 1, n / 2, -n, 7 % -3, -7 / 2, 2.0 / 3]",
 ];
 
-/// Mutation d'un programme : suppression, duplication ou échange de lignes, insertion
-/// d'un jeton, suppression ou remplacement de caractères.
+/// Mutates a program: deletes, duplicates or swaps lines, inserts a token, deletes or
+/// replaces characters.
 fn mutate(r: &mut Rng, src: &str) -> String {
     let mut s = src.to_string();
     for _ in 0..1 + r.below(3) {
@@ -294,12 +294,12 @@ fn random_token_soup() {
 #[test]
 fn mutated_programs() {
     let mut r = seed(0xE703_7ED1_A0B4_28DB);
-    // Le corpus lui-même s'exécute sans erreur.
+    // The corpus itself runs without errors.
     for src in CORPUS {
         let mut e = bokoni::Engine::new();
         e.set_output(|_| {});
         if let Err(err) = e.eval(src) {
-            panic!("corpus invalide :\n{}", err.render(src, "corpus"));
+            panic!("invalid corpus:\n{}", err.render(src, "corpus"));
         }
     }
     for _ in 0..count(400) {
@@ -309,15 +309,15 @@ fn mutated_programs() {
     }
 }
 
-/// Programme plausible, surtout bien typé (pour aller loin dans l'exécution), avec une
-/// part de mélanges hasardeux : déclarations, fonctions typées (JIT) et non typées,
+/// Plausible program, mostly well typed (to get far into execution), with a share of
+/// random mixes: declarations, typed (JIT) and untyped functions,
 /// objets, listes, closures, boucles.
 fn program(r: &mut Rng) -> String {
-    // Expression entière (variables `a`, `n` entières) ; `calls` : peut appeler `g` et
-    // `h` (pas dans leur propre corps : récursion sans fin).
+    // Integer expression (integer variables `a`, `n`); `calls`: may call `g` and `h`
+    // (not in their own body: endless recursion).
     fn int(r: &mut Rng, d: u32, calls: bool) -> String {
         if d == 0 {
-            // Grands nombres rares : sinon presque tout déborde.
+            // Big numbers are rare: otherwise almost everything overflows.
             if r.below(30) == 0 {
                 return r
                     .pick(&["9223372036854775807", "-9223372036854775808"])
@@ -348,7 +348,7 @@ fn program(r: &mut Rng) -> String {
             _ => format!("(-{})", e(r)),
         }
     }
-    // Valeur quelconque : mélanges (types différents, `nil`, chaînes…).
+    // Any value: mixes (different types, `nil`, strings…).
     fn wild(r: &mut Rng, d: u32) -> String {
         if d == 0 {
             return r

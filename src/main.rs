@@ -1,18 +1,18 @@
-//! `bokoni` : exécute un script, une expression, ou lance le REPL.
+//! `bokoni`: runs a script or an expression, or starts the REPL.
 
 use bokoni::{Engine, Value};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-usage :
+usage:
   bokoni                    REPL
-  bokoni fichier.bk         exécute un fichier
-  bokoni -e \"code\"          exécute du code et affiche le résultat
-  bokoni --ast fichier.bk   affiche l'arbre syntaxique (S-expressions)
-  bokoni --ir fichier.bk    affiche l'IR (ce qu'exécute l'interpréteur)
-  (--ast et --ir acceptent aussi -e \"code\")
-  --no-jit                  sans compilation native (interpréteur seul)";
+  bokoni file.bk            runs a file
+  bokoni -e \"code\"          runs code and prints the result
+  bokoni --ast file.bk      prints the syntax tree (S-expressions)
+  bokoni --ir file.bk       prints the IR (what the interpreter runs)
+  (--ast and --ir also accept -e \"code\")
+  --no-jit                  no native compilation (interpreter only)";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -32,26 +32,26 @@ fn main() -> ExitCode {
             "--no-jit" => jit = false,
             "-e" => match it.next() {
                 Some(src) => code = Some((src.clone(), "<-e>".into())),
-                None => return usage_error("`-e` attend du code"),
+                None => return usage_error("`-e` expects code"),
             },
             path if !path.starts_with('-') && code.is_none() => match std::fs::read_to_string(path)
             {
                 Ok(src) => code = Some((src, path.to_string())),
                 Err(e) => {
-                    eprintln!("impossible de lire {path} : {e}");
+                    eprintln!("cannot read {path}: {e}");
                     return ExitCode::FAILURE;
                 }
             },
-            other => return usage_error(&format!("argument inconnu `{other}`")),
+            other => return usage_error(&format!("unknown argument `{other}`")),
         }
     }
 
     let mut engine = Engine::new();
-    // Avertissements (déclarations `@[Deprecated]`…) : affichés avant l'exécution.
+    // Warnings (`@[Deprecated]` declarations…): printed before execution.
     engine.set_warning_handler(|w| eprint!("{}", w.render("", "")));
     engine.set_jit(jit);
     match code {
-        None if ast || ir => usage_error("`--ast` / `--ir` attendent un fichier ou `-e`"),
+        None if ast || ir => usage_error("`--ast` / `--ir` expect a file or `-e`"),
         Some((src, name)) if ir => match engine.ir(&src) {
             Ok(s) => {
                 print!("{s}");
@@ -75,7 +75,7 @@ fn main() -> ExitCode {
         },
         Some((src, name)) => match engine.eval_named(&src, &name) {
             Ok(v) => {
-                // Avec `-e`, le résultat est affiché (sauf nil) ; un fichier ne l'affiche pas.
+                // With `-e`, the result is printed (unless nil); a file does not print it.
                 if name == "<-e>" && !matches!(v, Value::Nil) {
                     println!("{}", engine.inspect(&v));
                 }
@@ -98,7 +98,7 @@ fn repl(engine: &mut Engine) -> ExitCode {
     let interactive = io::stdin().is_terminal();
     if interactive {
         println!(
-            "bokoni {} — `:q` ou Ctrl-D pour quitter",
+            "bokoni {} — `:q` or Ctrl-D to quit",
             env!("CARGO_PKG_VERSION")
         );
     }
@@ -131,7 +131,7 @@ fn repl(engine: &mut Engine) -> ExitCode {
         match engine.eval_named(&buffer, &name) {
             Ok(Value::Nil) => {}
             Ok(v) => println!("=> {}", engine.inspect(&v)),
-            // Construction pas encore terminée (`def` sans `end`…) : on lit la suite.
+            // Construct not finished yet (`def` without `end`…): read the next line.
             Err(e) if e.is_incomplete() => {
                 n -= 1;
                 continue;
