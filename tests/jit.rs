@@ -977,3 +977,45 @@ end
     assert_eq!(e.eval_as::<i64>("total([A(5), B(1)])").unwrap(), 105);
     assert!(e.is_native("total"));
 }
+
+#[test]
+fn classes_constructed_in_native_code() {
+    let src = "class V
+  def init(@x: float, @y: float)
+  end
+  def n2(): float = @x * @x + @y * @y
+end
+class Named
+  def init(@name: str, @tags: [str])
+    @size = @tags.len()
+  end
+  size: int = 0
+  def size(): int = @size
+end
+class Half
+  def init(@a: int, b: int)
+    if b > 0 then @b = b end
+  end
+  b: int
+end
+def total(n: int): float
+  let t = 0.0
+  for i in 0...n
+    let v = V(i * 1.0, 2.0)
+    t += v.n2()
+  end
+  t
+end
+def half(b: int): int
+  let h = Half(1, b)
+  1
+end
+[total(100), Named(\"x\", [\"a\", \"b\"]).size()]";
+    assert_eq!(same(src), "[328750.0, 2]");
+    let mut e = Engine::new();
+    e.eval(src).unwrap();
+    assert!(e.is_native("total"));
+    // A field not initialized by `init`: the interpreter's error.
+    same(&format!("{src}\nhalf(1)"));
+    same(&format!("{src}\nhalf(0)"));
+}

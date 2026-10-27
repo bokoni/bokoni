@@ -865,6 +865,41 @@ extern "C" fn bk_box_into(out: *mut Value, bits: u64, kind: i32) {
     }
 }
 
+/// A new object of class `info` into the slot `out`, its fields not initialized (its
+/// `init`, compiled, follows).
+extern "C" fn bk_new_object(info: *const crate::objects::TypeInfo, out: *mut Value) {
+    // SAFETY: `info` is kept alive by the `Jit` (`known_types`); `out` is a slot.
+    unsafe {
+        Rc::increment_strong_count(info);
+        let info = Rc::from_raw(info);
+        let n = info.fields.len();
+        *out = Value::Object(Rc::new(std::cell::RefCell::new(crate::objects::Object {
+            info,
+            fields: vec![Value::Uninit; n],
+        })));
+    }
+}
+
+/// After the `init` of a new object: 0, or 1 if a field is not initialized (the
+/// interpreter's error, `JitCtx::pending`).
+extern "C" fn bk_init_done(ctx: *mut JitCtx, obj: *const Value, span: u64) -> i32 {
+    // SAFETY: `obj` is the slot of the new object; `ctx.rt` is valid.
+    unsafe {
+        let Value::Object(o) = &*obj else {
+            return 0;
+        };
+        let span = Span::new(span as u32, (span >> 32) as u32);
+        match (*(*ctx).rt).initialized(o, span) {
+            Ok(()) => 0,
+            Err(e) => {
+                (*ctx).pending = Some(e);
+                (*ctx).err = PENDING;
+                1
+            }
+        }
+    }
+}
+
 /// Truthiness of a value (`if v`, `not v`).
 extern "C" fn bk_truthy(v: *const Value) -> i8 {
     // SAFETY: `v` is null or a live value.
@@ -1132,8 +1167,9 @@ pub struct Jit {
     list_fns: [FuncId; 3],
     /// `bk_str_add`, `bk_str_cmp`, `bk_str_len`, `bk_concat`.
     str_fns: [FuncId; 4],
-    /// `bk_call_boxed`, `bk_binary`, `bk_truthy`, `bk_global`, `bk_box_into`.
-    boxed_fns: [FuncId; 5],
+    /// `bk_call_boxed`, `bk_binary`, `bk_truthy`, `bk_global`, `bk_box_into`,
+    /// `bk_new_object`, `bk_init_done`.
+    boxed_fns: [FuncId; 7],
     /// Calls through the interpreter (addresses held by native code).
     #[allow(clippy::vec_box)]
     boxed_calls: Vec<Box<BoxedCall>>,
@@ -1239,7 +1275,7 @@ fn ret_jty(anns: &mut Vec<RtType>, q: &Proto) -> JTy {
 /// Native signature of a function (parameters and return), otherwise `None`.
 /// For a method (not `init`): `self` first.
 fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
-    let method = p.kind == ProtoKind::Method && !p.name.ends_with(".init");
+    let method = p.kind == ProtoKind::Method;
     let function = matches!(p.kind, ProtoKind::Function | ProtoKind::Lambda);
     if !(function || method) || !p.captures.is_empty() || p.ncells != 0 {
         return None;
@@ -1249,7 +1285,8 @@ fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
         params.push(RegTy::Value);
     }
     for prm in &p.params {
-        if prm.has_default || prm.field.is_some() {
+        // (`init(@x)`: its code assigns the field.)
+        if prm.has_default {
             return None;
         }
         params.push(native_ty(&prm.ty.as_ref()?.ty)?);
@@ -1443,6 +1480,9 @@ struct Plan {
     /// Instructions done by the interpreter (key: address): calls of functions not
     /// compiled, operations on `JTy::Boxed` values.
     boxed: crate::intern::FxHashSet<usize>,
+    /// Classes constructed natively (key: address of the `Call`): an object, then its
+    /// `init` (the target) called directly.
+    news: FxHashMap<usize, Rc<crate::objects::TypeInfo>>,
 }
 
 /// Type of an element of type `anns[a]`.
@@ -1465,6 +1505,9 @@ struct Analysis<'a> {
     targets: FxHashMap<usize, Target>,
     this: Option<Rc<crate::objects::TypeInfo>>,
     boxed: crate::intern::FxHashSet<usize>,
+    /// See `Plan::news`. (key: address of the `Call`): an object, then its
+    /// `init` (the target) called directly.
+    news: FxHashMap<usize, Rc<crate::objects::TypeInfo>>,
 }
 
 /// Function compiled and called directly; for a method, the type of `self` it is
@@ -1972,6 +2015,59 @@ impl Analysis<'_> {
                         }
                         ret_jty(&mut self.anns, &callee)
                     }
+                    // A class: a new object, then its `init` called natively (no field with
+                    // a default value: those are computed by the interpreter).
+                    JTy::Ctor(slot)
+                        if matches!(&self.globals.at(slot).value,
+                            Some(Value::Type(i)) if i.kind == crate::ast::TypeDeclKind::Class) =>
+                    {
+                        let info = match &self.globals.at(slot).value {
+                            Some(Value::Type(info)) => info.clone(),
+                            _ => return None,
+                        };
+                        if info.is_abstract
+                            || info.fields.iter().any(|f| f.default.is_some())
+                            || site.block
+                            || !site.named.is_empty()
+                        {
+                            return None;
+                        }
+                        let init = info.methods.values().find(|m| m.name.ends_with(".init"))?.clone();
+                        let (cparams, _) = native_sig(&init)?;
+                        if site.npos as usize + 1 != cparams.len() {
+                            return None;
+                        }
+                        for (k, pt) in cparams[1..].iter().enumerate() {
+                            let at = g(site.start + k as u32)?;
+                            let ok = match (pt, at) {
+                                (RegTy::Float, JTy::Int | JTy::Float) => true,
+                                (RegTy::Value, JTy::Obj(_) | JTy::List(_) | JTy::Str) => {
+                                    kind_for(&self.anns, at, ann_of(&init, k)) == Some(Kind::Ref)
+                                }
+                                (t, a) => *t != RegTy::Value && jty(*t) == a,
+                            };
+                            if !ok {
+                                return None;
+                            }
+                        }
+                        let name = init.decl.as_ref()?.name;
+                        let owner = crate::objects::method_owner(&info, name, &init);
+                        let key = ins as *const Instr as usize;
+                        self.targets.insert(
+                            key,
+                            Target {
+                                proto: init.clone(),
+                                this: Some(owner),
+                                declared: Some(init),
+                            },
+                        );
+                        self.news.insert(key, info);
+                        if !self.ctors.contains(&slot) {
+                            self.ctors.push(slot);
+                        }
+                        let t = RtType::Named(slot, crate::intern::Symbol(u32::MAX), Rc::from([]));
+                        JTy::Obj(intern_ann(&mut self.anns, &t))
+                    }
                     JTy::Ctor(slot) => {
                         let info = global_type(self.globals, slot)?;
                         let tys: Vec<Option<JTy>> = cur.iter().map(|l| l.get()).collect();
@@ -2019,6 +2115,7 @@ fn analyze(
         ctors: Vec::new(),
         targets: FxHashMap::default(),
         boxed: Default::default(),
+        news: FxHashMap::default(),
         this: this.clone(),
     };
     // Typed IR registers: their type does not change.
@@ -2145,6 +2242,7 @@ fn analyze(
         callees: an.callees,
         ctors: an.ctors,
         boxed: an.boxed,
+        news: an.news,
         anns: an.anns,
         targets: an.targets,
         this,
@@ -2259,6 +2357,8 @@ impl Jit {
         builder.symbol("bk_truthy", bk_truthy as *const u8);
         builder.symbol("bk_global", bk_global as *const u8);
         builder.symbol("bk_box_into", bk_box_into as *const u8);
+        builder.symbol("bk_new_object", bk_new_object as *const u8);
+        builder.symbol("bk_init_done", bk_init_done as *const u8);
         builder.symbol("bk_str_cmp", bk_str_cmp as *const u8);
         builder.symbol("bk_str_len", bk_str_len as *const u8);
         builder.symbol("bk_concat", bk_concat as *const u8);
@@ -2397,6 +2497,8 @@ impl Jit {
                 &[ptr, types::I64, types::I32][..],
                 types::INVALID,
             ),
+            ("bk_new_object", &[ptr, ptr][..], types::INVALID),
+            ("bk_init_done", &[ptr, ptr, types::I64][..], types::I32),
         ] {
             let mut sig = module.make_signature();
             for t in params {
@@ -2407,7 +2509,7 @@ impl Jit {
             }
             boxed_fns.push(module.declare_function(name, Linkage::Import, &sig).ok()?);
         }
-        let boxed_fns: [FuncId; 5] = boxed_fns.try_into().ok()?;
+        let boxed_fns: [FuncId; 7] = boxed_fns.try_into().ok()?;
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr));
         sig.params.push(AbiParam::new(ptr));
@@ -2656,7 +2758,15 @@ impl Jit {
             .declare_func_in_func(self.list_fn, &mut ctx.func);
         let [this_fields_fn, method_fn] = self.this_fns;
         let [push_fn, set_fn, snapshot_fn] = self.list_fns;
-        let [call_boxed_ref, binary_ref, truthy_ref, global_ref, box_ref] = self
+        let [
+            call_boxed_ref,
+            binary_ref,
+            truthy_ref,
+            global_ref,
+            box_ref,
+            new_ref,
+            init_done_ref,
+        ] = self
             .boxed_fns
             .map(|f| self.module.declare_func_in_func(f, &mut ctx.func));
         let [str_add_ref, str_cmp_ref, str_len_ref, concat_ref] = self
@@ -3305,6 +3415,95 @@ impl Jit {
                             .get(&key)
                             .is_some_and(|t| !self.compiled.contains_key(&t.key())));
                 match ins {
+                    // A class constructed natively: the object, its `init`, the check
+                    // that every field is initialized.
+                    Call { dst, site, .. } if !boxed_call && plan.news.contains_key(&key) => {
+                        let info = &plan.news[&key];
+                        if !self.known_types.iter().any(|t| Rc::ptr_eq(t, info)) {
+                            self.known_types.push(info.clone());
+                        }
+                        let target = &plan.targets[&key];
+                        let (fref, q) = callee_refs[&target.key()].clone();
+                        let (cparams, cret) = native_sig(&q).ok_or(())?;
+                        let site = &p.calls[*site as usize];
+                        let obj = own!(bx, *dst);
+                        let ip = bx.ins().iconst(types::I64, Rc::as_ptr(info) as i64);
+                        bx.ins().call(new_ref, &[ip, obj]);
+                        let mut args = vec![ctxv, obj];
+                        for (k, pt) in cparams[1..].iter().enumerate() {
+                            let r = site.start + k as u32;
+                            let v = bx.use_var(uvar!(r));
+                            args.push(match (pt, tyof!(r)) {
+                                (RegTy::Float, Some(JTy::Int)) => {
+                                    bx.ins().fcvt_from_sint(types::F64, v)
+                                }
+                                _ => v,
+                            });
+                        }
+                        // The result of `init` (not kept): a value slot, dropped after.
+                        let scratch = (cret == RegTy::Value).then(|| {
+                            bx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                crate::value::layout::SIZE as u32,
+                                3,
+                            ))
+                        });
+                        if let Some(s) = scratch {
+                            let a = bx.ins().stack_addr(types::I64, s, 0);
+                            let z = bx.ins().iconst(types::I64, 0);
+                            for k in 0..3 {
+                                bx.ins().store(MemFlagsData::trusted(), z, a, k * 8);
+                            }
+                            args.push(a);
+                        }
+                        let depth =
+                            bx.ins()
+                                .load(types::I64, MemFlagsData::trusted(), ctxv, DEPTH_OFFSET);
+                        let max = bx.ins().load(
+                            types::I64,
+                            MemFlagsData::trusted(),
+                            ctxv,
+                            MAX_DEPTH_OFFSET,
+                        );
+                        let too_deep = bx.ins().icmp(IntCC::SignedGreaterThanOrEqual, depth, max);
+                        bail!(bx, too_deep);
+                        let d1 = bx.ins().iadd_imm_s(depth, 1);
+                        bx.ins()
+                            .store(MemFlagsData::trusted(), d1, ctxv, DEPTH_OFFSET);
+                        let call = bx.ins().call(fref, &args);
+                        let status = bx.inst_results(call)[0];
+                        bx.ins()
+                            .store(MemFlagsData::trusted(), depth, ctxv, DEPTH_OFFSET);
+                        if let Some(s) = scratch {
+                            let a = bx.ins().stack_addr(types::I64, s, 0);
+                            let one = bx.ins().iconst(types::I64, 1);
+                            bx.ins().call(drop_ref, &[a, one]);
+                        }
+                        call_sites.push((q.name.clone(), span));
+                        let tid = trace_base + (call_sites.len() - 1) as i64;
+                        let failed = bx.create_block();
+                        let cont = bx.create_block();
+                        bx.ins().brif(status, failed, &[], cont, &[]);
+                        bx.switch_to_block(failed);
+                        let t = bx.ins().iconst(types::I32, tid);
+                        bx.ins().call(trace_ref, &[ctxv, t]);
+                        let none = bx.ins().iconst(types::I64, -1);
+                        bx.ins().jump(fail, &[none.into()]);
+                        bx.switch_to_block(cont);
+                        let sp = bx
+                            .ins()
+                            .iconst(types::I64, span.start as i64 | ((span.end as i64) << 32));
+                        let call = bx.ins().call(init_done_ref, &[ctxv, obj, sp]);
+                        let missing = bx.inst_results(call)[0];
+                        let failed = bx.create_block();
+                        let cont = bx.create_block();
+                        bx.ins().brif(missing, failed, &[], cont, &[]);
+                        bx.switch_to_block(failed);
+                        let none = bx.ins().iconst(types::I64, -1);
+                        bx.ins().jump(fail, &[none.into()]);
+                        bx.switch_to_block(cont);
+                        bx.def_var(dvar!(*dst), obj);
+                    }
                     Call { dst, .. } | CallMethod { dst, .. } if boxed_call => {
                         let mut words = Vec::new();
                         let callee = match ins {
@@ -3646,9 +3845,16 @@ impl Jit {
                             (JTy::Bool, _) => (crate::value::layout::TAG_BOOL, v),
                             _ => (crate::value::layout::TAG_INT, v),
                         };
-                        // The old value must be of the same simple type: nothing to drop.
+                        // The old value must be of the same simple type, or not initialized
+                        // yet (in `init`): nothing to drop.
                         let old = bx.ins().load(types::I8, MemFlagsData::trusted(), fp, off);
-                        let bad = bx.ins().icmp_imm_s(IntCC::NotEqual, old, tag as i64);
+                        let other = bx.ins().icmp_imm_s(IntCC::NotEqual, old, tag as i64);
+                        let set = bx.ins().icmp_imm_s(
+                            IntCC::NotEqual,
+                            old,
+                            crate::value::layout::TAG_UNINIT as i64,
+                        );
+                        let bad = bx.ins().band(other, set);
                         bail!(bx, bad);
                         let t = bx.ins().iconst(types::I8, tag as i64);
                         bx.ins().store(MemFlagsData::trusted(), t, fp, off);

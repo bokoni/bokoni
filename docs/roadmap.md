@@ -324,6 +324,9 @@ namespaces, `trait` for shared behavior.
       a copy per types of the arguments (`Proto::specialize_params`), like `forall`; a
       result not annotated is any value (boxed in the caller's slot, a `Guard` reads
       it)
+- [x] Classes constructed in native code (no field with a default value): the object,
+      its `init` called directly (methods `init` are compiled), the check that every
+      field is initialized; a typed loop constructing objects: 0.56 s → 0.08 s
 - [x] Strings in native code: `str` parameters, results, fields, list elements,
       literals (the function's constants, not copied), `+`, comparisons, interpolation
       of strings and simple values, `len()` — the interpreter's operations, called by

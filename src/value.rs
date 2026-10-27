@@ -573,6 +573,8 @@ pub mod layout {
     pub const TAG_INT: u8 = 2;
     pub const TAG_FLOAT: u8 = 3;
     pub const TAG_STR: u8 = 4;
+    /// `Value::Uninit`: a field not initialized yet (owns nothing).
+    pub const TAG_UNINIT: u8 = 15;
     /// Higher tags: the value owns a resource (reference counted).
     pub const FIRST_HEAP_TAG: u8 = 4;
     pub const PAYLOAD: i32 = 8;
@@ -734,6 +736,7 @@ mod tests {
         assert_eq!(tag(&Value::Float(1.5)), layout::TAG_FLOAT);
         assert!(tag(&Value::str("x")) >= layout::FIRST_HEAP_TAG);
         assert_eq!(tag(&Value::str("x")), layout::TAG_STR);
+        assert_eq!(tag(&Value::Uninit), layout::TAG_UNINIT);
         assert!(tag(&Value::Uninit) >= layout::FIRST_HEAP_TAG);
         assert_eq!(payload::<i64>(&Value::Int(-42)), -42);
         assert_eq!(payload::<f64>(&Value::Float(2.5)), 2.5);

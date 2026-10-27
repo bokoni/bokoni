@@ -550,22 +550,24 @@ impl Runtime {
                 }
             }
         }
-        let missing = obj
-            .borrow()
-            .fields
-            .iter()
-            .position(|v| matches!(v, Value::Uninit));
-        if let Some(i) = missing {
-            return rt_err(
+        self.initialized(&obj, span)?;
+        Ok(this)
+    }
+
+    /// Every field of a new object is initialized (after its `init`).
+    pub(crate) fn initialized(&self, obj: &Rc<RefCell<Object>>, span: Span) -> R<()> {
+        let o = obj.borrow();
+        match o.fields.iter().position(|v| matches!(v, Value::Uninit)) {
+            Some(i) => rt_err(
                 format!(
                     "field `@{}` of `{}` is not initialized (default value or `init`)",
-                    self.name(info.fields[i].name),
-                    info.name
+                    self.name(o.info.fields[i].name),
+                    o.info.name
                 ),
                 span,
-            );
+            ),
+            None => Ok(()),
         }
-        Ok(this)
     }
 
     // ─── Fields and methods ──────────────────────────────────────────────────
