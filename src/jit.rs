@@ -17,6 +17,9 @@
 //! - Lists are modified in place (`xs << x`, `xs[i] = v`). Where a list may change (this
 //!   function modifies one, or calls another), the elements read are copied rather than
 //!   pointed to, and a `for` goes over a copy of the list.
+//! - What is not compiled natively is done by the interpreter (`bk_call_boxed`,
+//!   `bk_binary`…): a call of a function that is not compiled or of a built-in, any
+//!   method, an operation on such a result (`JTy::Boxed`, a value of any type).
 //! - When an assumption does not hold (value of another type, index out of bounds,
 //!   method redefined, native stack nearly full), the native code is not abandoned: the
 //!   interpreter resumes at that instruction, with the registers rebuilt (`DeoptSite`,
@@ -602,6 +605,250 @@ fn emit_inline(
     })
 }
 
+/// Function called through the interpreter from native code.
+#[derive(Clone, Copy)]
+enum BoxedCallee {
+    /// Value of a global (function, type constructed).
+    Global(u32),
+    /// The first word: the function value.
+    Value,
+    /// Method `name` of the first word, called from `access`.
+    Method(crate::intern::Symbol, crate::ir::Access),
+}
+
+/// Call made by the interpreter for native code: a function that is not compiled, a
+/// built-in, a method of an object of unknown type… (`bk_call_boxed`).
+struct BoxedCall {
+    callee: BoxedCallee,
+    /// How to rebuild each word (callee or receiver first, then the arguments).
+    words: Vec<DKind>,
+    /// Native type expected for the result: 0 int, 1 float, 2 bool, 3 any (a value into
+    /// the slot), 4 none (not kept).
+    want: u8,
+    span: Span,
+}
+
+/// Value of a word written by native code.
+///
+/// # Safety
+/// For `DKind::Ref`, `w` is null or the address of a live value; `rt` is valid.
+unsafe fn word_value(rt: *mut Runtime, kind: DKind, w: u64) -> Value {
+    unsafe {
+        match kind {
+            DKind::Int => Value::Int(w as i64),
+            DKind::Float => Value::Float(f64::from_bits(w)),
+            DKind::Bool => Value::Bool(w & 0xff != 0),
+            DKind::Ref if w == 0 => Value::Nil,
+            DKind::Ref => (*(w as *const Value)).clone(),
+            DKind::Global(slot) => (*rt).globals.at(slot).value.clone().unwrap_or(Value::Nil),
+            _ => Value::Nil,
+        }
+    }
+}
+
+/// Runs `f` (an interpreter operation) with the native context saved around it (the
+/// interpreter may run native code again), at the native call depth.
+///
+/// # Safety
+/// `ctx` is the context of the running native code, `ctx.rt` its runtime.
+unsafe fn with_interpreter<T>(ctx: *mut JitCtx, f: impl FnOnce(&mut Runtime) -> T) -> T {
+    unsafe {
+        let rt = (*ctx).rt;
+        let saved = (
+            (*ctx).depth,
+            (*ctx).max_depth,
+            (*ctx).err,
+            std::mem::take(&mut (*ctx).traces),
+        );
+        let depth = (*rt).depth;
+        (*rt).depth = saved.0 as usize;
+        let r = f(&mut *rt);
+        (*rt).depth = depth;
+        (*ctx).depth = saved.0;
+        (*ctx).max_depth = saved.1;
+        (*ctx).err = saved.2;
+        (*ctx).traces = saved.3;
+        (*ctx).rt = rt;
+        r
+    }
+}
+
+/// Call through the interpreter (see `BoxedCall`): 0, its result in `out`; 1, an error
+/// (`JitCtx::pending`); 2, a result of another type than expected (`JitCtx::returned`:
+/// the native code resumes after the call with it).
+extern "C" fn bk_call_boxed(
+    ctx: *mut JitCtx,
+    call: *const BoxedCall,
+    buf: *const u64,
+    out: *mut u64,
+) -> i32 {
+    // SAFETY: `call` is kept alive by the `Jit`; `buf` holds its words, written just
+    // before; `out` is a slot of the native frame (a value for `want` 3).
+    unsafe {
+        let call = &*call;
+        let rt = (*ctx).rt;
+        let mut vals: Vec<Value> = call
+            .words
+            .iter()
+            .enumerate()
+            .map(|(k, kind)| word_value(rt, *kind, *buf.add(k)))
+            .collect();
+        let r = with_interpreter(ctx, |rt| match call.callee {
+            BoxedCallee::Global(slot) => {
+                let f = rt.globals.at(slot).value.clone().unwrap_or(Value::Nil);
+                rt.call_value(&f, crate::vm::CallArgs::plain(vals), call.span)
+            }
+            BoxedCallee::Value => {
+                let f = vals.remove(0);
+                rt.call_value(&f, crate::vm::CallArgs::plain(vals), call.span)
+            }
+            BoxedCallee::Method(name, access) => {
+                let recv = vals.remove(0);
+                rt.call_method_named(
+                    recv,
+                    name,
+                    crate::vm::CallArgs::plain(vals),
+                    access,
+                    call.span,
+                )
+            }
+        });
+        match r {
+            Ok(v) => match (call.want, v) {
+                (0, Value::Int(i)) => {
+                    *out = i as u64;
+                    0
+                }
+                (1, Value::Float(f)) => {
+                    *out = f.to_bits();
+                    0
+                }
+                (1, Value::Int(i)) => {
+                    *out = (i as f64).to_bits();
+                    0
+                }
+                (2, Value::Bool(b)) => {
+                    *out = b as u64;
+                    0
+                }
+                (3, v) => {
+                    *(out as *mut Value) = v;
+                    0
+                }
+                (4, _) => 0,
+                (_, v) => {
+                    (*ctx).returned = Some(v);
+                    2
+                }
+            },
+            Err(e) => {
+                (*ctx).pending = Some(e);
+                (*ctx).err = PENDING;
+                1
+            }
+        }
+    }
+}
+
+/// All the binary operations, by code (`op_code`).
+const ALL_OPS: [BinOp; 14] = [
+    BinOp::Add,
+    BinOp::Sub,
+    BinOp::Mul,
+    BinOp::Div,
+    BinOp::Rem,
+    BinOp::Eq,
+    BinOp::Ne,
+    BinOp::Lt,
+    BinOp::Le,
+    BinOp::Gt,
+    BinOp::Ge,
+    BinOp::And,
+    BinOp::Or,
+    BinOp::Push,
+];
+
+fn op_code(op: BinOp) -> i64 {
+    ALL_OPS.iter().position(|o| *o == op).unwrap() as i64
+}
+
+fn dkind_code(k: DKind) -> i64 {
+    match k {
+        DKind::Int => 0,
+        DKind::Float => 1,
+        DKind::Bool => 2,
+        DKind::Ref => 3,
+        _ => 4,
+    }
+}
+
+fn dkind_of_code(c: i32) -> DKind {
+    match c {
+        0 => DKind::Int,
+        1 => DKind::Float,
+        2 => DKind::Bool,
+        3 => DKind::Ref,
+        _ => DKind::Nil,
+    }
+}
+
+/// `a op b` on values of any type (the interpreter's operation) into the slot `out`: 0,
+/// or 1 (its error, `JitCtx::pending`).
+#[allow(clippy::too_many_arguments)]
+extern "C" fn bk_binary(
+    ctx: *mut JitCtx,
+    op: i32,
+    a: u64,
+    ka: i32,
+    b: u64,
+    kb: i32,
+    out: *mut Value,
+    span: u64,
+) -> i32 {
+    // SAFETY: the words are values written by native code (`word_value`); `out` is a
+    // slot of the native frame.
+    unsafe {
+        let rt = (*ctx).rt;
+        let (l, r) = (
+            word_value(rt, dkind_of_code(ka), a),
+            word_value(rt, dkind_of_code(kb), b),
+        );
+        let span = Span::new(span as u32, (span >> 32) as u32);
+        match (*rt).binary(ALL_OPS[op as usize], l, r, span) {
+            Ok(v) => {
+                *out = v;
+                0
+            }
+            Err(e) => {
+                (*ctx).pending = Some(e);
+                (*ctx).err = PENDING;
+                1
+            }
+        }
+    }
+}
+
+/// Truthiness of a value (`if v`, `not v`).
+extern "C" fn bk_truthy(v: *const Value) -> i8 {
+    // SAFETY: `v` is null or a live value.
+    unsafe { (!v.is_null() && (*v).truthy()) as i8 }
+}
+
+/// Value of global `slot` into the slot `out`: 0, or 1 if it is not defined (resumed in
+/// the interpreter, which gives the error).
+extern "C" fn bk_global(ctx: *mut JitCtx, slot: u32, out: *mut Value) -> i32 {
+    // SAFETY: `out` is a slot of the native frame; `ctx.rt` is valid.
+    unsafe {
+        match &(*(*ctx).rt).globals.at(slot).value {
+            Some(v) => {
+                *out = v.clone();
+                0
+            }
+            None => 1,
+        }
+    }
+}
+
 /// Binary operations on strings, by code (`str_op_code`).
 const STR_OPS: [BinOp; 7] = [
     BinOp::Add,
@@ -848,6 +1095,11 @@ pub struct Jit {
     list_fns: [FuncId; 3],
     /// `bk_str_add`, `bk_str_cmp`, `bk_str_len`, `bk_concat`.
     str_fns: [FuncId; 4],
+    /// `bk_call_boxed`, `bk_binary`, `bk_truthy`, `bk_global`.
+    boxed_fns: [FuncId; 4],
+    /// Calls through the interpreter (addresses held by native code).
+    #[allow(clippy::vec_box)]
+    boxed_calls: Vec<Box<BoxedCall>>,
     /// `bk_build`, `bk_clone_into`, `bk_move_out`, `bk_drop_slots`.
     mem_fns: [FuncId; 4],
     /// Construction plans (addresses held by native code).
@@ -891,6 +1143,9 @@ enum JTy {
     This,
     /// String: pointer to the value.
     Str,
+    /// Any value, result of the interpreter (a call into it, an operation on such a
+    /// value): pointer to the value, in a slot of the frame.
+    Boxed,
     /// List of elements of type `anns[i]`: pointer to the value.
     List(u32),
     /// Iterator over a list of elements of type `anns[i]`.
@@ -1134,6 +1389,9 @@ struct Plan {
     ctors: Vec<u32>,
     /// Types of objects and list elements (`JTy::Obj` / `List` / `Iter`).
     anns: Vec<RtType>,
+    /// Instructions done by the interpreter (key: address): calls of functions not
+    /// compiled, operations on `JTy::Boxed` values.
+    boxed: crate::intern::FxHashSet<usize>,
 }
 
 /// Type of an element of type `anns[a]`.
@@ -1155,6 +1413,7 @@ struct Analysis<'a> {
     ctors: Vec<u32>,
     targets: FxHashMap<usize, Target>,
     this: Option<Rc<crate::objects::TypeInfo>>,
+    boxed: crate::intern::FxHashSet<usize>,
 }
 
 /// Function compiled and called directly; for a method, the type of `self` it is
@@ -1206,6 +1465,76 @@ fn field_jty(
 }
 
 impl Analysis<'_> {
+    /// An instruction not compiled natively, done by the interpreter: calls (a function
+    /// not compiled, a built-in, any method) and operations on their results
+    /// (`JTy::Boxed`). `None`: not even that.
+    fn boxed(&mut self, ins: &Instr, cur: &[Lat]) -> Option<Option<JTy>> {
+        use Instr::*;
+        let g = |r: Reg| cur[r as usize].get();
+        // Native values rebuilt as interpreter values.
+        let value = |t: JTy| {
+            matches!(
+                t,
+                JTy::Int
+                    | JTy::Float
+                    | JTy::Bool
+                    | JTy::Obj(_)
+                    | JTy::List(_)
+                    | JTy::Str
+                    | JTy::This
+                    | JTy::Boxed
+                    | JTy::Nil
+            )
+        };
+        let word = |t: JTy| value(t) || matches!(t, JTy::Callee(_) | JTy::Ctor(_));
+        let p = self.p;
+        let t = match ins {
+            Call { f, site, .. } => {
+                let site = &p.calls[*site as usize];
+                if site.block || !site.named.is_empty() || !word(g(*f)?) {
+                    return None;
+                }
+                for k in 0..site.npos {
+                    if !word(g(site.start + k)?) {
+                        return None;
+                    }
+                }
+                JTy::Boxed
+            }
+            CallMethod { recv, site, .. } => {
+                let site = &p.calls[*site as usize];
+                if site.block || !site.named.is_empty() || !value(g(*recv)?) {
+                    return None;
+                }
+                for k in 0..site.npos {
+                    if !word(g(site.start + k)?) {
+                        return None;
+                    }
+                }
+                JTy::Boxed
+            }
+            Bin(op, _, a, b)
+                if !matches!(op, BinOp::Push | BinOp::And | BinOp::Or)
+                    && (g(*a)? == JTy::Boxed || g(*b)? == JTy::Boxed)
+                    && value(g(*a)?)
+                    && value(g(*b)?) =>
+            {
+                JTy::Boxed
+            }
+            Guard(_, a, t) if g(*a)? == JTy::Boxed => jty(*t),
+            Not(_, a) if g(*a)? == JTy::Boxed => JTy::Bool,
+            // A global: a function called (its value read when calling), or a value.
+            GetGlobal(_, slot) => match &self.globals.at(*slot).value {
+                Some(Value::Function(_)) => return Some(Some(JTy::Callee(*slot))),
+                Some(Value::Type(_)) => return Some(Some(JTy::Ctor(*slot))),
+                _ => JTy::Boxed,
+            },
+            _ => return None,
+        };
+        self.boxed.insert(ins as *const Instr as usize);
+        Some(Some(t))
+    }
+
     fn sig_of(&self, slot: u32) -> Option<(Vec<RegTy>, RegTy)> {
         global_proto(self.globals, slot).and_then(|q| native_sig(&q))
     }
@@ -1217,7 +1546,13 @@ impl Analysis<'_> {
         let value = |t: JTy| {
             matches!(
                 t,
-                JTy::Int | JTy::Float | JTy::Bool | JTy::Obj(_) | JTy::List(_) | JTy::Str
+                JTy::Int
+                    | JTy::Float
+                    | JTy::Bool
+                    | JTy::Obj(_)
+                    | JTy::List(_)
+                    | JTy::Str
+                    | JTy::Boxed
             )
         };
         let numeric = |t: JTy| matches!(t, JTy::Int | JTy::Float);
@@ -1601,6 +1936,7 @@ fn analyze(
         callees: Vec::new(),
         ctors: Vec::new(),
         targets: FxHashMap::default(),
+        boxed: Default::default(),
         this: this.clone(),
     };
     // Typed IR registers: their type does not change.
@@ -1633,7 +1969,11 @@ fn analyze(
                 continue;
             };
             for (k, ins) in b.instrs.iter().enumerate() {
-                let t = an.instr(ins, &cur)?;
+                let t = match an.instr(ins, &cur) {
+                    Some(t) => t,
+                    // Not compiled natively: done by the interpreter, if possible.
+                    None => an.boxed(ins, &cur)?,
+                };
                 let d = reads_writes(p, ins)?.1;
                 if let (Some(d), Some(t)) = (d, t) {
                     let t = match fixed[d as usize] {
@@ -1650,9 +1990,10 @@ fn analyze(
             let num = |r: Reg| matches!(g(r), Some(JTy::Int | JTy::Float));
             let ok = match &b.term {
                 Term::Jump(_) => true,
-                Term::Branch { cond, .. } => {
-                    matches!(g(*cond), Some(JTy::Int | JTy::Float | JTy::Bool | JTy::Nil))
-                }
+                Term::Branch { cond, .. } => matches!(
+                    g(*cond),
+                    Some(JTy::Int | JTy::Float | JTy::Bool | JTy::Nil | JTy::Boxed)
+                ),
                 Term::IfInt { a, b: y, .. } => g(*a) == Some(JTy::Int) && g(*y) == Some(JTy::Int),
                 Term::IfIntK { a, .. } => g(*a) == Some(JTy::Int),
                 Term::Return { reg, .. } => match ret {
@@ -1703,6 +2044,7 @@ fn analyze(
         term_defs,
         callees: an.callees,
         ctors: an.ctors,
+        boxed: an.boxed,
         anns: an.anns,
         targets: an.targets,
         this,
@@ -1812,6 +2154,10 @@ impl Jit {
         builder.symbol("bk_list_push", bk_list_push as *const u8);
         builder.symbol("bk_fields_cached", bk_fields_cached as *const u8);
         builder.symbol("bk_str_add", bk_str_add as *const u8);
+        builder.symbol("bk_call_boxed", bk_call_boxed as *const u8);
+        builder.symbol("bk_binary", bk_binary as *const u8);
+        builder.symbol("bk_truthy", bk_truthy as *const u8);
+        builder.symbol("bk_global", bk_global as *const u8);
         builder.symbol("bk_str_cmp", bk_str_cmp as *const u8);
         builder.symbol("bk_str_len", bk_str_len as *const u8);
         builder.symbol("bk_concat", bk_concat as *const u8);
@@ -1926,6 +2272,34 @@ impl Jit {
             str_fns.push(module.declare_function(name, Linkage::Import, &sig).ok()?);
         }
         let str_fns: [FuncId; 4] = str_fns.try_into().ok()?;
+        let mut boxed_fns = Vec::new();
+        for (name, params, ret) in [
+            ("bk_call_boxed", &[ptr, ptr, ptr, ptr][..], types::I32),
+            (
+                "bk_binary",
+                &[
+                    ptr,
+                    types::I32,
+                    types::I64,
+                    types::I32,
+                    types::I64,
+                    types::I32,
+                    ptr,
+                    types::I64,
+                ][..],
+                types::I32,
+            ),
+            ("bk_truthy", &[ptr][..], types::I8),
+            ("bk_global", &[ptr, types::I32, ptr][..], types::I32),
+        ] {
+            let mut sig = module.make_signature();
+            for t in params {
+                sig.params.push(AbiParam::new(*t));
+            }
+            sig.returns.push(AbiParam::new(ret));
+            boxed_fns.push(module.declare_function(name, Linkage::Import, &sig).ok()?);
+        }
+        let boxed_fns: [FuncId; 4] = boxed_fns.try_into().ok()?;
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr));
         sig.params.push(AbiParam::new(ptr));
@@ -1976,6 +2350,8 @@ impl Jit {
             this_fns: [this_fields_fn, method_fn],
             list_fns: [push_fn, set_fn, snapshot_fn],
             str_fns,
+            boxed_fns,
+            boxed_calls: Vec::new(),
             mem_fns,
             build_plans: Vec::new(),
             known_types: Vec::new(),
@@ -2030,27 +2406,8 @@ impl Jit {
             plans.insert(key, plan);
             order.push(p);
         }
-        // 2. A function that calls a non-compilable function is not compilable either.
-        loop {
-            let mut changed = false;
-            for p in &order {
-                let key = Rc::as_ptr(p) as usize;
-                let Some(Some(plan)) = plans.get(&key) else {
-                    continue;
-                };
-                let blocked = plan.targets.values().any(|q| {
-                    let k = q.key();
-                    !self.compiled.contains_key(&k) && !matches!(plans.get(&k), Some(Some(_)))
-                });
-                if blocked {
-                    plans.insert(key, None);
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
+        // 2. A function whose callee is not compilable stays compilable: that call goes
+        // through the interpreter.
         // 3. Declaration, then code generation.
         let mut new = Vec::new();
         for p in &order {
@@ -2191,6 +2548,9 @@ impl Jit {
             .declare_func_in_func(self.list_fn, &mut ctx.func);
         let [this_fields_fn, method_fn] = self.this_fns;
         let [push_fn, set_fn, snapshot_fn] = self.list_fns;
+        let [call_boxed_ref, binary_ref, truthy_ref, global_ref] = self
+            .boxed_fns
+            .map(|f| self.module.declare_func_in_func(f, &mut ctx.func));
         let [str_add_ref, str_cmp_ref, str_len_ref, concat_ref] = self
             .str_fns
             .map(|f| self.module.declare_func_in_func(f, &mut ctx.func));
@@ -2229,8 +2589,12 @@ impl Jit {
         // Registers of objects, lists and iterators: "borrowed" if they always refer to a value
         // that lives for the whole call (parameter, element of a borrowed list); otherwise
         // "owning": a slot of the native frame, dropped on exit.
-        let is_ref =
-            |t: Option<JTy>| matches!(t, Some(JTy::Obj(_) | JTy::List(_) | JTy::Iter(_) | JTy::Str));
+        let is_ref = |t: Option<JTy>| {
+            matches!(
+                t,
+                Some(JTy::Obj(_) | JTy::List(_) | JTy::Iter(_) | JTy::Str | JTy::Boxed)
+            )
+        };
         let nregs = p.regs.len();
         // (register, type) pairs: parameters, writes, types known at block entries.
         let mut pairs: Vec<(Reg, JTy)> = Vec::new();
@@ -2349,7 +2713,9 @@ impl Jit {
             let ty = match t {
                 JTy::Float => types::F64,
                 JTy::Bool => types::I8,
-                JTy::Int | JTy::Obj(_) | JTy::List(_) | JTy::This | JTy::Str => types::I64,
+                JTy::Int | JTy::Obj(_) | JTy::List(_) | JTy::This | JTy::Str | JTy::Boxed => {
+                    types::I64
+                }
                 _ => continue,
             };
             vars.insert((*r, *t), bx.declare_var(ty));
@@ -2432,7 +2798,8 @@ impl Jit {
                         | JTy::Obj(_)
                         | JTy::List(_)
                         | JTy::This
-                        | JTy::Str => {
+                        | JTy::Str
+                        | JTy::Boxed => {
                             let Some(&v) = vars.get(&(r, t)) else {
                                 continue;
                             };
@@ -2684,6 +3051,30 @@ impl Jit {
                 $bx.switch_to_block(cont);
             }};
         }
+        // A native value as a word for the interpreter (`word_value`).
+        macro_rules! boxed_word {
+            ($bx:expr, $r:expr) => {{
+                match tyof!($r) {
+                    Some(JTy::Callee(s) | JTy::Ctor(s)) => {
+                        ($bx.ins().iconst(types::I64, 0), DKind::Global(s))
+                    }
+                    Some(JTy::Nil) | None => ($bx.ins().iconst(types::I64, 0), DKind::Nil),
+                    Some(JTy::Int) => ($bx.use_var(uvar!($r)), DKind::Int),
+                    Some(JTy::Float) => {
+                        let v = $bx.use_var(uvar!($r));
+                        (
+                            $bx.ins().bitcast(types::I64, MemFlagsData::new(), v),
+                            DKind::Float,
+                        )
+                    }
+                    Some(JTy::Bool) => {
+                        let v = $bx.use_var(uvar!($r));
+                        ($bx.ins().uextend(types::I64, v), DKind::Bool)
+                    }
+                    Some(_) => ($bx.use_var(uvar!($r)), DKind::Ref),
+                }
+            }};
+        }
         // A native value as (bits, kind) for the list helpers.
         macro_rules! native_arg {
             ($bx:expr, $r:expr) => {{
@@ -2791,7 +3182,183 @@ impl Jit {
                 use Instr::*;
                 (site_b, site_k) = (bi, k);
                 dty = plan.defs[bi][k];
+                let key = ins as *const Instr as usize;
+                // A call through the interpreter: decided by the analysis, or its native
+                // target could not be compiled.
+                let boxed_call = matches!(ins, Call { .. } | CallMethod { .. })
+                    && !inlines.contains_key(&key)
+                    && (plan.boxed.contains(&key)
+                        || plan
+                            .targets
+                            .get(&key)
+                            .is_some_and(|t| !self.compiled.contains_key(&t.key())));
                 match ins {
+                    Call { dst, .. } | CallMethod { dst, .. } if boxed_call => {
+                        let mut words = Vec::new();
+                        let callee = match ins {
+                            Call { f, site, .. } => {
+                                let callee = match tyof!(*f) {
+                                    Some(JTy::Callee(s) | JTy::Ctor(s)) => BoxedCallee::Global(s),
+                                    _ => {
+                                        words.push(boxed_word!(bx, *f));
+                                        BoxedCallee::Value
+                                    }
+                                };
+                                let site = &p.calls[*site as usize];
+                                for k in 0..site.npos {
+                                    words.push(boxed_word!(bx, site.start + k));
+                                }
+                                callee
+                            }
+                            CallMethod {
+                                recv,
+                                name,
+                                site,
+                                access,
+                                ..
+                            } => {
+                                words.push(boxed_word!(bx, *recv));
+                                let site = &p.calls[*site as usize];
+                                for k in 0..site.npos {
+                                    words.push(boxed_word!(bx, site.start + k));
+                                }
+                                BoxedCallee::Method(*name, *access)
+                            }
+                            _ => unreachable!(),
+                        };
+                        let buf =
+                            bx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                (words.len().max(1) * 8) as u32,
+                                3,
+                            ));
+                        let base = bx.ins().stack_addr(types::I64, buf, 0);
+                        for (j, (w, _)) in words.iter().enumerate() {
+                            bx.ins()
+                                .store(MemFlagsData::trusted(), *w, base, (j * 8) as i32);
+                        }
+                        let want = match dty {
+                            Some(JTy::Int) => 0,
+                            Some(JTy::Float) => 1,
+                            Some(JTy::Bool) => 2,
+                            Some(t) if is_ref(Some(t)) => 3,
+                            _ => 4,
+                        };
+                        self.boxed_calls.push(Box::new(BoxedCall {
+                            callee,
+                            words: words.iter().map(|(_, k)| *k).collect(),
+                            want,
+                            span,
+                        }));
+                        let desc = &**self.boxed_calls.last().unwrap() as *const BoxedCall;
+                        let dp = bx.ins().iconst(types::I64, desc as i64);
+                        let out = if want == 3 {
+                            own!(bx, *dst)
+                        } else {
+                            bx.ins().stack_addr(types::I64, dout, 0)
+                        };
+                        let call = bx.ins().call(call_boxed_ref, &[ctxv, dp, base, out]);
+                        let status = bx.inst_results(call)[0];
+                        // 2: a result of another type: resumed after the call with it.
+                        let other = bx.ins().icmp_imm_s(IntCC::Equal, status, 2);
+                        deopt!(bx, other, cur, site_b, site_k + 1, Some(*dst));
+                        let failed = bx.create_block();
+                        let cont = bx.create_block();
+                        bx.ins().brif(status, failed, &[], cont, &[]);
+                        bx.switch_to_block(failed);
+                        let none = bx.ins().iconst(types::I64, -1);
+                        bx.ins().jump(fail, &[none.into()]);
+                        bx.switch_to_block(cont);
+                        match want {
+                            0 => {
+                                let v = bx.ins().stack_load(types::I64, types::I64, dout, 0);
+                                bx.def_var(dvar!(*dst), v);
+                            }
+                            1 => {
+                                let v = bx.ins().stack_load(types::I64, types::F64, dout, 0);
+                                bx.def_var(dvar!(*dst), v);
+                            }
+                            2 => {
+                                let v = bx.ins().stack_load(types::I64, types::I8, dout, 0);
+                                bx.def_var(dvar!(*dst), v);
+                            }
+                            3 => bx.def_var(dvar!(*dst), out),
+                            _ => {}
+                        }
+                    }
+                    // Operations on values of any type: the interpreter's.
+                    Bin(op, d, a, b2) if plan.boxed.contains(&key) => {
+                        let (wa, ka) = boxed_word!(bx, *a);
+                        let (wb, kb) = boxed_word!(bx, *b2);
+                        let slot = own!(bx, *d);
+                        let oc = bx.ins().iconst(types::I32, op_code(*op));
+                        let ka = bx.ins().iconst(types::I32, dkind_code(ka));
+                        let kb = bx.ins().iconst(types::I32, dkind_code(kb));
+                        let sp = bx
+                            .ins()
+                            .iconst(types::I64, span.start as i64 | ((span.end as i64) << 32));
+                        let call = bx
+                            .ins()
+                            .call(binary_ref, &[ctxv, oc, wa, ka, wb, kb, slot, sp]);
+                        let status = bx.inst_results(call)[0];
+                        let failed = bx.create_block();
+                        let cont = bx.create_block();
+                        bx.ins().brif(status, failed, &[], cont, &[]);
+                        bx.switch_to_block(failed);
+                        let none = bx.ins().iconst(types::I64, -1);
+                        bx.ins().jump(fail, &[none.into()]);
+                        bx.switch_to_block(cont);
+                        bx.def_var(dvar!(*d), slot);
+                    }
+                    // A value of any type to a simple type: its tag checked (otherwise
+                    // resumed in the interpreter, which gives the error).
+                    Guard(d, a, _) if plan.boxed.contains(&key) => {
+                        use crate::value::layout::{PAYLOAD, TAG_BOOL, TAG_FLOAT, TAG_INT};
+                        let v = bx.use_var(uvar!(*a));
+                        let tag = bx.ins().load(types::I8, MemFlagsData::trusted(), v, 0);
+                        let raw = bx
+                            .ins()
+                            .load(types::I64, MemFlagsData::trusted(), v, PAYLOAD);
+                        let r = match dty {
+                            Some(JTy::Int) => {
+                                let bad = bx.ins().icmp_imm_s(IntCC::NotEqual, tag, TAG_INT as i64);
+                                bail!(bx, bad);
+                                raw
+                            }
+                            Some(JTy::Bool) => {
+                                let bad =
+                                    bx.ins().icmp_imm_s(IntCC::NotEqual, tag, TAG_BOOL as i64);
+                                bail!(bx, bad);
+                                bx.ins().ireduce(types::I8, raw)
+                            }
+                            _ => {
+                                let isf = bx.ins().icmp_imm_s(IntCC::Equal, tag, TAG_FLOAT as i64);
+                                let isi = bx.ins().icmp_imm_s(IntCC::Equal, tag, TAG_INT as i64);
+                                let ok = bx.ins().bor(isf, isi);
+                                let bad = bx.ins().icmp_imm_s(IntCC::Equal, ok, 0);
+                                bail!(bx, bad);
+                                let f = bx.ins().bitcast(types::F64, MemFlagsData::new(), raw);
+                                let i = bx.ins().fcvt_from_sint(types::F64, raw);
+                                bx.ins().select(isf, f, i)
+                            }
+                        };
+                        bx.def_var(dvar!(*d), r);
+                    }
+                    Not(d, a) if plan.boxed.contains(&key) => {
+                        let v = bx.use_var(uvar!(*a));
+                        let call = bx.ins().call(truthy_ref, &[v]);
+                        let t = bx.inst_results(call)[0];
+                        let r = bx.ins().icmp_imm_s(IntCC::Equal, t, 0);
+                        bx.def_var(dvar!(*d), r);
+                    }
+                    GetGlobal(d, slot) if plan.boxed.contains(&key) => {
+                        let out = own!(bx, *d);
+                        let s = bx.ins().iconst(types::I32, *slot as i64);
+                        let call = bx.ins().call(global_ref, &[ctxv, s, out]);
+                        let failed = bx.inst_results(call)[0];
+                        bail!(bx, failed);
+                        bx.def_var(dvar!(*d), out);
+                    }
                     Int(d, n) => {
                         let v = bx.ins().iconst(types::I64, *n);
                         bx.def_var(dvar!(*d), v);
@@ -3431,6 +3998,12 @@ impl Jit {
                 Term::Branch { cond, then, else_ } => {
                     let (t, e) = (blocks[*then as usize], blocks[*else_ as usize]);
                     match tyof!(*cond) {
+                        Some(JTy::Boxed) => {
+                            let v = bx.use_var(uvar!(*cond));
+                            let call = bx.ins().call(truthy_ref, &[v]);
+                            let c = bx.inst_results(call)[0];
+                            bx.ins().brif(c, t, &[], e, &[]);
+                        }
                         Some(JTy::Bool) => {
                             let c = bx.use_var(uvar!(*cond));
                             bx.ins().brif(c, t, &[], e, &[]);

@@ -1697,7 +1697,7 @@ impl Runtime {
     }
 
     /// `recv.name(args)`: function field, declared method, enum method or built-in.
-    fn call_method_named(
+    pub(crate) fn call_method_named(
         &mut self,
         r: Value,
         name: Symbol,

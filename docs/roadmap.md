@@ -311,6 +311,11 @@ namespaces, `trait` for shared behavior.
       (`bk_fields_cached`, resumed in the interpreter if it redefines the method); an
       inlined call does not count as a call that may modify lists (no copy); a typed
       loop calling `sq(p.x()) + p.y()`: 0.18 s → 0.01 s
+- [x] Native code calls the interpreter (v0.15) for what it does not compile: a
+      function that is not compiled, a built-in (`print`), any method, a function
+      value; its result is a value of any type (`JTy::Boxed`) on which operations are
+      the interpreter's (`Guard` to a simple type checks its tag); a callee that cannot
+      be compiled no longer prevents its callers from being compiled
 - [x] Strings in native code: `str` parameters, results, fields, list elements,
       literals (the function's constants, not copied), `+`, comparisons, interpolation
       of strings and simple values, `len()` — the interpreter's operations, called by

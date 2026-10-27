@@ -894,3 +894,47 @@ end
     };
     assert_eq!(bad(true), bad(false));
 }
+
+/// Result and printed output of a program.
+fn outcome_out(src: &str, jit: bool) -> String {
+    let mut e = Engine::new();
+    let out = Rc::new(std::cell::RefCell::new(String::new()));
+    let o = out.clone();
+    e.set_output(move |s| o.borrow_mut().push_str(s));
+    e.set_jit(jit);
+    let r = match e.eval(src) {
+        Ok(v) => e.inspect(&v),
+        Err(err) => err.render(src, "test"),
+    };
+    format!("{}{r}", out.borrow())
+}
+
+#[test]
+fn native_code_calls_the_interpreter() {
+    // `print`, an unannotated function, a built-in method, a function value: done by the
+    // interpreter, the rest natively.
+    let src = "def untyped(x) = x * 2
+def show(n: int): int
+  let t = 0
+  for i in 0...n
+    print(\"i=#{i}\")
+    t += untyped(i) + [i, 1].len()
+  end
+  t
+end
+def twice(f, x: int): int = f(f(x))
+def inc(x: int): int = x + 1
+[show(3), twice(inc, 5), twice(|v| v * 3, 2)]";
+    assert_eq!(outcome_out(src, true), outcome_out(src, false));
+    assert!(outcome_out(src, true).ends_with("[12, 7, 18]"));
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    e.eval(src).unwrap();
+    assert!(e.is_native("show"));
+    // An error in the interpreter: the same message and call stack.
+    same("def bad(x) = x + nil\ndef f(n: int): int = n + bad(n)\nf(1)");
+    // A result of another type than the typed code expects: resumed after the call.
+    same(
+        "def any(x) = if x > 1 then 1.5 else x end\ndef g(n: int): int\n  let t = 0\n  for i in 0...n\n    t += any(i)\n  end\n  t\nend\ng(3)",
+    );
+}
