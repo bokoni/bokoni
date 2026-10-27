@@ -88,8 +88,8 @@ JIT's job (direct calls, unboxed values).
 - [x] Insufficient native stack (very deep recursion): resumed in the interpreter,
       whose stack grows on the heap (v0.14)
 - [x] Cargo feature `jit` (on by default); `Engine::set_jit(false)`, `bokoni --no-jit`
-- [ ] Compile more: methods, lists, strings, calls into the interpreter from native code
-      (boxed values)
+- [x] Compile more: lists (v0.5, v0.14), methods (v0.13), strings and calls into the
+      interpreter from native code, with boxed values (v0.15)
 
 | Program (`cargo run --release --example bench_interp`)    | Interpreter | JIT    |
 |-----------------------------------------------------------|------------:|-------:|
@@ -224,7 +224,8 @@ namespaces, `trait` for shared behavior.
       for later scripts
 - [x] `abstract class`: not instantiable, may declare `abstract def`s
 - [x] `TypeDesc::traits`, `TypeDesc::is_abstract`, `DeclKind::Trait`
-- [ ] A trait that includes another one; generic traits (`Comparable(T)`)
+- [x] Generic traits (`Comparable(T)`, v0.12)
+- [ ] A trait that includes another one
 
 ### v0.10 — Modules and files
 
