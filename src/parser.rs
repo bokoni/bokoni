@@ -351,6 +351,7 @@ fn is_keyword(kind: TokenKind) -> bool {
             | T::Annotation
             | T::Macro
             | T::Module
+            | T::Require
             | T::True
             | T::False
             | T::Nil
@@ -726,6 +727,18 @@ impl Parser<'_, '_> {
                     body,
                     span: self.span_from(start),
                 }))
+            }
+            T::Require => {
+                self.bump();
+                let t = self.tok();
+                if t.kind != T::Str {
+                    return self.error_here(format!(
+                        "expected a file name in quotes after `require`, found {}",
+                        self.found()
+                    ));
+                }
+                self.bump();
+                StmtKind::Require(self.str_symbol(t)?)
             }
             T::Macro => {
                 return self

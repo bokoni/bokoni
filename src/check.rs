@@ -1428,6 +1428,12 @@ impl Checker<'_> {
             }
             // Checked with the declarations (`hoist`).
             StmtKind::Module(_) => Ty::Nil,
+            StmtKind::Require(_) => {
+                if self.scopes.len() > 1 || self.fns.len() > 1 {
+                    self.error("`require` must be at the top level of the script", s.span);
+                }
+                Ty::Nil
+            }
             StmtKind::Type(_) | StmtKind::Enum(_)
                 if self.scopes.iter().skip(1).any(|s| s.module.is_none()) || self.fns.len() > 1 =>
             {

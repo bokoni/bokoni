@@ -1,7 +1,8 @@
 //! `bokoni`: runs a script or an expression, or starts the REPL.
 
-use bokoni::{Engine, Value};
+use bokoni::{Engine, Source, Value};
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "\
@@ -12,7 +13,8 @@ usage:
   bokoni --ast file.bk      prints the syntax tree (S-expressions)
   bokoni --ir file.bk       prints the IR (what the interpreter runs)
   (--ast and --ir also accept -e \"code\")
-  --no-jit                  no native compilation (interpreter only)";
+  --no-jit                  no native compilation (interpreter only)
+  `require \"lib/http\"` loads lib/http.bk, relative to the requiring file";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -47,6 +49,7 @@ fn main() -> ExitCode {
     }
 
     let mut engine = Engine::new();
+    engine.set_loader(load_file);
     // Warnings (`@[Deprecated]` declarations…): printed before execution.
     engine.set_warning_handler(|w| eprint!("{}", w.render("", "")));
     engine.set_jit(jit);
@@ -87,6 +90,31 @@ fn main() -> ExitCode {
             }
         },
     }
+}
+
+/// `require "name"`: `name.bk` (unless it has an extension), relative to the directory
+/// of the requiring file (the current directory for `-e` and the REPL).
+fn load_file(name: &str, from: &str) -> Result<Source, String> {
+    let base = match from.starts_with('<') {
+        true => PathBuf::from("."),
+        false => Path::new(from).parent().map(Path::to_path_buf).unwrap_or_default(),
+    };
+    let mut path = base.join(name);
+    if path.extension().is_none() {
+        path.set_extension("bk");
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // One name per file, however it is reached: relative to the current directory
+    // when possible.
+    let full = std::fs::canonicalize(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let shown = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| full.strip_prefix(cwd).ok().map(Path::to_path_buf))
+        .unwrap_or(full);
+    Ok(Source {
+        name: shown.display().to_string(),
+        text,
+    })
 }
 
 fn usage_error(msg: &str) -> ExitCode {

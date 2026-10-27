@@ -278,6 +278,8 @@ pub enum StmtKind {
     Type(Box<TypeDecl>),
     Enum(Box<EnumDecl>),
     Module(Box<ModuleDecl>),
+    /// `require "file"`: loaded (once) before the script is checked.
+    Require(Symbol),
 }
 
 /// `module Name … end`: its declarations are named `Name::…` outside.

@@ -641,6 +641,21 @@ end
   later script, to add members.
 - A module is declared at the top level of the script, or in a module.
 
+### Files: `require`
+
+```ruby
+require "lib/http"            # lib/http.bk, relative to this file
+
+Http.get("example.org")
+```
+
+- A required file is loaded once (by its name), before the script is checked: its
+  declarations are known as those of a previous script. Nested `require`s are loaded
+  first; a cycle is an error.
+- `require` is written at the top level of the script, with a literal name.
+- Embedded, the files are provided by the host (`Engine::set_loader`); the `bokoni`
+  command reads them from disk (`.bk` added when the name has no extension).
+
 ## Comments
 
 ```ruby
@@ -840,7 +855,7 @@ Point(x: 1).to_s()            # "Point(x=1, y=0)"
 ## Reserved words
 
 `let def end if elsif else unless then case when while for in do break next return
-module
+module require
 begin rescue ensure raise super trait abstract include type class enum annotation macro true false nil and or not`
 
 ## Open questions

@@ -36,9 +36,23 @@ pub struct Engine {
     warnings: Vec<Error>,
     /// Warning handler (otherwise warnings are kept for `take_warnings`).
     on_warning: Option<WarningHandler>,
+    /// Provides the files of `require` (see [`Engine::set_loader`]).
+    loader: Option<Loader>,
+    /// Files already loaded (by their name), and those being loaded (cycles).
+    loaded: Vec<String>,
+    loading: Vec<String>,
 }
 
 type WarningHandler = Box<dyn FnMut(&Error)>;
+type Loader = Box<dyn FnMut(&str, &str) -> Result<Source, String>>;
+
+/// A file provided to `require` by the loader.
+pub struct Source {
+    /// Its name: identifies it (a file is loaded once per name) and appears in error
+    /// messages; the loader receives it back as the origin of nested `require`s.
+    pub name: String,
+    pub text: String,
+}
 
 impl Default for Engine {
     fn default() -> Self {
@@ -66,10 +80,72 @@ impl Engine {
             static_checks: true,
             warnings: Vec::new(),
             on_warning: None,
+            loader: None,
+            loaded: Vec::new(),
+            loading: Vec::new(),
         };
         e.eval_named(PRELUDE, "<prelude>")
             .expect("the prelude compiles");
         e
+    }
+
+    /// Provides the files of `require "name"`: `loader(name, from)` receives the name
+    /// as written and the name of the script that requires it (to resolve relative
+    /// paths), and returns the file. Without a loader, `require` is an error.
+    ///
+    /// ```
+    /// use bokoni::{Engine, Source};
+    ///
+    /// let mut engine = Engine::new();
+    /// engine.set_loader(|name, _from| match name {
+    ///     "math" => Ok(Source {
+    ///         name: "math.bk".into(),
+    ///         text: "module Math\n  def sq(x: int): int = x * x\nend".into(),
+    ///     }),
+    ///     _ => Err("no such file".into()),
+    /// });
+    /// let v: i64 = engine.eval_as("require \"math\"\nMath.sq(7)").unwrap();
+    /// assert_eq!(v, 49);
+    /// ```
+    pub fn set_loader(
+        &mut self,
+        f: impl FnMut(&str, &str) -> Result<Source, String> + 'static,
+    ) {
+        self.loader = Some(Box::new(f));
+    }
+
+    /// Loads the files required by a script (each one once, in order), before it is
+    /// checked: their declarations are then known, as those of a previous script.
+    fn require(&mut self, program: &crate::ast::Program, from: &str) -> Result<(), Errors> {
+        for s in &program.body.stmts {
+            let crate::ast::StmtKind::Require(path) = s.kind else {
+                continue;
+            };
+            let path = self.rt.interner.resolve(path).to_string();
+            let fail = |msg: String| -> Errors { Error::runtime(msg, s.span).into() };
+            let Some(mut loader) = self.loader.take() else {
+                return Err(fail(format!(
+                    "`require \"{path}\"`: no file loader (`Engine::set_loader`)"
+                )));
+            };
+            let found = loader(&path, from);
+            self.loader = Some(loader);
+            let src = found.map_err(|e| fail(format!("cannot load `{path}`: {e}")))?;
+            if self.loaded.contains(&src.name) {
+                continue;
+            }
+            if self.loading.contains(&src.name) {
+                let mut chain = self.loading.clone();
+                chain.push(src.name);
+                return Err(fail(format!("circular `require`: {}", chain.join(" → "))));
+            }
+            self.loading.push(src.name.clone());
+            let r = self.eval_named(&src.text, &src.name);
+            self.loading.pop();
+            r?;
+            self.loaded.push(src.name);
+        }
+        Ok(())
     }
 
     /// Redirects the output of `print` (default: standard output).
@@ -238,6 +314,24 @@ impl Engine {
             errs
         };
         let program = parser::parse(src, &mut self.rt.interner).map_err(with_src)?;
+        // The script itself counts as being loaded (a file that requires it: a cycle).
+        let top = !self.loading.iter().any(|n| n == name);
+        if top {
+            self.loading.push(name.into());
+        }
+        let r = self.require(&program, name);
+        if top {
+            self.loading.pop();
+        }
+        r.map_err(|mut errs| {
+            // Errors of the `require` itself are in this script.
+            for e in &mut errs.0 {
+                if e.src.is_none() {
+                    e.src = Some((script.name.clone(), script.src.clone()));
+                }
+            }
+            errs
+        })?;
         crate::compile::intern_module_names(&program, &mut self.rt.interner);
         let prims = if self.static_checks {
             let (errors, warnings, prims) =

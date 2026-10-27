@@ -168,3 +168,100 @@ fn module_errors() {
     let out = run_mode(&format!("{HTTP}Http::nope"), false, false, false);
     assert!(out.contains("`Http::nope` is not defined"), "{out}");
 }
+
+/// Engine whose `require` reads files from a list (name → text).
+fn with_files(files: &[(&'static str, &'static str)]) -> (Engine, Rc<RefCell<Vec<String>>>) {
+    let mut e = Engine::new();
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let l = log.clone();
+    e.set_output(move |s| l.borrow_mut().push(s.trim_end().to_string()));
+    let files: Vec<(&str, &str)> = files.to_vec();
+    e.set_loader(
+        move |name, _from| match files.iter().find(|(n, _)| *n == name) {
+            Some((n, text)) => Ok(bokoni::Source {
+                name: format!("{n}.bk"),
+                text: text.to_string(),
+            }),
+            None => Err("no such file".into()),
+        },
+    );
+    (e, log)
+}
+
+#[test]
+fn require_loads_each_file_once() {
+    let (mut e, log) = with_files(&[
+        (
+            "http",
+            "require \"mime\"\nmodule Http\n  def get(url: str): str = \"GET #{url} #{Mime::JSON}\"\nend\nprint(\"http\")",
+        ),
+        (
+            "mime",
+            "module Mime\n  let JSON = \"json\"\nend\nprint(\"mime\")",
+        ),
+    ]);
+    let v = e
+        .eval("require \"http\"\nrequire \"mime\"\nrequire \"http\"\nHttp.get(\"/\")")
+        .unwrap();
+    assert_eq!(e.inspect(&v), "\"GET / json\"");
+    // Each file ran once, the nested one first.
+    assert_eq!(*log.borrow(), ["mime", "http"]);
+    // Later scripts: already loaded.
+    e.eval("require \"http\"").unwrap();
+    assert_eq!(log.borrow().len(), 2);
+    // The checker knows what a required file declares.
+    let err = e
+        .eval("require \"http\"\nHttp.get(1)")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("expected type `str` for `url`, got `int`"),
+        "{err}"
+    );
+}
+
+#[test]
+fn require_errors() {
+    let (mut e, _) = with_files(&[
+        ("a", "require \"b\""),
+        ("b", "require \"a\""),
+        ("broken", "def f(x: int): int = x +\n"),
+        ("typed", "def f(x: int): int = x\nf(\"s\")"),
+    ]);
+    let render = |e: &mut Engine, src: &str| match e.eval(src) {
+        Ok(_) => "ok".to_string(),
+        Err(err) => err.render(src, "main"),
+    };
+    let out = render(&mut e, "require \"a\"");
+    assert!(
+        out.contains("circular `require`: <eval> → a.bk → b.bk → a.bk"),
+        "{out}"
+    );
+    // Errors in a required file point into it.
+    let out = render(&mut e, "require \"broken\"");
+    assert!(out.contains("--> broken.bk:1:25"), "{out}");
+    let out = render(&mut e, "require \"typed\"");
+    assert!(out.contains("--> typed.bk:2:3"), "{out}");
+    let out = render(&mut e, "require \"nope\"");
+    assert!(out.contains("cannot load `nope`: no such file"), "{out}");
+    assert!(out.contains("--> <eval>:1:1"), "{out}");
+    let out = render(&mut e, "def f()\n  require \"a\"\nend");
+    assert!(
+        out.contains("`require` must be at the top level of the script"),
+        "{out}"
+    );
+    let out = render(&mut e, "require x");
+    assert!(
+        out.contains("expected a file name in quotes after `require`"),
+        "{out}"
+    );
+    // Without a loader.
+    let out = match Engine::new().eval("require \"x\"") {
+        Ok(_) => String::new(),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        out.contains("no file loader (`Engine::set_loader`)"),
+        "{out}"
+    );
+}

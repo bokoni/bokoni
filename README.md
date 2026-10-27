@@ -74,6 +74,15 @@ let col = ty.field("name").unwrap().annotation("Column").unwrap();
 let column: String = col.get("name")?;               // "user_name"
 ```
 
+`require "name"` asks the host for the file (from disk, an archive, the network…):
+
+```rust
+engine.set_loader(|name, _from| match assets.get(name) {
+    Some(text) => Ok(Source { name: format!("{name}.bk"), text: text.clone() }),
+    None => Err(format!("unknown file `{name}`")),
+});
+```
+
 ## Command line
 
 ```sh

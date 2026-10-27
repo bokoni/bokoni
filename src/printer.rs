@@ -98,6 +98,11 @@ impl Printer<'_> {
                 self.out.push(')');
             }
             StmtKind::Def(f) => self.def(f),
+            StmtKind::Require(path) => {
+                self.out.push_str("(require ");
+                self.quoted(*path);
+                self.out.push(')');
+            }
             StmtKind::Module(m) => {
                 self.out.push_str("(module ");
                 self.name(m.name);

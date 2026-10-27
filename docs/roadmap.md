@@ -237,7 +237,9 @@ namespaces, `trait` for shared behavior.
       module functions directly
 - [x] Module bodies run with the declarations, before the block's statements; a
       module can be reopened (also by a later script)
-- [ ] `require "file"`, the files provided by the host
+- [x] `require "file"`: loaded once, before the script is checked (its declarations
+      known as a previous script's); nested requires, cycles reported; files provided
+      by the host (`Engine::set_loader`), from disk for the `bokoni` command
 - [ ] `private`
 
 ### Next

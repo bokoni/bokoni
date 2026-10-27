@@ -97,7 +97,7 @@ fn block_decls(b: &Block) -> Vec<(Symbol, u32)> {
             StmtKind::Def(f) => out.push((f.name, f.name_span.start)),
             StmtKind::Type(t) => out.push((t.name, t.name_span.start)),
             StmtKind::Enum(e) => out.push((e.name, e.name_span.start)),
-            StmtKind::Expr(_) | StmtKind::Module(_) => {}
+            StmtKind::Expr(_) | StmtKind::Module(_) | StmtKind::Require(_) => {}
         }
     }
     out
@@ -141,7 +141,7 @@ pub fn intern_module_names(program: &Program, i: &mut Interner) {
                 StmtKind::Enum(e) => {
                     qualify(i, prefix, e.name);
                 }
-                StmtKind::Expr(_) => {}
+                StmtKind::Expr(_) | StmtKind::Require(_) => {}
             }
         }
     }
@@ -230,6 +230,7 @@ impl Resolver<'_> {
 
     fn stmt(&mut self, s: &Stmt) {
         match &s.kind {
+            StmtKind::Require(_) => {}
             StmtKind::Module(m) => {
                 self.push(true);
                 for (n, k) in block_decls(&m.body) {
@@ -1552,6 +1553,17 @@ impl Compiler<'_> {
             StmtKind::Expr(e) => Some(self.expr(*e)),
             // Run with the declarations (`hoist`).
             StmtKind::Module(_) => None,
+            // Loaded by the engine before compiling.
+            StmtKind::Require(_) => {
+                let top = self.fns.len() == 1 && self.f().scopes.len() == 1;
+                if !top {
+                    self.errors.push(Error::syntax(
+                        "`require` must be at the top level of the script",
+                        s.span,
+                    ));
+                }
+                None
+            }
             StmtKind::Let(l) => {
                 let span = self.ast.span(l.value);
                 let mut v = self.expr(l.value);
@@ -3236,6 +3248,7 @@ fn visit_block(ast: &Ast, b: &Block, f: &mut dyn FnMut(ExprId)) {
         match &s.kind {
             StmtKind::Expr(e) => visit(ast, *e, f),
             StmtKind::Module(m) => visit_block(ast, &m.body, f),
+            StmtKind::Require(_) => {}
             StmtKind::Let(l) => visit(ast, l.value, f),
             StmtKind::Def(d) => {
                 for p in d.params.iter().flatten() {

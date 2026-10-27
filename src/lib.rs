@@ -30,7 +30,7 @@ pub mod value;
 pub mod vm;
 
 pub use diagnostic::{Error, ErrorKind, Errors};
-pub use engine::{Engine, FromValue, IntoValue};
+pub use engine::{Engine, FromValue, IntoValue, Source};
 pub use reflect::{
     Annotation, DeclKind, EnumDesc, FieldDesc, FnDesc, ParamDesc, TypeDesc, VariantDesc,
 };
