@@ -311,7 +311,12 @@ namespaces, `trait` for shared behavior.
       (`bk_fields_cached`, resumed in the interpreter if it redefines the method); an
       inlined call does not count as a call that may modify lists (no copy); a typed
       loop calling `sq(p.x()) + p.y()`: 0.18 s → 0.01 s
-- [ ] Strings in native code
+- [x] Strings in native code: `str` parameters, results, fields, list elements,
+      literals (the function's constants, not copied), `+`, comparisons, interpolation
+      of strings and simple values, `len()` — the interpreter's operations, called by
+      helpers (resumed in the interpreter if a value is not a string); a `nil` copied
+      (value of an `if` without `else`) no longer prevents compilation; ×2.6 on a typed
+      loop building strings
 
 ### Next
 

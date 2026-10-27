@@ -830,3 +830,67 @@ def use_big(n: int): int = big(n) + 1
     same(&format!("{src}\nuse_big(1)"));
     same(&format!("{src}\nuse_big(2)"));
 }
+
+#[test]
+fn strings_in_native_code() {
+    let src = "def rep(s: str, n: int): str
+  let out = \"\"
+  for i in 0...n
+    out = out + s
+  end
+  if out == \"x\" then \"y\" else \"#{out}:#{n}:#{out.len()}:#{1.5}:#{true}\" end
+end
+def longest(xs: [str]): str
+  let best = \"\"
+  for x in xs
+    if x.len() > best.len() then best = x end
+  end
+  best
+end
+def count(xs: [str], w: str): int
+  let n = 0
+  for x in xs
+    if x == w or x < \"b\" then n += 1 end
+  end
+  n
+end
+class Greeter
+  def init(@name: str, @n: int)
+  end
+  def greet(who: str): str
+    @n += 1
+    @name = @name + \"!\"
+    \"#{@name} #{who} #{@n}\"
+  end
+end
+def many(g: Greeter, k: int): int
+  let t = 0
+  for i in 0...k
+    t += g.greet(\"bob\").len()
+  end
+  t
+end
+[rep(\"ab\", 3), rep(\"x\", 1), longest([\"a\", \"ccc\", \"bb\"]), count([\"a\", \"b\", \"c\", \"b\"], \"b\"),
+ many(Greeter(\"hi\", 0), 3), \"é\".len()]";
+    assert_eq!(
+        same(src),
+        "[\"ababab:3:6:1.5:true\", \"y\", \"ccc\", 3, 30, 1]"
+    );
+    let mut e = Engine::new();
+    e.eval(src).unwrap();
+    for f in ["rep", "longest", "count", "many"] {
+        assert!(e.is_native(f), "`{f}` should be compiled");
+    }
+    // A non-string where a string is expected (static checks off): the interpreter's
+    // error.
+    let bad = |jit: bool| {
+        let mut e = Engine::new();
+        e.set_jit(jit);
+        e.set_static_checks(false);
+        e.eval(src).unwrap();
+        e.eval("longest([\"a\", 3])")
+            .map(|v| e.inspect(&v))
+            .unwrap_or_else(|e| e.to_string())
+    };
+    assert_eq!(bad(true), bad(false));
+}

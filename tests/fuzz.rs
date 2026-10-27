@@ -259,6 +259,7 @@ const CORPUS: &[&str] = &[
     "class P\n  def init(@x: int, @w: float)\n  end\n  def grow(d: int): int\n    @x += d\n    @w = @w * 2.0\n    @x\n  end\n  def v(): int = @x * 2\nend\nclass Q < P\n  def v(): int = @x + 1\nend\ndef sum(ps: [P]): int\n  let t = 0\n  for p in ps\n    t += p.v()\n  end\n  t\nend\nlet p = P(1, 0.5)\nfor i in 0..20\n  p.grow(i)\nend\n[sum([p, P(3, 1.0)]), sum([p, Q(2, 0.0)]), p.v()]",
     "class G(T)\n  def init(@s: T, @n: int)\n  end\n  def add(x: T): T\n    @s = @s + x\n    @n += 1\n    @s\n  end\n  def two(): T = self.add(self.add(@s))\nend\nlet a = G(1, 0)\nlet b = G(0.5, 0)\nlet c = G(\"a\", 0)\nfor i in 0..30\n  a.add(i)\n  b.add(i * 0.25)\n  c.add(\"b\")\nend\n[a.add(0), b.add(0.0), c.add(\"\").len(), a.two()]",
     "def sq(n: int): [int]\n  let out: [int] = []\n  for i in 0...n\n    out << i * i\n  end\n  out[0] = n\n  out\nend\ndef sum(xs: [int]): int\n  let t = 0\n  for x in xs\n    t += x\n    xs << 1 if x == 4\n  end\n  t + xs.len()\nend\nlet a = sq(5)\n[a, sum(a), a.len(), sum(sq(1))]",
+    "def rep(s: str, n: int): str\n  let out = \"\"\n  for i in 0...n\n    out = out + s\n  end\n  \"#{out}:#{out.len()}\"\nend\ndef best(xs: [str]): str\n  let b = \"\"\n  for x in xs\n    if x.len() > b.len() or x == \"z\" then b = x end\n  end\n  b\nend\n[rep(\"ab\", 3), best([\"a\", \"ccc\", \"z\"]), rep(\"\", 2)]",
 ];
 
 /// Mutates a program: deletes, duplicates or swaps lines, inserts a token, deletes or

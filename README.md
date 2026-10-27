@@ -47,7 +47,8 @@ end
 Fully typed functions are compiled to native code (Cranelift JIT) on their first call:
 `fib(25)` goes from 28 ms (interpreted) to 0.5 ms. A generic function
 (`def max(a: T, b: T): T forall T`) is compiled once per type it is called with, and
-methods are compiled too (their typed fields read and written in place).
+methods, lists and strings are compiled too; where an assumption of the native code does
+not hold, the interpreter takes over at that point.
 Everything else is interpreted, with exactly the same result.
 
 ## Using it from Rust

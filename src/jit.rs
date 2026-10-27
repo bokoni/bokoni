@@ -10,6 +10,8 @@
 //!   compiled.
 //! - Same rules as the interpreter: overflow, division by zero and call depth are checked,
 //!   with the same messages and the same call stack.
+//! - Strings (`str`) are pointers to the values; their operations (`+`, comparisons,
+//!   interpolation, `len`) call the interpreter's code (`bk_str_add`, `bk_concat`…).
 //! - Small functions and getters are inlined (`inlinable`, `emit_inline`); an inlined
 //!   method's class is checked with a cache per call site.
 //! - Lists are modified in place (`xs << x`, `xs[i] = v`). Where a list may change (this
@@ -600,6 +602,96 @@ fn emit_inline(
     })
 }
 
+/// Binary operations on strings, by code (`str_op_code`).
+const STR_OPS: [BinOp; 7] = [
+    BinOp::Add,
+    BinOp::Eq,
+    BinOp::Ne,
+    BinOp::Lt,
+    BinOp::Le,
+    BinOp::Gt,
+    BinOp::Ge,
+];
+
+fn str_op_code(op: BinOp) -> Option<i64> {
+    STR_OPS.iter().position(|o| *o == op).map(|i| i as i64)
+}
+
+/// `a + b` of two strings into the slot `dst` (the interpreter's operation): 0, or 1 if
+/// one is not a string (resumed in the interpreter).
+extern "C" fn bk_str_add(
+    ctx: *mut JitCtx,
+    dst: *mut Value,
+    a: *const Value,
+    b: *const Value,
+) -> i32 {
+    // SAFETY: `a`, `b` are live values, `dst` a slot of the native frame (possibly the
+    // same as `a`: read first); `ctx.rt` is the runtime running this code.
+    unsafe {
+        let (l, r) = ((*a).clone(), (*b).clone());
+        if !matches!((&l, &r), (Value::Str(_), Value::Str(_))) {
+            return 1;
+        }
+        match (*(*ctx).rt).binary(BinOp::Add, l, r, Span::default()) {
+            Ok(v) => {
+                *dst = v;
+                0
+            }
+            Err(_) => 1,
+        }
+    }
+}
+
+/// Comparison `op` (`STR_OPS`) of two strings: 0 / 1, or 2 if one is not a string.
+extern "C" fn bk_str_cmp(ctx: *mut JitCtx, op: i32, a: *const Value, b: *const Value) -> i32 {
+    // SAFETY: as for `bk_str_add`.
+    unsafe {
+        let (l, r) = ((*a).clone(), (*b).clone());
+        if !matches!((&l, &r), (Value::Str(_), Value::Str(_))) {
+            return 2;
+        }
+        match (*(*ctx).rt).binary(STR_OPS[op as usize], l, r, Span::default()) {
+            Ok(Value::Bool(b)) => b as i32,
+            _ => 2,
+        }
+    }
+}
+
+/// Number of characters of a string; -1 if it is not one.
+extern "C" fn bk_str_len(s: *const Value) -> i64 {
+    // SAFETY: `s` is a live value.
+    unsafe {
+        match &*s {
+            Value::Str(s) => s.chars().count() as i64,
+            _ => -1,
+        }
+    }
+}
+
+/// Interpolation (`"#{a} #{b}"`) of `n` native values (`words`, kinds in `kinds`: 0 int,
+/// 1 float, 2 bool, 3 string) into the slot `dst`: 0, or 1 if a string is not one.
+extern "C" fn bk_concat(dst: *mut Value, words: *const u64, kinds: *const u8, n: u64) -> i32 {
+    // SAFETY: `words` and `kinds` hold `n` items written just before the call; the
+    // strings are live values; `dst` is a slot of the native frame.
+    unsafe {
+        let mut out = String::new();
+        for k in 0..n as usize {
+            let w = *words.add(k);
+            match *kinds.add(k) {
+                3 => match &*(w as *const Value) {
+                    Value::Str(s) => out.push_str(s),
+                    _ => return 1,
+                },
+                c => {
+                    from_bits(kind_of_code(c as i32), w).write_scalar(&mut out);
+                }
+            }
+        }
+        *dst = Value::Str(Rc::from(out.as_str()));
+        0
+    }
+}
+
 /// Kind of a native value passed to a list helper (`kind_code`).
 fn kind_of_code(c: i32) -> Kind {
     match c {
@@ -754,6 +846,8 @@ pub struct Jit {
     this_fns: [FuncId; 2],
     /// `bk_list_push`, `bk_list_set`, `bk_list_snapshot`.
     list_fns: [FuncId; 3],
+    /// `bk_str_add`, `bk_str_cmp`, `bk_str_len`, `bk_concat`.
+    str_fns: [FuncId; 4],
     /// `bk_build`, `bk_clone_into`, `bk_move_out`, `bk_drop_slots`.
     mem_fns: [FuncId; 4],
     /// Construction plans (addresses held by native code).
@@ -795,6 +889,8 @@ enum JTy {
     /// `self` in a method (register 0): pointer to the value; its fields are those of
     /// `Plan::this`.
     This,
+    /// String: pointer to the value.
+    Str,
     /// List of elements of type `anns[i]`: pointer to the value.
     List(u32),
     /// Iterator over a list of elements of type `anns[i]`.
@@ -834,10 +930,8 @@ fn clif(t: RegTy) -> Type {
 /// type and a list of simple elements or objects.
 fn native_ty(rt: &RtType) -> Option<RegTy> {
     match rt {
-        RtType::Named(..) => Some(RegTy::Value),
-        RtType::List(e) if matches!(**e, RtType::Named(..)) || prim(e).is_some() => {
-            Some(RegTy::Value)
-        }
+        RtType::Named(..) | RtType::Str => Some(RegTy::Value),
+        RtType::List(e) if elem_ok(e) => Some(RegTy::Value),
         t => prim(t),
     }
 }
@@ -905,6 +999,7 @@ fn intern_ann(anns: &mut Vec<RtType>, t: &RtType) -> u32 {
 fn value_jty(anns: &mut Vec<RtType>, t: &RtType) -> JTy {
     match t {
         RtType::Named(..) => JTy::Obj(intern_ann(anns, t)),
+        RtType::Str => JTy::Str,
         RtType::List(e) => JTy::List(intern_ann(anns, e)),
         t => jty(prim(t).expect("simple type")),
     }
@@ -950,7 +1045,7 @@ fn kind_for(anns: &[RtType], t: JTy, want: Option<&RtType>) -> Option<Kind> {
         JTy::Int => Kind::Int,
         JTy::Float => Kind::Float,
         JTy::Bool => Kind::Bool,
-        JTy::Obj(_) | JTy::List(_) => Kind::Ref,
+        JTy::Obj(_) | JTy::List(_) | JTy::Str => Kind::Ref,
         _ => return None,
     };
     let Some(want) = want else {
@@ -961,6 +1056,7 @@ fn kind_for(anns: &[RtType], t: JTy, want: Option<&RtType>) -> Option<Kind> {
             Some(kind)
         }
         (RtType::Float, JTy::Int) => Some(Kind::IntToFloat),
+        (RtType::Str, JTy::Str) => Some(kind),
         (w @ RtType::Named(..), JTy::Obj(a)) if same_ann(w, &anns[a as usize]) => Some(kind),
         (RtType::List(e), JTy::List(a)) if same_ann(e, &anns[a as usize]) => Some(kind),
         _ => None,
@@ -1044,6 +1140,7 @@ struct Plan {
 fn elem_jty(anns: &[RtType], a: u32) -> JTy {
     match &anns[a as usize] {
         RtType::Named(..) => JTy::Obj(a),
+        RtType::Str => JTy::Str,
         t => jty(prim(t).expect("simple element or object")),
     }
 }
@@ -1079,13 +1176,14 @@ impl Target {
 
 /// Elements a native list can hold: simple values, objects of a declared type.
 fn elem_ok(e: &RtType) -> bool {
-    prim(e).is_some() || matches!(e, RtType::Named(..))
+    prim(e).is_some() || matches!(e, RtType::Named(..) | RtType::Str)
 }
 
-/// Field `idx` of `info` annotated as a list (`@items: [int]`): its element type.
-fn field_list(info: &crate::objects::TypeInfo, idx: u32) -> Option<RtType> {
+/// Field `idx` of `info` annotated as a list (`@items: [int]`) or a string: its type.
+fn field_ref(info: &crate::objects::TypeInfo, idx: u32) -> Option<RtType> {
     match &*info.fields.get(idx as usize)?.ty.as_ref()?.ty {
-        RtType::List(e) if elem_ok(e) => Some((**e).clone()),
+        t @ RtType::List(e) if elem_ok(e) => Some(t.clone()),
+        RtType::Str => Some(RtType::Str),
         _ => None,
     }
 }
@@ -1119,7 +1217,7 @@ impl Analysis<'_> {
         let value = |t: JTy| {
             matches!(
                 t,
-                JTy::Int | JTy::Float | JTy::Bool | JTy::Obj(_) | JTy::List(_)
+                JTy::Int | JTy::Float | JTy::Bool | JTy::Obj(_) | JTy::List(_) | JTy::Str
             )
         };
         let numeric = |t: JTy| matches!(t, JTy::Int | JTy::Float);
@@ -1130,7 +1228,8 @@ impl Analysis<'_> {
             Float(..) => JTy::Float,
             Bool(..) => JTy::Bool,
             Nil(_) => JTy::Nil,
-            Move(_, a) => Some(g(*a)?).filter(|t| value(*t))?,
+            // (`nil`: the value of an `if` without `else`, never read.)
+            Move(_, a) => Some(g(*a)?).filter(|t| value(*t) || *t == JTy::Nil)?,
             Guard(_, a, _) => {
                 Some(g(*a)?).filter(|t| matches!(t, JTy::Int | JTy::Float | JTy::Bool))?
             }
@@ -1140,8 +1239,8 @@ impl Analysis<'_> {
             },
             // `@x` in a method: an annotated field of a simple type.
             FieldAt(_, a, idx) => match (g(*a)?, &this) {
-                (JTy::This, Some(info)) => match field_list(info, *idx) {
-                    Some(e) => JTy::List(intern_ann(&mut self.anns, &e)),
+                (JTy::This, Some(info)) => match field_ref(info, *idx) {
+                    Some(t) => value_jty(&mut self.anns, &t),
                     None => field_jty(info, *idx, p.spec.as_deref())?,
                 },
                 _ => return None,
@@ -1150,8 +1249,12 @@ impl Analysis<'_> {
                 let (JTy::This, Some(info)) = (g(*obj)?, &this) else {
                     return None;
                 };
-                if field_list(info, *idx).is_some() {
-                    return matches!(g(*src)?, JTy::List(_)).then_some(None);
+                if let Some(t) = field_ref(info, *idx) {
+                    let ok = match t {
+                        RtType::Str => g(*src)? == JTy::Str,
+                        _ => matches!(g(*src)?, JTy::List(_)),
+                    };
+                    return ok.then_some(None);
                 }
                 let t = field_jty(info, *idx, p.spec.as_deref())?;
                 let s = g(*src)?;
@@ -1220,7 +1323,7 @@ impl Analysis<'_> {
             // directly, if not redefined by the object's class (checked when calling).
             CallMethod {
                 recv, name, site, ..
-            } if !matches!(g(*recv)?, JTy::List(_)) => {
+            } if !matches!(g(*recv)?, JTy::List(_) | JTy::Str) => {
                 let site = &p.calls[*site as usize];
                 let info = match g(*recv)? {
                     JTy::This => this?,
@@ -1280,7 +1383,7 @@ impl Analysis<'_> {
                     let at = g(site.start + k as u32)?;
                     let ok = match (pt, at) {
                         (RegTy::Float, JTy::Int | JTy::Float) => true,
-                        (RegTy::Value, JTy::Obj(_) | JTy::List(_)) => {
+                        (RegTy::Value, JTy::Obj(_) | JTy::List(_) | JTy::Str) => {
                             kind_for(&self.anns, at, ann_of(&m, k)) == Some(Kind::Ref)
                         }
                         (t, a) => *t != RegTy::Value && jty(*t) == a,
@@ -1305,7 +1408,7 @@ impl Analysis<'_> {
             } => {
                 let site = &p.calls[*site as usize];
                 let ok = *name == self.len
-                    && matches!(g(*recv)?, JTy::List(_))
+                    && matches!(g(*recv)?, JTy::List(_) | JTy::Str)
                     && site.npos == 0
                     && site.named.is_empty()
                     && !site.block;
@@ -1315,6 +1418,25 @@ impl Analysis<'_> {
                 JTy::Int
             }
             // List literal: elements all of the same type.
+            // String literal: the constant itself.
+            Const(_, c) => match &p.consts[*c as usize] {
+                Value::Str(_) => JTy::Str,
+                _ => return None,
+            },
+            // Strings: `+`, comparisons, interpolation of strings and simple values.
+            Bin(op, _, a, b) if g(*a)? == JTy::Str && g(*b)? == JTy::Str => match op {
+                BinOp::Add => JTy::Str,
+                op if str_op_code(*op).is_some() => JTy::Bool,
+                _ => return None,
+            },
+            Concat(_, start, n) => {
+                for k in 0..*n {
+                    if !matches!(g(*start + k)?, JTy::Int | JTy::Float | JTy::Bool | JTy::Str) {
+                        return None;
+                    }
+                }
+                JTy::Str
+            }
             // `[]`: elements of unknown type (an annotation gives them).
             List(_, _, 0) => JTy::List(intern_ann(&mut self.anns, &RtType::Any)),
             List(_, start, n) => {
@@ -1429,7 +1551,7 @@ impl Analysis<'_> {
                             let ok = match (pt, at) {
                                 (RegTy::Float, JTy::Int | JTy::Float) => true,
                                 // Object or list passed as is: same type, already checked.
-                                (RegTy::Value, JTy::Obj(_) | JTy::List(_)) => {
+                                (RegTy::Value, JTy::Obj(_) | JTy::List(_) | JTy::Str) => {
                                     kind_for(&self.anns, at, ann_of(&callee, k)) == Some(Kind::Ref)
                                 }
                                 (t, a) => *t != RegTy::Value && jty(*t) == a,
@@ -1609,6 +1731,8 @@ fn reads_writes(p: &Proto, ins: &Instr) -> Option<(Vec<Reg>, Option<Reg>)> {
         FieldAt(d, a, _) => (vec![*a], Some(*d)),
         SetFieldAt { obj, src, .. } => (vec![*obj, *src], None),
         SetIndex(a, i, v) => (vec![*a, *i, *v], None),
+        Const(d, _) => (vec![], Some(*d)),
+        Concat(d, start, n) => ((*start..*start + *n).collect(), Some(*d)),
         Coerce { dst, src, .. } => (vec![*src], Some(*dst)),
         CallMethod {
             dst, recv, site, ..
@@ -1687,6 +1811,10 @@ impl Jit {
         builder.symbol("bk_resume", bk_resume as *const u8);
         builder.symbol("bk_list_push", bk_list_push as *const u8);
         builder.symbol("bk_fields_cached", bk_fields_cached as *const u8);
+        builder.symbol("bk_str_add", bk_str_add as *const u8);
+        builder.symbol("bk_str_cmp", bk_str_cmp as *const u8);
+        builder.symbol("bk_str_len", bk_str_len as *const u8);
+        builder.symbol("bk_concat", bk_concat as *const u8);
         builder.symbol("bk_list_set", bk_list_set as *const u8);
         builder.symbol("bk_list_snapshot", bk_list_snapshot as *const u8);
         builder.symbol("bk_list_view", bk_list_view as *const u8);
@@ -1783,6 +1911,21 @@ impl Jit {
         let fields_cached_fn = module
             .declare_function("bk_fields_cached", Linkage::Import, &sig)
             .ok()?;
+        let mut str_fns = Vec::new();
+        for (name, params, ret) in [
+            ("bk_str_add", &[ptr, ptr, ptr, ptr][..], types::I32),
+            ("bk_str_cmp", &[ptr, types::I32, ptr, ptr][..], types::I32),
+            ("bk_str_len", &[ptr][..], types::I64),
+            ("bk_concat", &[ptr, ptr, ptr, types::I64][..], types::I32),
+        ] {
+            let mut sig = module.make_signature();
+            for t in params {
+                sig.params.push(AbiParam::new(*t));
+            }
+            sig.returns.push(AbiParam::new(ret));
+            str_fns.push(module.declare_function(name, Linkage::Import, &sig).ok()?);
+        }
+        let str_fns: [FuncId; 4] = str_fns.try_into().ok()?;
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr));
         sig.params.push(AbiParam::new(ptr));
@@ -1832,6 +1975,7 @@ impl Jit {
             list_fn,
             this_fns: [this_fields_fn, method_fn],
             list_fns: [push_fn, set_fn, snapshot_fn],
+            str_fns,
             mem_fns,
             build_plans: Vec::new(),
             known_types: Vec::new(),
@@ -2047,6 +2191,9 @@ impl Jit {
             .declare_func_in_func(self.list_fn, &mut ctx.func);
         let [this_fields_fn, method_fn] = self.this_fns;
         let [push_fn, set_fn, snapshot_fn] = self.list_fns;
+        let [str_add_ref, str_cmp_ref, str_len_ref, concat_ref] = self
+            .str_fns
+            .map(|f| self.module.declare_func_in_func(f, &mut ctx.func));
         let push_ref = self.module.declare_func_in_func(push_fn, &mut ctx.func);
         let set_ref = self.module.declare_func_in_func(set_fn, &mut ctx.func);
         let snapshot_ref = self.module.declare_func_in_func(snapshot_fn, &mut ctx.func);
@@ -2082,7 +2229,8 @@ impl Jit {
         // Registers of objects, lists and iterators: "borrowed" if they always refer to a value
         // that lives for the whole call (parameter, element of a borrowed list); otherwise
         // "owning": a slot of the native frame, dropped on exit.
-        let is_ref = |t: Option<JTy>| matches!(t, Some(JTy::Obj(_) | JTy::List(_) | JTy::Iter(_)));
+        let is_ref =
+            |t: Option<JTy>| matches!(t, Some(JTy::Obj(_) | JTy::List(_) | JTy::Iter(_) | JTy::Str));
         let nregs = p.regs.len();
         // (register, type) pairs: parameters, writes, types known at block entries.
         let mut pairs: Vec<(Reg, JTy)> = Vec::new();
@@ -2141,6 +2289,8 @@ impl Jit {
             for b in &p.blocks {
                 for ins in &b.instrs {
                     let (w, from_borrowed) = match ins {
+                        // A string literal: the function's constant, alive.
+                        Instr::Const(d, _) => (Some(*d), true),
                         Instr::Move(d, a)
                         | Instr::Coerce { dst: d, src: a, .. }
                         | Instr::Bin(BinOp::Push, d, a, _) => (Some(*d), borrowed[*a as usize]),
@@ -2199,7 +2349,7 @@ impl Jit {
             let ty = match t {
                 JTy::Float => types::F64,
                 JTy::Bool => types::I8,
-                JTy::Int | JTy::Obj(_) | JTy::List(_) | JTy::This => types::I64,
+                JTy::Int | JTy::Obj(_) | JTy::List(_) | JTy::This | JTy::Str => types::I64,
                 _ => continue,
             };
             vars.insert((*r, *t), bx.declare_var(ty));
@@ -2281,7 +2431,8 @@ impl Jit {
                         | JTy::Bool
                         | JTy::Obj(_)
                         | JTy::List(_)
-                        | JTy::This => {
+                        | JTy::This
+                        | JTy::Str => {
                             let Some(&v) = vars.get(&(r, t)) else {
                                 continue;
                             };
@@ -2594,6 +2745,15 @@ impl Jit {
                 let t = elem_jty(&plan.anns, $a);
                 if let JTy::Obj(_) = t {
                     $addr
+                } else if t == JTy::Str {
+                    let tag = $bx.ins().load(types::I8, MemFlagsData::trusted(), $addr, 0);
+                    let bad = $bx.ins().icmp_imm_s(
+                        IntCC::NotEqual,
+                        tag,
+                        crate::value::layout::TAG_STR as i64,
+                    );
+                    bail!($bx, bad);
+                    $addr
                 } else {
                     let tag = $bx.ins().load(types::I8, MemFlagsData::trusted(), $addr, 0);
                     let raw = $bx
@@ -2645,6 +2805,7 @@ impl Jit {
                         bx.def_var(dvar!(*d), v);
                     }
                     Nil(_) | GetGlobal(..) => {}
+                    Move(..) if dty == Some(JTy::Nil) => {}
                     Move(_, a) if is_ref(dty) => {
                         let d = match ins {
                             Move(d, _) => d,
@@ -2668,6 +2829,64 @@ impl Jit {
                         let v = int_bin(&mut bx, *op, x, y, &mut |bx, c, k| check!(bx, c, k, span));
                         bx.def_var(dvar!(*d), v);
                     }
+                    // String literal: the address of the constant.
+                    Const(d, c) => {
+                        let v = bx
+                            .ins()
+                            .iconst(types::I64, &p.consts[*c as usize] as *const Value as i64);
+                        put_ref!(bx, *d, v);
+                    }
+                    // Strings: the interpreter's operations (resumed in it if a value is not a
+                    // string).
+                    Bin(op, d, a, b2)
+                        if tyof!(*a) == Some(JTy::Str) && tyof!(*b2) == Some(JTy::Str) =>
+                    {
+                        let (x, y) = (bx.use_var(uvar!(*a)), bx.use_var(uvar!(*b2)));
+                        if *op == BinOp::Add {
+                            let slot = own!(bx, *d);
+                            let call = bx.ins().call(str_add_ref, &[ctxv, slot, x, y]);
+                            let failed = bx.inst_results(call)[0];
+                            bail!(bx, failed);
+                            bx.def_var(dvar!(*d), slot);
+                        } else {
+                            let code = bx.ins().iconst(types::I32, str_op_code(*op).ok_or(())?);
+                            let call = bx.ins().call(str_cmp_ref, &[ctxv, code, x, y]);
+                            let r = bx.inst_results(call)[0];
+                            let failed = bx.ins().icmp_imm_s(IntCC::Equal, r, 2);
+                            bail!(bx, failed);
+                            let v = bx.ins().ireduce(types::I8, r);
+                            bx.def_var(dvar!(*d), v);
+                        }
+                    }
+                    Concat(d, start, n) => {
+                        let words =
+                            bx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                (*n).max(1) * 8,
+                                3,
+                            ));
+                        let kinds =
+                            bx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                (*n).max(1),
+                                0,
+                            ));
+                        let wb = bx.ins().stack_addr(types::I64, words, 0);
+                        let kb = bx.ins().stack_addr(types::I64, kinds, 0);
+                        for k in 0..*n {
+                            let (bits, kind) = native_arg!(bx, *start + k);
+                            bx.ins()
+                                .store(MemFlagsData::trusted(), bits, wb, (k * 8) as i32);
+                            let kc = bx.ins().iconst(types::I8, kind);
+                            bx.ins().store(MemFlagsData::trusted(), kc, kb, k as i32);
+                        }
+                        let slot = own!(bx, *d);
+                        let nn = bx.ins().iconst(types::I64, *n as i64);
+                        let call = bx.ins().call(concat_ref, &[slot, wb, kb, nn]);
+                        let failed = bx.inst_results(call)[0];
+                        bail!(bx, failed);
+                        bx.def_var(dvar!(*d), slot);
+                    }
                     // `xs << v`, `xs[i] = v`: the helper refuses a list being borrowed or an
                     // index out of bounds (resumed in the interpreter, which gives the error).
                     Bin(BinOp::Push, d, a, b2) => {
@@ -2690,7 +2909,8 @@ impl Jit {
                     }
                     // A list field of `self`: copied into its slot (the field may change).
                     FieldAt(d, 0, idx)
-                        if tyof!(0) == Some(JTy::This) && matches!(dty, Some(JTy::List(_))) =>
+                        if tyof!(0) == Some(JTy::This)
+                            && matches!(dty, Some(JTy::List(_) | JTy::Str)) =>
                     {
                         let fp = this_fp.ok_or(())?;
                         let off = *idx as i32 * crate::value::layout::SIZE;
@@ -2700,7 +2920,7 @@ impl Jit {
                     SetFieldAt {
                         obj: 0, idx, src, ..
                     } if tyof!(0) == Some(JTy::This)
-                        && matches!(tyof!(*src), Some(JTy::List(_))) =>
+                        && matches!(tyof!(*src), Some(JTy::List(_) | JTy::Str)) =>
                     {
                         let fp = this_fp.ok_or(())?;
                         let off = *idx as i32 * crate::value::layout::SIZE;
@@ -3181,6 +3401,14 @@ impl Jit {
                         } else {
                             bx.def_var(dvar!(*d), v);
                         }
+                    }
+                    CallMethod { dst, recv, .. } if tyof!(*recv) == Some(JTy::Str) => {
+                        let s = bx.use_var(uvar!(*recv));
+                        let call = bx.ins().call(str_len_ref, &[s]);
+                        let len = bx.inst_results(call)[0];
+                        let failed = bx.ins().icmp_imm_s(IntCC::SignedLessThan, len, 0);
+                        bail!(bx, failed);
+                        bx.def_var(dvar!(*dst), len);
                     }
                     CallMethod { dst, recv, .. } => {
                         let list = bx.use_var(uvar!(*recv));

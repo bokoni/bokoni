@@ -39,6 +39,10 @@ const PROGRAMS: &[(&str, &str)] = &[
         "class P\n  def init(@x: float, @y: float)\n  end\n  def x(): float = @x\n  def y(): float = @y\nend\ndef sq(v: float): float = v * v\ndef total(ps: [P], k: int): float\n  let t = 0.0\n  for i in 0...k\n    for p in ps\n      t += sq(p.x()) + p.y()\n    end\n  end\n  t\nend\ntotal([P(1.0, 2.0), P(3.0, 4.0)], 500000)",
     ),
     (
+        "strings in typed code: interpolation, len (100 k)",
+        "def label(i: int, name: str): str = \"#{name}-#{i}\"\ndef run(n: int): int\n  let t = 0\n  for i in 0...n\n    let s = label(i, \"item\")\n    if s != \"x\" then t += s.len() end\n  end\n  t\nend\nrun(100000)",
+    ),
+    (
         "float: harmonic series (1 M)",
         "def h(n: int): float\n  let s = 0.0\n  for i in 1..n\n    s += 1.0 / i\n  end\n  s\nend\nh(1000000)",
     ),
