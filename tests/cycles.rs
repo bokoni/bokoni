@@ -97,3 +97,77 @@ fn collected_during_a_long_script() {
         .unwrap();
     assert!(bokoni::gc::tracked() < 250_000, "{}", bokoni::gc::tracked());
 }
+
+#[test]
+fn cycles_through_shared_closures_and_tuples() {
+    for jit in [false, true] {
+        let mut e = Engine::new();
+        e.set_output(|_| {});
+        e.set_jit(jit);
+        e.set_static_checks(false);
+        e.eval(
+            "class Node\n  def init(@peer)\n  end\n  def set(p) = @peer = p\nend
+def shared(): int
+  let n = Node(nil)
+  let f = || n
+  n.set([f, f])
+  1
+end
+def tuple(): int
+  let xs = [0]
+  let t = (xs, xs)
+  xs << t
+  1
+end
+def handlers(): int
+  let hs = {}
+  let me = |x| hs
+  hs[1] = me
+  hs[2] = me
+  1
+end",
+        )
+        .unwrap();
+        let base = alive_after(&mut e);
+        e.eval("let t = 0\nfor i in 0...2000\n  t += shared() + tuple() + handlers()\nend")
+            .unwrap();
+        let after = alive_after(&mut e);
+        assert!(
+            after <= base + 10,
+            "jit={jit}: {base} containers before, {after} after"
+        );
+    }
+}
+
+#[test]
+fn cycles_built_by_the_host() {
+    use bokoni::Value;
+    use std::cell::RefCell;
+    use std::rc::{Rc, Weak};
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    // Lists the host built (not registered when created), put into cycles by the script,
+    // then dropped: freed.
+    type Made = Rc<RefCell<Vec<Weak<RefCell<Vec<Value>>>>>>;
+    let made: Made = Rc::default();
+    let m = made.clone();
+    e.register_fn("make", move || {
+        let l = Rc::new(RefCell::new(vec![Value::Int(1)]));
+        m.borrow_mut().push(Rc::downgrade(&l));
+        Value::List(l)
+    });
+    e.eval("def f(): int\n  let xs = make()\n  xs << xs\n  1\nend\nlet t = 0\nfor i in 0...1000\n  t += f()\nend")
+        .unwrap();
+    e.collect_cycles();
+    let alive = made
+        .borrow()
+        .iter()
+        .filter(|w| w.strong_count() > 0)
+        .count();
+    assert_eq!(alive, 0);
+    // Kept while reachable from a global.
+    e.set_global("g", Value::List(Rc::new(RefCell::new(vec![]))));
+    e.eval("g << g\ng << 5").unwrap();
+    e.collect_cycles();
+    assert_eq!(e.eval_as::<i64>("g[0][0][1]").unwrap(), 5);
+}

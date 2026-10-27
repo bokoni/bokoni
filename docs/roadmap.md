@@ -397,6 +397,24 @@ namespaces, `trait` for shared behavior.
       simple types are not registered (they cannot be in a cycle). No measurable cost
       on the benchmarks.
 
+### v0.19 — Limits lifted
+
+- [x] Hashes and records in the loops of typed code: indexing, fields, hash and record
+      literals call the interpreter's function for them directly, on borrowed values
+      (`direct_op`, no registers rebuilt): such a function is compiled even with them in
+      a loop. A value of any type with a number (`h[k] + 1`) is speculated to be a
+      number (tag checked, otherwise resumed in the interpreter, which then does that
+      instruction): `t += h[1] + 1`, 3 M turns, 0.08 s (baseline) → 0.05 s
+- [x] Native code calling the interpreter grows the stack when needed (a deep recursion
+      through `map` and native functions)
+- [x] A global list of ints, floats, bools or strings (its first element) read by native
+      code as such a list, each element checked as it is read: a loop over a global list
+      of 1,000 ints, 3,000 times: 0.03 s → under 0.01 s
+- [x] Cycle collector: closures that capture and tuples holding containers registered
+      too (a cycle through a closure referenced several times is freed); a value built
+      by the host is registered when it reaches the engine (`set_global`, the result of a
+      Rust function, `Engine::call`); registered twice, it is counted once
+
 ### Next
 
 - Macros: calls without parentheses, named arguments.
@@ -452,11 +470,12 @@ optimizations (on-demand lexer, interning of short names) only brought a few %.
 ## Known limitations (v0.1)
 
 - Reference cycles are freed by a collection (see v0.18), not as soon as they become
-  unreachable; a cycle through a value the host built (`Value::List` from Rust) or
-  through a closure also referenced elsewhere is kept.
+  unreachable; a value the host built and keeps (a `Value::List` it still holds) counts
+  as referenced from outside, as does a container nested in it that the host shares.
 - A `for` loop over a list does not copy it: the loop copies what it has left only when
   the list is modified (`<<`, `push`, `pop`, `xs[i] = v`) while it walks it. A list
   modified from Rust (`Value::List`) during a loop is seen modified.
 - Globals are typed in native code (by their value, checked on every read) only in the
   loops of the main program and the functions compiled natively; the interpreter keeps
-  them dynamic. A global list read in native code is any value.
+  them dynamic. A global list of objects (or empty when compiled) read in native code is
+  any value.

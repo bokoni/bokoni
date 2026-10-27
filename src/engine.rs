@@ -256,7 +256,9 @@ impl Engine {
     /// Defines (or replaces) a global variable the script can modify.
     pub fn set_global(&mut self, name: &str, v: impl IntoValue) {
         let sym = self.rt.interner.intern(name);
-        self.rt.globals.define(sym, v.into_value(), true);
+        let v = v.into_value();
+        crate::gc::track_new(&v);
+        self.rt.globals.define(sym, v, true);
     }
 
     /// Reads a global variable.
@@ -440,6 +442,7 @@ impl Engine {
                 None,
             )
         })?;
+        args.iter().for_each(crate::gc::track_new);
         Ok(self
             .rt
             .call_value(&f, CallArgs::plain(args), Default::default())?)

@@ -244,7 +244,12 @@ impl Runtime {
                         span,
                     );
                 }
-                (n.f)(&args.pos).map_err(|msg| Error::runtime(msg, span))
+                let v = (n.f)(&args.pos).map_err(|msg| Error::runtime(msg, span))?;
+                // Built by the host: registered if it holds containers.
+                if crate::gc::addr_of_value(&v).is_some() {
+                    crate::gc::track_new(&v);
+                }
+                Ok(v)
             }
             Function::Builtin(b) => self.builtin(*b, args.pos, span),
             Function::Script(c) => self.invoke(&c.proto, &c.upvals, &c.ctx, None, args, span),
@@ -1086,6 +1091,7 @@ impl Runtime {
             Instr::Tuple(d, s, n) => {
                 let s = *s as usize;
                 reg!(*d) = Value::Tuple(regs[s..s + *n as usize].into());
+                crate::gc::track(&reg!(*d));
             }
             Instr::Hash(d, s, n) => {
                 let mut h = HashMap::new();

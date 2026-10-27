@@ -635,6 +635,20 @@ fn sole<T>(rc: &Rc<RefCell<T>>) -> Option<std::cell::RefMut<'_, T>> {
     }
 }
 
+/// The contents of an immutable `rc` (tuple, closure) if `v` is its sole owner (weak
+/// references aside, as for `sole`).
+#[inline]
+fn sole_mut<T: ?Sized>(rc: &mut Rc<T>) -> Option<&mut T> {
+    if Rc::strong_count(rc) == 1 {
+        // SAFETY: the only strong reference, held mutably: no other reference to the
+        // contents exists (a weak one is not upgraded while a value is being dropped),
+        // which is what `Rc::get_mut` checks, weak references aside.
+        Some(unsafe { &mut *(Rc::as_ptr(rc) as *mut T) })
+    } else {
+        None
+    }
+}
+
 /// `v` is the sole owner of a container that itself holds a container.
 fn has_nested(v: &mut Value) -> bool {
     fn any<'a>(mut xs: impl Iterator<Item = &'a Value>) -> bool {
@@ -642,11 +656,11 @@ fn has_nested(v: &mut Value) -> bool {
     }
     match v {
         Value::List(rc) => sole(rc).is_some_and(|c| any(c.iter())),
-        Value::Tuple(rc) => Rc::get_mut(rc).is_some_and(|c| any(c.iter())),
+        Value::Tuple(rc) => sole_mut(rc).is_some_and(|c| any(c.iter())),
         Value::Hash(rc) => sole(rc).is_some_and(|c| any(c.entries.iter().map(|(_, x)| x))),
         Value::Record(rc) => sole(rc).is_some_and(|c| any(c.fields.iter().map(|(_, x)| x))),
         Value::Object(rc) => sole(rc).is_some_and(|c| any(c.fields.iter())),
-        Value::Function(rc) => Rc::get_mut(rc).is_some_and(|f| match f {
+        Value::Function(rc) => sole_mut(rc).is_some_and(|f| match f {
             Function::Script(c) => c
                 .upvals
                 .iter()
@@ -692,7 +706,7 @@ fn take_children(v: &mut Value, out: &mut Vec<Value>) {
             }
         }
         Value::Tuple(rc) => {
-            if let Some(items) = Rc::get_mut(rc) {
+            if let Some(items) = sole_mut(rc) {
                 for x in items.iter_mut() {
                     push(std::mem::replace(x, Value::Nil));
                 }
@@ -715,7 +729,7 @@ fn take_children(v: &mut Value, out: &mut Vec<Value>) {
             }
         }
         Value::Function(rc) => {
-            if let Some(Function::Script(c)) = Rc::get_mut(rc) {
+            if let Some(Function::Script(c)) = sole_mut(rc) {
                 for cell in c.upvals.iter() {
                     if let Some(mut cell) = sole(cell) {
                         push(std::mem::replace(&mut *cell, Value::Nil));

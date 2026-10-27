@@ -526,6 +526,7 @@ impl Runtime {
                 upvals: c.upvals.clone(),
                 ctx: c.ctx.clone(),
             })));
+            crate::gc::track(&f);
             args.pos.push(f);
         }
         match info.methods.get(&self.syms.init).cloned() {
