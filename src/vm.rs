@@ -1794,7 +1794,7 @@ impl Runtime {
     /// `type` (not `class`) named by a named type.
     fn data_type(&self, rt: &RtType) -> Option<Rc<TypeInfo>> {
         match rt {
-            RtType::Named(slot, _) if *slot != u32::MAX => match &self.globals.at(*slot).value {
+            RtType::Named(slot, ..) if *slot != u32::MAX => match &self.globals.at(*slot).value {
                 Some(Value::Type(info)) if info.kind != TypeDeclKind::Class => Some(info.clone()),
                 _ => None,
             },
@@ -1838,7 +1838,7 @@ impl Runtime {
             RtType::Fn => matches!(v, Value::Function(_) | Value::Type(_)),
             RtType::LitStr(s) => matches!(v, Value::Str(x) if **x == **s),
             RtType::LitInt(n) => matches!(v, Value::Int(x) if x == n),
-            RtType::Named(slot, name) => {
+            RtType::Named(slot, name, _) => {
                 let found = if *slot == u32::MAX {
                     None
                 } else {

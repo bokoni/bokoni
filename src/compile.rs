@@ -1384,8 +1384,13 @@ impl Compiler<'_> {
 
     fn rt_type(&mut self, t: &TypeExpr) -> RtType {
         match &t.kind {
-            // Generic: erased at run time (`Box(int)` is checked as a `Box`).
+            // Generic: erased at run time (`Box(int)` is checked as a `Box`); its
+            // arguments are kept for the typed JIT.
             TypeKind::Named(path) | TypeKind::Applied(path, _) => {
+                let args: Rc<[RtType]> = match &t.kind {
+                    TypeKind::Applied(_, xs) => xs.iter().map(|x| self.rt_type(x)).collect(),
+                    _ => Rc::from([]),
+                };
                 if let [name] = path.as_slice() {
                     if self.tparams.contains(name) {
                         return RtType::Any;
@@ -1397,12 +1402,12 @@ impl Compiler<'_> {
                         "str" => RtType::Str,
                         "bool" => RtType::Bool,
                         "nil" => RtType::Nil,
-                        _ => RtType::Named(self.global_slot(&[*name], t.span), *name),
+                        _ => RtType::Named(self.global_slot(&[*name], t.span), *name, args),
                     }
                 } else {
                     match self.member_slot(path, t.span) {
-                        Some(slot) => RtType::Named(slot, *path.last().unwrap()),
-                        None => RtType::Named(u32::MAX, path[0]),
+                        Some(slot) => RtType::Named(slot, *path.last().unwrap(), args),
+                        None => RtType::Named(u32::MAX, path[0], args),
                     }
                 }
             }

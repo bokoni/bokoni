@@ -22,7 +22,9 @@
 //!   typed for the arguments of a call (`T = int`, see `Proto::specialize`): one copy per
 //!   type, called directly by native code, or by the interpreter when the arguments fit.
 //!   Same for a method of a generic class (`class Box(T)`), `T` found from the fields of
-//!   `self` and the arguments; its fields of type `T` are checked on entry.
+//!   `self` and the arguments, or from the annotation of the receiver (`a: Acc(int)`: the
+//!   type arguments are kept in compiled annotations); its fields of type `T` are
+//!   checked on entry.
 //! - The interpreter calls native code directly (`Runtime::native_fast`) when the
 //!   arguments are exactly of its native types.
 //!
@@ -420,18 +422,32 @@ fn ann_of(q: &Proto, i: usize) -> Option<&RtType> {
     q.params[i].ty.as_ref().map(|t| &*t.ty)
 }
 
-/// Same type: a declared type is identified by its global slot.
+/// Same type: a declared type is identified by its global slot (whatever its type
+/// arguments: same layout).
 fn same_ann(a: &RtType, b: &RtType) -> bool {
     match (a, b) {
-        (RtType::Named(x, _), RtType::Named(y, _)) => x == y,
+        (RtType::Named(x, ..), RtType::Named(y, ..)) => x == y,
         (RtType::List(x), RtType::List(y)) => same_ann(x, y),
+        _ => a == b,
+    }
+}
+
+/// Same type and same type arguments (`Acc(int)` is not `Acc(float)`).
+fn same_ann_exact(a: &RtType, b: &RtType) -> bool {
+    match (a, b) {
+        (RtType::Named(x, _, xs), RtType::Named(y, _, ys)) => {
+            x == y
+                && xs.len() == ys.len()
+                && xs.iter().zip(ys.iter()).all(|(p, q)| same_ann_exact(p, q))
+        }
+        (RtType::List(x), RtType::List(y)) => same_ann_exact(x, y),
         _ => a == b,
     }
 }
 
 /// Index of `t` in the type table (added if needed).
 fn intern_ann(anns: &mut Vec<RtType>, t: &RtType) -> u32 {
-    match anns.iter().position(|a| same_ann(a, t)) {
+    match anns.iter().position(|a| same_ann_exact(a, t)) {
         Some(i) => i as u32,
         None => {
             anns.push(t.clone());
@@ -735,7 +751,7 @@ impl Analysis<'_> {
                 let info = match g(*recv)? {
                     JTy::This => this?,
                     JTy::Obj(a) => match &self.anns[a as usize] {
-                        RtType::Named(slot, _) => match &self.globals.at(*slot).value {
+                        RtType::Named(slot, ..) => match &self.globals.at(*slot).value {
                             Some(Value::Type(info)) => info.clone(),
                             _ => return None,
                         },
@@ -743,16 +759,38 @@ impl Analysis<'_> {
                     },
                     _ => return None,
                 };
+                // Type arguments of the receiver's annotation (`a: Acc(int)`), simple ones.
+                let recv_args: Option<Vec<RtType>> = match g(*recv)? {
+                    JTy::Obj(a) => match &self.anns[a as usize] {
+                        RtType::Named(_, _, xs)
+                            if !xs.is_empty() && xs.iter().all(|x| prim(x).is_some()) =>
+                        {
+                            Some(xs.to_vec())
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 let declared = info.methods.get(name)?.clone();
                 // Method of a generic class called on `self` in a typed copy: the copy for
                 // the same type arguments.
-                let m = match &p.spec {
-                    Some(s)
+                let owner = crate::objects::method_owner(&info, *name, &declared);
+                let m = match (&p.spec, recv_args) {
+                    (Some(s), _)
                         if !declared.class_params.is_empty()
                             && declared.class_params == p.class_params
                             && g(*recv)? == JTy::This =>
                     {
                         declared.specialize_as(&declared.class_params, &s.tys)
+                    }
+                    // Declared by the annotated class itself: its arguments are those of the
+                    // method's type parameters (checked on entry of the copy).
+                    (_, Some(args))
+                        if !declared.class_params.is_empty()
+                            && Rc::ptr_eq(&owner, &info)
+                            && args.len() == declared.class_params.len() =>
+                    {
+                        declared.specialize_as(&declared.class_params, &args)
                     }
                     _ => declared.clone(),
                 };
@@ -777,7 +815,6 @@ impl Analysis<'_> {
                         return None;
                     }
                 }
-                let owner = crate::objects::method_owner(&info, *name, &declared);
                 let ret = value_jty(&mut self.anns, &m.ret.as_ref()?.ty);
                 self.targets.insert(
                     ins as *const Instr as usize,
@@ -931,7 +968,7 @@ impl Analysis<'_> {
                         let info = global_type(self.globals, slot)?;
                         let tys: Vec<Option<JTy>> = cur.iter().map(|l| l.get()).collect();
                         ctor_plan(&info, site, &tys, &self.anns)?;
-                        let t = RtType::Named(slot, crate::intern::Symbol(u32::MAX));
+                        let t = RtType::Named(slot, crate::intern::Symbol(u32::MAX), Rc::from([]));
                         JTy::Obj(intern_ann(&mut self.anns, &t))
                     }
                     _ => return None,
@@ -1418,7 +1455,7 @@ impl Jit {
             // Type of a parameter redeclared: field layout to recompile.
             for prm in &p.params {
                 if let Some(ann) = &prm.ty
-                    && let RtType::Named(slot, _) = &*ann.ty
+                    && let RtType::Named(slot, ..) = &*ann.ty
                 {
                     globals.watch(*slot, &p);
                 }
@@ -1520,7 +1557,7 @@ impl Jit {
         // annotation), hence the offset of every field.
         let mut obj_types: Vec<Option<Rc<crate::objects::TypeInfo>>> = vec![None; plan.anns.len()];
         for (a, ann) in plan.anns.iter().enumerate() {
-            if let RtType::Named(slot, _) = ann
+            if let RtType::Named(slot, ..) = ann
                 && let Some(Value::Type(info)) = &globals.at(*slot).value
                 && info.kind == crate::ast::TypeDeclKind::Type
             {

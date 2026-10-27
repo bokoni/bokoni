@@ -285,8 +285,9 @@ namespaces, `trait` for shared behavior.
 - [x] Interpreter → native code called directly when the arguments are of its native
       types (no frame, no conversion): a method called in a loop of the script ×1.5 →
       ×5.8 against the interpreter, a typed function 56 → 28 ns per call
-- [ ] Native code called with type arguments known only to the checker (a parameter
-      `a: Acc(int)` in a typed function: erased, its methods are not called directly)
+- [x] Type arguments kept in compiled annotations (`a: Acc(int)`), ignored by the
+      run-time checks: typed native code calls the copy of the methods for them
+      directly (checked on entry of the copy); 0.13 s → 0.02 s on a typed loop
 
 ### Next
 

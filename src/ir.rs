@@ -296,8 +296,10 @@ pub enum RtType {
     LitStr(Rc<str>),
     LitInt(i64),
     Fn,
-    /// User type: `type`, `class` or `enum`, in a global slot.
-    Named(u32, Symbol),
+    /// User type: `type`, `class` or `enum`, in a global slot; the type arguments of a
+    /// generic one (`Acc(int)`), ignored by the checks (generics are erased), used by the
+    /// typed JIT to call the right typed copy of its methods.
+    Named(u32, Symbol, Rc<[RtType]>),
 }
 
 /// Runtime type of annotation `expr` (compiled as `orig`) with the type parameters
@@ -312,6 +314,16 @@ fn subst_rt(expr: &TypeExpr, orig: &RtType, names: &[Symbol], tys: &[RtType]) ->
             }
         }
         (TypeKind::List(x), RtType::List(o)) => RtType::List(Box::new(subst_rt(x, o, names, tys))),
+        (TypeKind::Applied(_, xs), RtType::Named(s, n, os)) if xs.len() == os.len() => {
+            RtType::Named(
+                *s,
+                *n,
+                xs.iter()
+                    .zip(os.iter())
+                    .map(|(x, o)| subst_rt(x, o, names, tys))
+                    .collect(),
+            )
+        }
         (TypeKind::Optional(x), RtType::Optional(o)) => {
             RtType::Optional(Box::new(subst_rt(x, o, names, tys)))
         }

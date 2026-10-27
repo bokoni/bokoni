@@ -1003,5 +1003,5 @@ begin rescue ensure raise super trait abstract include type class enum annotatio
 
 - Variance of generic types: compatible when their arguments are (covariant, like
   lists), which is lenient for a `Box(T)` that can be modified.
-- Type arguments kept at run time (`Acc(int)`) so that typed native code can call the
-  methods of a generic object directly.
+- Type arguments kept in each object (`Acc(int)`, as in C#), rather than only in the
+  annotations (the JIT's use today): stricter checks at run time, at a cost in memory.

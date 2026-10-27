@@ -603,3 +603,45 @@ end
         "ab"
     );
 }
+
+#[test]
+fn typed_code_calls_methods_of_generic_objects() {
+    let src = "class Acc(T)
+  def init(@sum: T, @n: int)
+  end
+  def get(): T = @sum
+  def scaled(k: T): T = @sum * k
+end
+def run(a: Acc(int), k: int): int
+  let t = 0
+  for i in 0...k
+    t += a.get() + a.scaled(2)
+  end
+  t
+end
+def runf(a: Acc(float), k: int): float
+  let t = 0.0
+  for i in 0...k
+    t += a.scaled(0.5)
+  end
+  t
+end
+[run(Acc(3, 0), 100), runf(Acc(4.0, 0), 10)]";
+    assert_eq!(same(src), "[900, 20.0]");
+    let mut e = Engine::new();
+    e.eval(src).unwrap();
+    // The annotation `Acc(int)` gives the copy of the methods to call directly.
+    assert!(e.is_native("run"));
+    assert!(e.is_native("runf"));
+    // An object that does not match (static checks off): checked on entry of the
+    // method's copy, the call is redone by the interpreter, which gives its error.
+    let bad = |jit: bool| {
+        let mut e = Engine::new();
+        e.set_jit(jit);
+        e.set_static_checks(false);
+        e.eval(src).unwrap();
+        e.eval("run(Acc(1.5, 0), 2)").unwrap_err().to_string()
+    };
+    assert_eq!(bad(true), bad(false));
+    assert!(bad(true).contains("expected type `int`, got float"));
+}
