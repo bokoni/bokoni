@@ -135,6 +135,10 @@ Temps compilation comprise.
       la redéclaration du type recompile la fonction pour la nouvelle disposition
 - [x] Analyse de vivacité : un `nil` jamais lu (valeur d'un `while`) n'empêche plus la
       compilation typée
+- [x] JIT typé : listes en paramètre (`[int]`, `[float]`, `[P]`…) — `for x in xs`,
+      `xs[i]` (index négatif compris), `xs.len()`, transmission aux fonctions natives ;
+      cas limite (index hors limites…) : l'interpréteur reprend l'appel et produit
+      l'erreur exacte
 - Non fait, volontairement : typer les paramètres des lambdas d'après la liste
   (`xs.map(|x| …)`) — une liste `[int]` peut recevoir une autre valeur depuis du code
   non typé, et le coût restant est celui de l'appel, pas du calcul
@@ -146,6 +150,7 @@ Temps compilation comprise.
 | objets : construction et champs (100 k) | 17,9 ms | 9,2 ms     | ×1,9 |
 | chaînes : interpolation (100 k)         | 11,2 ms | 8,7 ms     | ×1,3 |
 | objets typés : produit scalaire (1 M)   | 172 ms  | 3,2 ms     | ×54  |
+| boucle typée sur 100 k objets (`wsum`)  | ~6,4 ms | 0,47 ms    | ×14  |
 | `fib(25)` interprété (`--no-jit`)       | 28 ms   | 18 ms      | ×1,6 |
 
 ### Ensuite

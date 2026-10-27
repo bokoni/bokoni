@@ -187,7 +187,7 @@ pub struct TypeRef {
     pub expr: Rc<TypeExpr>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RtType {
     Any,
     Int,

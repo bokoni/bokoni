@@ -326,3 +326,45 @@ fn typed_fields_in_untyped_code() {
         same(&format!("{ty}{body}"));
     }
 }
+
+#[test]
+fn typed_functions_over_lists() {
+    let src = "type P\n  x: int = 0\n  w: float = 1.0\nend\n\
+               def total(xs: [int]): int\n  let t = 0\n  for x in xs\n    t += x\n  end\n  t\nend\n\
+               def mean(xs: [float]): float\n  let t = 0.0\n  for x in xs\n    t += x\n  end\n  t / xs.len()\nend\n\
+               def wsum(ps: [P]): float\n  let t = 0.0\n  for p in ps\n    t += p.x * p.w\n  end\n  t\nend\n\
+               def at(xs: [int], i: int): int = xs[i] * 10\n\
+               def first(ps: [P]): int = ps[0].x + ps[-1].x\n\
+               def pass(xs: [int]): int = total(xs) + xs.len()\n";
+    let cases = [
+        "[total([1, 2, 3]), total([]), mean([1.0, 2, 4.5]), wsum([P(x: 2), P(x: 3, w: 0.5)])]",
+        "[at([5, 6, 7], 1), at([5, 6, 7], -1), first([P(x: 9), P(x: 1)]), pass([4, 5])]",
+        // Cas limites : l'interpréteur reprend la main, mêmes erreurs.
+        "at([5, 6, 7], 3)",
+        "at([5, 6, 7], -4)",
+        "first([])",
+        &format!("total([{}, 1])", i64::MAX),
+    ];
+    for c in cases {
+        same(&format!("{src}{c}"));
+    }
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    e.eval(src).unwrap();
+    e.eval(cases[0]).unwrap();
+    e.eval(cases[1]).unwrap();
+    for f in ["total", "mean", "wsum", "at", "first", "pass"] {
+        assert!(e.is_native(f), "`{f}` devrait être compilée");
+    }
+}
+
+#[test]
+fn list_with_unexpected_values_falls_back() {
+    // Une liste annotée `[int]` qui reçoit ensuite une chaîne (code non typé) : refusée
+    // à l'appel (l'annotation vérifie les éléments), en natif comme en interprété.
+    let src = "def total(xs: [int]): int\n  let t = 0\n  for x in xs\n    t += x\n  end\n  t\nend\n\
+               def push(l, v) = l << v\n\
+               let xs: [int] = [1, 2]\ntotal(xs)\npush(xs, \"a\")\ntotal(xs)";
+    let r = same(src);
+    assert!(r.contains("type attendu `[int]`"), "{r}");
+}

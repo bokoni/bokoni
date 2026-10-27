@@ -74,6 +74,7 @@ pub(crate) struct Syms {
     pub name: Symbol,
     pub values: Symbol,
     pub from: Symbol,
+    pub len: Symbol,
 }
 
 impl Syms {
@@ -85,6 +86,7 @@ impl Syms {
             name: i.intern("name"),
             values: i.intern("values"),
             from: i.intern("from"),
+            len: i.intern("len"),
         }
     }
 }

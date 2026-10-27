@@ -103,6 +103,24 @@ extern "C" fn bk_obj_fields(
     }
 }
 
+/// Éléments d'une liste : adresse dans `out[0]`, nombre dans `out[1]` ; 1 si ce n'est
+/// pas une liste.
+extern "C" fn bk_list_view(v: *const Value, out: *mut u64) -> i32 {
+    // SAFETY : `v` désigne une valeur vivante pendant l'appel natif, `out` deux cases.
+    // Le code natif est sans effet de bord : la liste ne change pas pendant l'appel.
+    unsafe {
+        let Value::List(l) = &*v else {
+            return 1;
+        };
+        let Ok(items) = l.try_borrow() else {
+            return 1;
+        };
+        *out = items.as_ptr() as u64;
+        *out.add(1) = items.len() as u64;
+    }
+    0
+}
+
 /// Champ d'un objet passé en paramètre (`FieldAs`) : 0 et la valeur (bits) dans `out`,
 /// ou 1 si l'objet n'a pas ce champ avec ce type.
 extern "C" fn bk_field_native(obj: *const Value, cache: *mut u8, out: *mut u64) -> i32 {
@@ -139,11 +157,14 @@ pub struct Jit {
     frem_fn: FuncId,
     field_fn: FuncId,
     fields_fn: FuncId,
+    list_fn: FuncId,
     /// Types dont le code natif connaît la disposition (gardés en vie : leur adresse sert
     /// d'identité).
     known_types: Vec<Rc<crate::objects::TypeInfo>>,
     /// Le dernier appel natif a été abandonné (`ErrKind::Bail`).
     pub bailed: bool,
+    /// Symbole de la méthode `len` (listes).
+    pub len_sym: crate::intern::Symbol,
     /// Fonctions d'aide du code de base (`bk_step`, `bk_iter_next`, `bk_drop`).
     dyn_fns: Option<(FuncId, FuncId, FuncId)>,
     /// Fonctions d'aide rapides (`FAST`), dans l'ordre de `Fast`.
@@ -165,9 +186,13 @@ enum JTy {
     Nil,
     /// Fonction globale appelée directement (case globale).
     Callee(u32),
-    /// Objet reçu en paramètre (index du paramètre) : pointeur vers la valeur, empruntée
-    /// à l'appelant pour la durée de l'appel.
+    /// Objet du type `anns[i]` : pointeur vers la valeur (paramètre ou élément d'une
+    /// liste), vivante pendant tout l'appel.
     Obj(u32),
+    /// Liste d'éléments du type `anns[i]` : pointeur vers la valeur.
+    List(u32),
+    /// Itérateur sur une liste d'éléments du type `anns[i]`.
+    Iter(u32),
 }
 
 fn prim(rt: &RtType) -> Option<RegTy> {
@@ -211,6 +236,9 @@ fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
         // Paramètre d'un type déclaré : l'objet, par pointeur (`Value`).
         params.push(match &**ty {
             RtType::Named(..) => RegTy::Value,
+            RtType::List(e) if matches!(**e, RtType::Named(..)) || prim(e).is_some() => {
+                RegTy::Value
+            }
             t => prim(t)?,
         });
     }
@@ -218,7 +246,7 @@ fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
 }
 
 /// Annotation du paramètre `i`.
-fn param_ann(q: &Proto, i: usize) -> Option<&RtType> {
+fn ann_of(q: &Proto, i: usize) -> Option<&RtType> {
     q.params[i].ty.as_ref().map(|t| &*t.ty)
 }
 
@@ -237,19 +265,47 @@ fn global_proto(globals: &Globals, slot: u32) -> Option<Rc<Proto>> {
 struct Plan {
     tys: Vec<Option<JTy>>,
     callees: Vec<u32>,
+    /// Types des objets et des éléments de liste (`JTy::Obj` / `List` / `Iter`).
+    anns: Vec<RtType>,
+    /// Annotation propre à chaque paramètre objet.
+    param_ann: Vec<Option<u32>>,
+}
+
+/// Type d'un élément de type `anns[a]`.
+fn elem_jty(anns: &[RtType], a: u32) -> JTy {
+    match &anns[a as usize] {
+        RtType::Named(..) => JTy::Obj(a),
+        t => jty(prim(t).expect("élément simple ou objet")),
+    }
 }
 
 /// Types des registres d'une fonction compilable ; `None` si elle ne l'est pas.
-fn analyze(p: &Proto, globals: &Globals) -> Option<Plan> {
+fn analyze(p: &Proto, globals: &Globals, len: crate::intern::Symbol) -> Option<Plan> {
     let (params, ret) = native_sig(p)?;
     let mut tys: Vec<Option<JTy>> = p
         .regs
         .iter()
         .map(|t| (*t != RegTy::Value).then(|| jty(*t)))
         .collect();
+    let mut anns: Vec<RtType> = Vec::new();
+    let mut param_ann = vec![None; params.len()];
     for (k, (prm, t)) in p.params.iter().zip(&params).enumerate() {
         tys[prm.reg as usize] = Some(match t {
-            RegTy::Value => JTy::Obj(k as u32),
+            RegTy::Value => {
+                let a = anns.len() as u32;
+                match &*prm.ty.as_ref()?.ty {
+                    t @ RtType::Named(..) => {
+                        anns.push(t.clone());
+                        param_ann[k] = Some(a);
+                        JTy::Obj(a)
+                    }
+                    RtType::List(e) => {
+                        anns.push((**e).clone());
+                        JTy::List(a)
+                    }
+                    _ => return None,
+                }
+            }
             t => jty(*t),
         });
     }
@@ -291,6 +347,23 @@ fn analyze(p: &Proto, globals: &Globals) -> Option<Plan> {
                         }
                     }
                     FieldAs(d, _, _, t) => set(&mut tys, *d, jty(*t))?,
+                    IterNew { dst, src, .. } => match tys[*src as usize] {
+                        Some(JTy::List(a)) => set(&mut tys, *dst, JTy::Iter(a))?,
+                        None => {}
+                        _ => return None,
+                    },
+                    Index(d, a, _) => match tys[*a as usize] {
+                        Some(JTy::List(e)) => set(&mut tys, *d, elem_jty(&anns, e))?,
+                        None => {}
+                        _ => return None,
+                    },
+                    CallMethod {
+                        dst, recv, name, ..
+                    } if *name == len => match tys[*recv as usize] {
+                        Some(JTy::List(_)) => set(&mut tys, *dst, JTy::Int)?,
+                        None => {}
+                        _ => return None,
+                    },
                     IBin(op, d, _, _) | IBinK(op, d, _, _) | FBin(op, d, _, _) => {
                         let t = if is_cmp(*op) {
                             JTy::Bool
@@ -345,6 +418,13 @@ fn analyze(p: &Proto, globals: &Globals) -> Option<Plan> {
                     _ => return None,
                 }
             }
+            if let Term::IterNext { iter, dst, .. } = &b.term {
+                match tys[*iter as usize] {
+                    Some(JTy::Iter(a)) => set(&mut tys, *dst, elem_jty(&anns, a))?,
+                    None => {}
+                    _ => return None,
+                }
+            }
         }
         if !changed {
             break;
@@ -361,8 +441,20 @@ fn analyze(p: &Proto, globals: &Globals) -> Option<Plan> {
                 Int(..) | Float(..) | Bool(..) | Nil(..) | GetGlobal(..) => true,
                 Move(_, a) => matches!(
                     ty(*a),
-                    Some(JTy::Int | JTy::Float | JTy::Bool | JTy::Obj(_))
+                    Some(JTy::Int | JTy::Float | JTy::Bool | JTy::Obj(_) | JTy::List(_))
                 ),
+                IterNew { src, .. } => matches!(ty(*src), Some(JTy::List(_))),
+                Index(_, a, i) => matches!(ty(*a), Some(JTy::List(_))) && is(*i, JTy::Int),
+                CallMethod {
+                    recv, name, site, ..
+                } => {
+                    let site = &p.calls[*site as usize];
+                    *name == len
+                        && matches!(ty(*recv), Some(JTy::List(_)))
+                        && site.npos == 0
+                        && site.named.is_empty()
+                        && !site.block
+                }
                 Guard(_, a, _) => matches!(ty(*a), Some(JTy::Int | JTy::Float | JTy::Bool)),
                 FieldAs(_, a, _, _) => matches!(ty(*a), Some(JTy::Obj(_))),
                 IBin(_, _, a, b2) => is(*a, JTy::Int) && is(*b2, JTy::Int),
@@ -377,7 +469,9 @@ fn analyze(p: &Proto, globals: &Globals) -> Option<Plan> {
                     let site = &p.calls[*site as usize];
                     (0..site.npos).all(|k| {
                         let r = site.start + k;
-                        num(r) || is(r, JTy::Bool) || matches!(ty(r), Some(JTy::Obj(_)))
+                        num(r)
+                            || is(r, JTy::Bool)
+                            || matches!(ty(r), Some(JTy::Obj(_) | JTy::List(_)))
                     })
                 }
                 _ => false,
@@ -398,7 +492,7 @@ fn analyze(p: &Proto, globals: &Globals) -> Option<Plan> {
                 RegTy::Float => num(*reg),
                 t => ty(*reg) == Some(jty(t)),
             },
-            Term::IterNext { .. } => false,
+            Term::IterNext { iter, .. } => matches!(ty(*iter), Some(JTy::Iter(_))),
         };
         if !ok {
             return None;
@@ -418,9 +512,14 @@ fn analyze(p: &Proto, globals: &Globals) -> Option<Plan> {
                     let compatible = match (pt, at) {
                         (RegTy::Float, JTy::Int | JTy::Float) => true,
                         // Objet transmis tel quel : même annotation, donc déjà vérifié.
-                        (RegTy::Value, JTy::Obj(j)) => {
+                        (RegTy::Value, JTy::Obj(a)) => {
                             let callee = global_proto(globals, slot)?;
-                            param_ann(&callee, k) == param_ann(p, j as usize)
+                            ann_of(&callee, k) == Some(&anns[a as usize])
+                        }
+                        // Liste transmise telle quelle : mêmes éléments.
+                        (RegTy::Value, JTy::List(a)) => {
+                            let callee = global_proto(globals, slot)?;
+                            matches!(ann_of(&callee, k), Some(RtType::List(e)) if **e == anns[a as usize])
                         }
                         (t, a) => jty(*t) == a,
                     };
@@ -431,7 +530,12 @@ fn analyze(p: &Proto, globals: &Globals) -> Option<Plan> {
             }
         }
     }
-    Some(Plan { tys, callees })
+    Some(Plan {
+        tys,
+        callees,
+        anns,
+        param_ann,
+    })
 }
 
 /// Registres lus et écrit par une instruction acceptée par le JIT typé ; `None` pour
@@ -448,7 +552,19 @@ fn reads_writes(p: &Proto, ins: &Instr) -> Option<(Vec<Reg>, Option<Reg>)> {
         | IToF(d, a)
         | Not(d, a)
         | IBinK(_, d, a, _) => (vec![*a], Some(*d)),
-        IBin(_, d, a, b) | FBin(_, d, a, b) | Bin(_, d, a, b) => (vec![*a, *b], Some(*d)),
+        IBin(_, d, a, b) | FBin(_, d, a, b) | Bin(_, d, a, b) | Index(d, a, b) => {
+            (vec![*a, *b], Some(*d))
+        }
+        IterNew { dst, src, .. } => (vec![*src], Some(*dst)),
+        CallMethod {
+            dst, recv, site, ..
+        } => {
+            let site = &p.calls[*site as usize];
+            let n = site.npos + site.named.len() as u32;
+            let mut r: Vec<Reg> = (site.start..site.start + n).collect();
+            r.push(*recv);
+            (r, Some(*dst))
+        }
         Call { dst, f, site } => {
             let site = &p.calls[*site as usize];
             let n = site.npos + site.named.len() as u32;
@@ -471,7 +587,9 @@ fn dead_nils(p: &Proto) -> Vec<*const Instr> {
             Term::IfInt { a, b, .. } => vec![*a, *b],
             Term::IfIntK { a, .. } => vec![*a],
             Term::Return { reg, .. } => vec![*reg],
-            Term::IterNext { .. } => return None,
+            // L'élément (`dst`) n'est écrit que vers le corps : compté comme non écrit,
+            // ce qui est prudent (moins de `nil` déclarés morts).
+            Term::IterNext { iter, .. } => vec![*iter],
         })
     };
     let succs = |t: &Term| -> Vec<usize> {
@@ -596,6 +714,7 @@ impl Jit {
         builder.symbol("bk_frem", bk_frem as *const u8);
         builder.symbol("bk_field_native", bk_field_native as *const u8);
         builder.symbol("bk_obj_fields", bk_obj_fields as *const u8);
+        builder.symbol("bk_list_view", bk_list_view as *const u8);
         builder.symbol("bk_step", bk_step as *const u8);
         builder.symbol("bk_iter_next", bk_iter_next as *const u8);
         builder.symbol("bk_drop", bk_drop as *const u8);
@@ -636,6 +755,13 @@ impl Jit {
         let fields_fn = module
             .declare_function("bk_obj_fields", Linkage::Import, &sig)
             .ok()?;
+        let mut sig = module.make_signature();
+        sig.params.push(AbiParam::new(ptr));
+        sig.params.push(AbiParam::new(ptr));
+        sig.returns.push(AbiParam::new(types::I32));
+        let list_fn = module
+            .declare_function("bk_list_view", Linkage::Import, &sig)
+            .ok()?;
         Some(Jit {
             module,
             ctx: Box::new(JitCtx {
@@ -651,8 +777,10 @@ impl Jit {
             frem_fn,
             field_fn,
             fields_fn,
+            list_fn,
             known_types: Vec::new(),
             bailed: false,
+            len_sym: crate::intern::Symbol(u32::MAX),
             dyn_fns: None,
             fast_fns: Vec::new(),
             field_caches: Vec::new(),
@@ -685,7 +813,7 @@ impl Jit {
                 order.push(p);
                 continue;
             }
-            let plan = analyze(&p, globals);
+            let plan = analyze(&p, globals, self.len_sym);
             if let Some(plan) = &plan {
                 for slot in &plan.callees {
                     if let Some(q) = global_proto(globals, *slot) {
@@ -852,16 +980,18 @@ impl Jit {
         let fields_ref = self
             .module
             .declare_func_in_func(self.fields_fn, &mut ctx.func);
+        let list_ref = self
+            .module
+            .declare_func_in_func(self.list_fn, &mut ctx.func);
         // Paramètres objets dont les champs sont lus : type connu maintenant (case globale
         // de l'annotation), donc position de chaque champ connue.
-        let mut obj_types: Vec<Option<Rc<crate::objects::TypeInfo>>> = vec![None; p.params.len()];
-        for (k, prm) in p.params.iter().enumerate() {
-            if let Some(ann) = &prm.ty
-                && let RtType::Named(slot, _) = &*ann.ty
+        let mut obj_types: Vec<Option<Rc<crate::objects::TypeInfo>>> = vec![None; plan.anns.len()];
+        for (a, ann) in plan.anns.iter().enumerate() {
+            if let RtType::Named(slot, _) = ann
                 && let Some(Value::Type(info)) = &globals.at(*slot).value
                 && info.kind == crate::ast::TypeDeclKind::Type
             {
-                obj_types[k] = Some(info.clone());
+                obj_types[a] = Some(info.clone());
                 // Gardé en vie : son adresse identifie le type dans le code natif.
                 if !self.known_types.iter().any(|t| Rc::ptr_eq(t, info)) {
                     self.known_types.push(info.clone());
@@ -883,8 +1013,19 @@ impl Jit {
                 Some(JTy::Int) => Some(bx.declare_var(types::I64)),
                 Some(JTy::Float) => Some(bx.declare_var(types::F64)),
                 Some(JTy::Bool) => Some(bx.declare_var(types::I8)),
-                Some(JTy::Obj(_)) => Some(bx.declare_var(types::I64)),
+                Some(JTy::Obj(_) | JTy::List(_)) => Some(bx.declare_var(types::I64)),
                 _ => None,
+            })
+            .collect();
+        // Itérateurs : adresse des éléments, nombre, position.
+        let iter_vars: FxHashMap<Reg, [Variable; 3]> = plan
+            .tys
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| matches!(t, Some(JTy::Iter(_))))
+            .map(|(r, _)| {
+                let v = [0; 3].map(|_| bx.declare_var(types::I64));
+                (r as Reg, v)
             })
             .collect();
         let entry = bx.create_block();
@@ -897,10 +1038,14 @@ impl Jit {
         // Case de sortie des lectures de champ.
         let out_slot = bx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
             cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-            8,
+            16,
             3,
         ));
         // Tous les registres sont définis dès l'entrée (valeur nulle).
+        for v in iter_vars.values().flatten() {
+            let z = bx.ins().iconst(types::I64, 0);
+            bx.def_var(*v, z);
+        }
         for (k, v) in vars.iter().enumerate() {
             if let Some(v) = v {
                 let z = match plan.tys[k] {
@@ -916,16 +1061,19 @@ impl Jit {
             bx.def_var(vars[prm.reg as usize].unwrap(), a);
         }
         // Adresse des champs de chaque objet de type connu (vérifié une fois ici).
-        let reads_fields = |k: usize| {
+        let reads_fields = |a: u32| {
             p.blocks.iter().flat_map(|b| &b.instrs).any(|i| {
-                matches!(i, Instr::FieldAs(_, a, ..) if plan.tys[*a as usize] == Some(JTy::Obj(k as u32)))
+                matches!(i, Instr::FieldAs(_, r, ..) if plan.tys[*r as usize] == Some(JTy::Obj(a)))
             })
         };
-        let mut fields_ptr: Vec<Option<cranelift_codegen::ir::Value>> = vec![None; p.params.len()];
+        let mut fields_ptr: Vec<Option<cranelift_codegen::ir::Value>> = vec![None; plan.anns.len()];
         let mut entry_checks = Vec::new();
         for k in 0..p.params.len() {
-            let Some(info) = &obj_types[k] else { continue };
-            if !reads_fields(k) {
+            let Some(a) = plan.param_ann[k] else { continue };
+            let Some(info) = &obj_types[a as usize] else {
+                continue;
+            };
+            if !reads_fields(a) {
                 continue;
             }
             let obj = bx.block_params(entry)[k + 1];
@@ -933,7 +1081,7 @@ impl Jit {
             let call = bx.ins().call(fields_ref, &[obj, ip]);
             let fp = bx.inst_results(call)[0];
             entry_checks.push(fp);
-            fields_ptr[k] = Some(fp);
+            fields_ptr[a as usize] = Some(fp);
         }
         let start = bx.create_block();
         for fp in entry_checks {
@@ -960,6 +1108,56 @@ impl Jit {
                 let id = $bx.ins().iconst(types::I64, eid);
                 $bx.ins().brif($cond, fail, &[id.into()], cont, &[]);
                 $bx.switch_to_block(cont);
+            }};
+        }
+        // Éléments d'une liste : (adresse, nombre) ; abandon si ce n'est pas une liste.
+        macro_rules! view {
+            ($bx:expr, $list:expr, $span:expr) => {{
+                let out = $bx.ins().stack_addr(types::I64, out_slot, 0);
+                let call = $bx.ins().call(list_ref, &[$list, out]);
+                let status = $bx.inst_results(call)[0];
+                check!($bx, status, ErrKind::Bail, $span);
+                let data = $bx.ins().load(types::I64, MemFlagsData::trusted(), out, 0);
+                let len = $bx.ins().load(types::I64, MemFlagsData::trusted(), out, 8);
+                (data, len)
+            }};
+        }
+        // Valeur de l'élément à l'adresse `addr`, du type `anns[a]` : l'adresse pour un
+        // objet ; sinon étiquette vérifiée (abandon si elle diffère), `int` vers `float`.
+        macro_rules! elem {
+            ($bx:expr, $addr:expr, $a:expr, $span:expr) => {{
+                use crate::value::layout::{PAYLOAD, TAG_BOOL, TAG_FLOAT, TAG_INT};
+                let t = elem_jty(&plan.anns, $a);
+                if let JTy::Obj(_) = t {
+                    $addr
+                } else {
+                    let tag = $bx.ins().load(types::I8, MemFlagsData::trusted(), $addr, 0);
+                    let raw = $bx
+                        .ins()
+                        .load(types::I64, MemFlagsData::trusted(), $addr, PAYLOAD);
+                    match t {
+                        JTy::Int => {
+                            let bad = $bx.ins().icmp_imm_s(IntCC::NotEqual, tag, TAG_INT as i64);
+                            check!($bx, bad, ErrKind::Bail, $span);
+                            raw
+                        }
+                        JTy::Bool => {
+                            let bad = $bx.ins().icmp_imm_s(IntCC::NotEqual, tag, TAG_BOOL as i64);
+                            check!($bx, bad, ErrKind::Bail, $span);
+                            $bx.ins().ireduce(types::I8, raw)
+                        }
+                        _ => {
+                            let isf = $bx.ins().icmp_imm_s(IntCC::Equal, tag, TAG_FLOAT as i64);
+                            let isi = $bx.ins().icmp_imm_s(IntCC::Equal, tag, TAG_INT as i64);
+                            let ok = $bx.ins().bor(isf, isi);
+                            let bad = $bx.ins().icmp_imm_s(IntCC::Equal, ok, 0);
+                            check!($bx, bad, ErrKind::Bail, $span);
+                            let f = $bx.ins().bitcast(types::F64, MemFlagsData::new(), raw);
+                            let i = $bx.ins().fcvt_from_sint(types::F64, raw);
+                            $bx.ins().select(isf, f, i)
+                        }
+                    }
+                }
             }};
         }
         for (bi, b) in p.blocks.iter().enumerate() {
@@ -999,11 +1197,23 @@ impl Jit {
                     // l'étiquette.
                     FieldAs(d, a, name, t)
                         if let Some(JTy::Obj(k)) = tyof(*a)
-                            && let Some(fp) = fields_ptr[k as usize]
-                            && let Some(idx) = obj_types[k as usize]
-                                .as_ref()
-                                .and_then(|i| i.field_index(*name)) =>
+                            && let Some(info) = &obj_types[k as usize]
+                            && let Some(idx) = info.field_index(*name) =>
                     {
+                        // Paramètre : adresse des champs prise à l'entrée ; élément d'une
+                        // liste : vérifiée à chaque lecture.
+                        let fp = match fields_ptr[k as usize] {
+                            Some(fp) => fp,
+                            None => {
+                                let obj = bx.use_var(var(*a));
+                                let ip = bx.ins().iconst(types::I64, Rc::as_ptr(info) as i64);
+                                let call = bx.ins().call(fields_ref, &[obj, ip]);
+                                let fp = bx.inst_results(call)[0];
+                                let null = bx.ins().icmp_imm_s(IntCC::Equal, fp, 0);
+                                check!(bx, null, ErrKind::Bail, span);
+                                fp
+                            }
+                        };
                         let off = idx as i32 * crate::value::layout::SIZE;
                         let tag = bx.ins().load(types::I8, MemFlagsData::trusted(), fp, off);
                         let (want, cty) = match t {
@@ -1161,6 +1371,39 @@ impl Jit {
                         bx.switch_to_block(cont);
                         bx.def_var(var(*dst), result);
                     }
+                    IterNew { dst, src, .. } => {
+                        let list = bx.use_var(var(*src));
+                        let (data, len) = view!(bx, list, span);
+                        let [dv, lv, iv] = iter_vars[dst];
+                        let zero = bx.ins().iconst(types::I64, 0);
+                        bx.def_var(dv, data);
+                        bx.def_var(lv, len);
+                        bx.def_var(iv, zero);
+                    }
+                    Index(d, a, i) => {
+                        let Some(JTy::List(e)) = tyof(*a) else {
+                            return Err(());
+                        };
+                        let list = bx.use_var(var(*a));
+                        let (data, len) = view!(bx, list, span);
+                        // Index négatif : depuis la fin ; hors limites : l'interpréteur
+                        // produit l'erreur.
+                        let i = bx.use_var(var(*i));
+                        let neg = bx.ins().icmp_imm_s(IntCC::SignedLessThan, i, 0);
+                        let from_end = bx.ins().iadd(i, len);
+                        let pos = bx.ins().select(neg, from_end, i);
+                        let out = bx.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, pos, len);
+                        check!(bx, out, ErrKind::Bail, span);
+                        let off = bx.ins().imul_imm_s(pos, crate::value::layout::SIZE as i64);
+                        let addr = bx.ins().iadd(data, off);
+                        let v = elem!(bx, addr, e, span);
+                        bx.def_var(var(*d), v);
+                    }
+                    CallMethod { dst, recv, .. } => {
+                        let list = bx.use_var(var(*recv));
+                        let (_, len) = view!(bx, list, span);
+                        bx.def_var(var(*dst), len);
+                    }
                     _ => return Err(()),
                 }
             }
@@ -1216,7 +1459,31 @@ impl Jit {
                     let ok = bx.ins().iconst(types::I32, 0);
                     bx.ins().return_(&[ok, v]);
                 }
-                Term::IterNext { .. } => return Err(()),
+                Term::IterNext {
+                    iter,
+                    dst,
+                    body,
+                    done,
+                } => {
+                    let Some(JTy::Iter(a)) = tyof(*iter) else {
+                        return Err(());
+                    };
+                    let [dv, lv, iv] = iter_vars[iter];
+                    let (i, len) = (bx.use_var(iv), bx.use_var(lv));
+                    let more = bx.ins().icmp(IntCC::SignedLessThan, i, len);
+                    let next = bx.create_block();
+                    bx.ins().brif(more, next, &[], blocks[*done as usize], &[]);
+                    bx.switch_to_block(next);
+                    let data = bx.use_var(dv);
+                    let off = bx.ins().imul_imm_s(i, crate::value::layout::SIZE as i64);
+                    let addr = bx.ins().iadd(data, off);
+                    let i1 = bx.ins().iadd_imm_s(i, 1);
+                    bx.def_var(iv, i1);
+                    let span = b.term_span;
+                    let v = elem!(bx, addr, a, span);
+                    bx.def_var(var(*dst), v);
+                    bx.ins().jump(blocks[*body as usize], &[]);
+                }
             }
         }
         // Sortie en erreur : l'index de l'erreur est rangé dans `ctx` (-1 : déjà rangé

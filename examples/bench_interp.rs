@@ -39,6 +39,10 @@ const PROGRAMS: &[(&str, &str)] = &[
         "type V\n  x: float = 0.0\n  y: float = 0.0\nend\ndef dot(a: V, b: V): float = a.x * b.x + a.y * b.y\ndef run(v: V, n: int): float\n  let t = 0.0\n  let i = 0\n  while i < n\n    t += dot(v, v)\n    i += 1\n  end\n  t\nend\nrun(V(x: 1.5, y: 2.0), 1000000)",
     ),
     (
+        "listes typées : 100 k objets créés, 10 passes",
+        "type P\n  x: int = 0\n  w: float = 1.0\nend\ndef wsum(ps: [P]): float\n  let t = 0.0\n  for p in ps\n    t += p.x * p.w\n  end\n  t\nend\nlet ps = (0...100000).map(|i| P(x: i, w: 0.5))\nlet t = 0.0\nfor k in 0...10\n  t += wsum(ps)\nend\nt",
+    ),
+    (
         "chaînes : interpolation (100 k)",
         "let n = 0\nfor i in 0...100000\n  let s = \"item #{i}\"\n  n += s.len()\nend\nn",
     ),

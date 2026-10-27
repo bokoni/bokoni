@@ -1085,7 +1085,9 @@ impl Runtime {
                     return None;
                 }
             }
-            self.jit.as_mut()?.compile(proto, &mut self.globals);
+            let jit = self.jit.as_mut()?;
+            jit.len_sym = self.syms.len;
+            jit.compile(proto, &mut self.globals);
         }
         let state = proto.jit.borrow();
         let JitState::Native(code) = &*state else {
