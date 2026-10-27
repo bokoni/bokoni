@@ -13,15 +13,15 @@ pub struct GlobalSlot {
     /// `None` : nom connu du compilateur mais pas encore défini.
     pub value: Option<Value>,
     pub mutable: bool,
+    /// Fonctions dont la compilation native dépend de la valeur de la case (appel direct
+    /// d'une fonction globale) : invalidées si elle change.
+    watchers: Vec<Weak<Proto>>,
 }
 
 #[derive(Default)]
 pub struct Globals {
     slots: Vec<GlobalSlot>,
     index: FxHashMap<Symbol, u32>,
-    /// Fonctions dont la compilation native dépend de la valeur d'une case (appel direct
-    /// d'une fonction globale) : invalidées si la case change.
-    watchers: FxHashMap<u32, Vec<Weak<Proto>>>,
 }
 
 impl Globals {
@@ -35,6 +35,7 @@ impl Globals {
             name,
             value: None,
             mutable: true,
+            watchers: Vec::new(),
         });
         self.index.insert(name, i);
         i
@@ -62,22 +63,18 @@ impl Globals {
 
     /// `proto` (compilé en natif, ou refusé) dépend de la valeur de la case `i`.
     pub fn watch(&mut self, i: u32, proto: &Rc<Proto>) {
-        self.watchers
-            .entry(i)
-            .or_default()
-            .push(Rc::downgrade(proto));
+        self.slots[i as usize].watchers.push(Rc::downgrade(proto));
     }
 
     #[inline]
     fn invalidate(&mut self, i: u32) {
-        if self.watchers.is_empty() {
+        let ws = &mut self.slots[i as usize].watchers;
+        if ws.is_empty() {
             return;
         }
-        if let Some(ws) = self.watchers.remove(&i) {
-            for w in ws {
-                if let Some(p) = w.upgrade() {
-                    *p.jit.borrow_mut() = JitState::Untried;
-                }
+        for w in std::mem::take(ws) {
+            if let Some(p) = w.upgrade() {
+                *p.jit.borrow_mut() = JitState::Untried;
             }
         }
     }

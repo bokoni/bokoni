@@ -189,6 +189,19 @@ fn untyped_code_matches_the_interpreter() {
         "def f()\n  let g = || x\n  g()\n  let x = 5\nend\nf()",
         "def any(x) = x\ndef f()\n  let n = 0\n  n = any(\"a\")\nend\nf()",
         "def inf(n) = inf(n + 1)\ninf(0)",
+        // Accès aux champs (cache) : plusieurs types au même endroit, champ à une autre
+        // position, classe (getter), record, variante, valeur modifiée entre deux lectures.
+        "type A\n  x: int = 1\nend\ntype B\n  y: int = 2\n  x: int = 3\nend\ndef gx(o) = o.x\nlet t = 0\nfor i in 0...20\n  t += gx(if i % 3 == 0 then A() else B() end)\nend\nt",
+        "class C\n  def init(@x: int)\n  end\n  def x = @x * 10\nend\ntype A\n  x: int = 1\nend\ndef gx(o) = o.x\n[gx(A()), gx(C(4)), gx(A()), gx({x: 7})]",
+        "class C\n  def init(@x: int)\n  end\nend\ndef gx(o) = o.x\ngx(C(1))",
+        "type A\n  x: int = 1\nend\ndef gx(o) = o.x\nlet a = A()\nlet r = [gx(a)]\na.x = 5\nr << gx(a)\nr",
+        "type A\n  x: int = 1\nend\ndef gx(o) = o.y\ngx(A())",
+        // Globales et variables capturées : cas d'erreur.
+        "def f() = g + 1\nf()",
+        "def f()\n  undefined_x = 1\nend\nf()",
+        "def f()\n  print = 1\nend\nf()",
+        "def f()\n  let g = || y\n  let r = g()\n  let y = 1\n  r\nend\nf()",
+        "def f()\n  let n = 0\n  let inc = || n += 1\n  for i in 0...10\n    inc()\n  end\n  n\nend\nf()",
         // Chaînes.
         "let s = \"\"\nfor i in 0...50\n  s = \"#{s}#{i % 10}\"\nend\ns.len()",
     ];
@@ -216,4 +229,39 @@ fn construction_errors_at_run_time() {
     );
     assert!(run(&format!("{ty}P(1, 2, 3)")).contains("`P` a 2 champs, reçu 3 arguments"));
     assert_eq!(run(&format!("{ty}P(y: 1, x: 2)")), "P(x: 2, y: 1)");
+}
+
+#[test]
+fn deep_untyped_recursion() {
+    // Récursion profonde par tous les chemins d'appel : directe, à travers `map`, une
+    // méthode, une closure. La pile grandit sur le tas, sans débordement.
+    let programs = [
+        "def down(n) = if n == 0 then 0 else 1 + down(n - 1) end\ndown(100000)",
+        "def down(n) = if n == 0 then 0 else [n].map(|x| down(x - 1))[0] + 1 end\ndown(30000)",
+        "class C\n  def down(n) = if n == 0 then 0 else 1 + self.down(n - 1) end\nend\nC().down(50000)",
+        "let f = nil\nf = |n| if n == 0 then 0 else 1 + f(n - 1) end\nf(100000)",
+        "type T\n  x: int = 0\nend\ndef down(n) = if n == 0 then T() else T do\n  x = down(n - 1).x + 1\nend end\ndown(20000).x",
+    ];
+    for src in programs {
+        for eager in [false, true] {
+            let mut e = Engine::new();
+            e.set_max_call_depth(10_000_000);
+            e.set_jit_eager(eager);
+            let r = e
+                .eval(src)
+                .map(|v| e.inspect(&v))
+                .unwrap_or_else(|err| err.to_string());
+            assert!(r.chars().all(|c| c.is_ascii_digit()), "{src} → {r}");
+        }
+    }
+}
+
+#[test]
+fn field_cache_sees_mutations() {
+    assert_eq!(
+        same_eager(
+            "type A\n  x: int = 1\nend\ndef gx(o) = o.x\nlet a = A()\nlet r = [gx(a)]\na.x = 5\nr << gx(a)\nr"
+        ),
+        "[1, 5]"
+    );
 }

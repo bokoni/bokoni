@@ -116,16 +116,25 @@ Temps compilation comprise.
       sont donnés
 - [x] Tests d'équivalence sur du code non typé (closures, listes, objets, erreurs), avec
       compilation dès le premier appel
-- [ ] Accès aux champs et appels de closures en natif (caches en ligne), objets sans
-      allocations multiples
+- [x] Fonctions d'aide dédiées au lieu de l'interpréteur pour les instructions
+      fréquentes : variables capturées et cellules, globales, appels ; gardes de type
+      en code natif
+- [x] Accès aux champs avec cache par emplacement (dernier type vu, position du champ)
+- [x] Construction d'un `type` directement depuis les registres de l'appel ; pile
+      examinée tous les 8 niveaux d'appel ; observateurs du JIT rangés dans les cases
+      des globales
+- Essayé et abandonné : champs d'objet dans l'objet (`SmallVec`) — pas plus rapide,
+  les petites allocations coûtent peu
+- [ ] Gain suivant : typer les champs et les closures dans l'IR (le vérificateur connaît
+      souvent `p: P` et `P.x: int`) pour que le JIT typé les compile
 
-| Programme                               | v0.4    | maintenant |
-|-----------------------------------------|--------:|-----------:|
-| listes : map / filter / sum (100 k)     | 16,9 ms | 9,0 ms     |
-| closures et compteur (300 k appels)     | 27,4 ms | 19,3 ms    |
-| objets : construction et champs (100 k) | 17,9 ms | 13,8 ms    |
-| chaînes : interpolation (100 k)         | 11,2 ms | 9,4 ms     |
-| `fib(25)` interprété (`--no-jit`)       | 28 ms   | 18 ms      |
+| Programme                               | v0.4    | maintenant | gain |
+|-----------------------------------------|--------:|-----------:|-----:|
+| listes : map / filter / sum (100 k)     | 16,9 ms | 8,6 ms     | ×2,0 |
+| closures et compteur (300 k appels)     | 27,4 ms | 14,6 ms    | ×1,9 |
+| objets : construction et champs (100 k) | 17,9 ms | 9,2 ms     | ×1,9 |
+| chaînes : interpolation (100 k)         | 11,2 ms | 8,8 ms     | ×1,3 |
+| `fib(25)` interprété (`--no-jit`)       | 28 ms   | 18 ms      | ×1,6 |
 
 ### Ensuite
 

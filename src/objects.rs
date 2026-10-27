@@ -131,21 +131,47 @@ impl Runtime {
     /// dans le même ordre, que le chemin général.
     fn construct_direct(&mut self, info: &Rc<TypeInfo>, args: CallArgs, span: Span) -> R {
         let CallArgs { pos, named, shapes } = args;
-        let mut fields: Vec<Option<Value>> = Vec::with_capacity(info.fields.len());
-        fields.resize(info.fields.len(), None);
         let args = pos
             .into_iter()
+            .map(|v| (None, v))
+            .chain(named.into_iter().map(|(n, v)| (Some(n), v)));
+        self.construct_fields(info, args, &shapes, span)
+    }
+
+    /// Construction directe depuis les registres d'un appel (`P(x: 1, y: 2)`), sans
+    /// passer par `CallArgs`.
+    pub(crate) fn construct_regs(
+        &mut self,
+        info: &Rc<TypeInfo>,
+        args: &[Value],
+        named: &[Symbol],
+        span: Span,
+    ) -> R {
+        let npos = args.len() - named.len();
+        let args = args
+            .iter()
             .enumerate()
-            .map(|(i, v)| (Some(i), None, v))
-            .chain(named.into_iter().map(|(n, v)| (None, Some(n), v)));
-        for (k, (i, name, v)) in args.enumerate() {
-            let i = match (i, name) {
-                (Some(i), _) => i,
-                (None, Some(name)) => match info.field_index(name) {
+            .map(|(k, v)| (k.checked_sub(npos).map(|j| named[j]), v.clone()));
+        self.construct_fields(info, args, &[], span)
+    }
+
+    /// Arguments positionnels (`None`) puis nommés, un par champ.
+    fn construct_fields(
+        &mut self,
+        info: &Rc<TypeInfo>,
+        args: impl Iterator<Item = (Option<Symbol>, Value)>,
+        shapes: &[Option<Rc<Shape>>],
+        span: Span,
+    ) -> R {
+        let mut fields: Vec<Option<Value>> = Vec::with_capacity(info.fields.len());
+        fields.resize(info.fields.len(), None);
+        for (k, (name, v)) in args.enumerate() {
+            let i = match name {
+                None => k,
+                Some(name) => match info.field_index(name) {
                     Some(i) if fields[i].is_none() => i,
                     _ => return self.construct_reported(info, span, name),
                 },
-                (None, None) => unreachable!(),
             };
             let v = match &info.fields[i].ty {
                 Some(ty) => {

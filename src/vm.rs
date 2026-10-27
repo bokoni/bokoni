@@ -54,8 +54,11 @@ pub enum IterState {
     Range(i64, i64),
 }
 
-const RED_ZONE: usize = 128 * 1024;
+const RED_ZONE: usize = 256 * 1024;
 const STACK_GROW: usize = 2 * 1024 * 1024;
+/// La pile n'est examinée qu'une fois tous les `STACK_CHECK` niveaux d'appel : la zone
+/// de réserve couvre largement ces appels (moins de 32 Kio chacun).
+const STACK_CHECK: usize = 8;
 
 /// État de l'interpréteur : noms, variables globales, sortie de `print`.
 pub struct Runtime {
@@ -242,14 +245,20 @@ impl Runtime {
         self.depth += 1;
         let mut regs = self.frames.pop().unwrap_or_default();
         fill_nil(&mut regs, proto.regs.len());
-        let r = stacker::maybe_grow(RED_ZONE, STACK_GROW, || {
+        let check_stack = self.depth.is_multiple_of(STACK_CHECK);
+        let body = || {
             bind(self, &mut regs)?;
             #[cfg(feature = "jit")]
             if let Some(r) = self.try_jit(proto, &regs) {
                 return r;
             }
             self.exec(proto, upvals, ctx, &mut regs)
-        });
+        };
+        let r = if check_stack {
+            stacker::maybe_grow(RED_ZONE, STACK_GROW, body)
+        } else {
+            body()
+        };
         regs.clear();
         self.frames.push(regs);
         self.depth -= 1;
@@ -574,43 +583,7 @@ impl Runtime {
                 }
                 reg!(*d) = v;
             }
-            Instr::Call { dst, f, site } => {
-                let site = &proto.calls[*site as usize];
-                // Cas courant : fonction du script, arguments positionnels exacts. La
-                // fonction et les arguments sont lus en place dans les registres.
-                if !site.block
-                    && site.named.is_empty()
-                    && let Value::Function(func) = &reg!(*f)
-                    && let Function::Script(c) = &**func
-                    && c.proto.params.len() == site.npos as usize
-                    && site.shapes.iter().all(Option::is_none)
-                {
-                    let start = site.start as usize;
-                    let v = self.invoke_regs(c, &regs[start..start + site.npos as usize], span)?;
-                    reg!(*dst) = v;
-                    return Ok(());
-                }
-                let f = reg!(*f).clone();
-                let mut args = Self::call_args(proto, regs, site);
-                let v = match (&f, site.block) {
-                    // Construction : le bloc `do` remplit les champs.
-                    (Value::Type(info), true) => {
-                        let block = args.pos.pop().unwrap();
-                        if !args.shapes.is_empty() {
-                            args.shapes.remove(site.npos as usize - 1);
-                        }
-                        let Value::Function(func) = block else {
-                            unreachable!()
-                        };
-                        let Function::Script(c) = &*func else {
-                            unreachable!()
-                        };
-                        self.construct(info, args, Some(c), span)?
-                    }
-                    _ => self.call_value(&f, args, span)?,
-                };
-                reg!(*dst) = v;
-            }
+            Instr::Call { dst, f, site } => self.call_instr(proto, regs, *dst, *f, *site, span)?,
             Instr::CallMethod {
                 dst,
                 recv,
@@ -626,6 +599,78 @@ impl Runtime {
             // qu'elle reste petite et bien optimisée.
             other => self.exec_slow(proto, upvals, ctx, regs, cells, other, span)?,
         }
+        Ok(())
+    }
+
+    /// Instruction `Call` (aussi appelée par le code natif de base).
+    #[inline]
+    pub(crate) fn call_instr(
+        &mut self,
+        proto: &Proto,
+        regs: &mut [Value],
+        dst: Reg,
+        f: Reg,
+        site: u32,
+        span: Span,
+    ) -> R<()> {
+        macro_rules! reg {
+            ($r:expr) => {
+                regs[$r as usize]
+            };
+        }
+        let site = &proto.calls[site as usize];
+        // Cas courant : fonction du script, arguments positionnels exacts. La
+        // fonction et les arguments sont lus en place dans les registres.
+        if !site.block
+            && site.named.is_empty()
+            && let Value::Function(func) = &reg!(f)
+            && let Function::Script(c) = &**func
+            && c.proto.params.len() == site.npos as usize
+            && site.shapes.iter().all(Option::is_none)
+        {
+            let start = site.start as usize;
+            let v = self.invoke_regs(c, &regs[start..start + site.npos as usize], span)?;
+            reg!(dst) = v;
+            return Ok(());
+        }
+        // Construction d'un `type` dont chaque champ est donné : directe.
+        if !site.block
+            && site.shapes.iter().all(Option::is_none)
+            && let Value::Type(info) = &reg!(f)
+            && info.kind != crate::ast::TypeDeclKind::Class
+            && info.fields.len() == site.npos as usize + site.named.len()
+        {
+            let start = site.start as usize;
+            let info = info.clone();
+            let v = self.construct_regs(
+                &info,
+                &regs[start..start + info.fields.len()],
+                &site.named,
+                span,
+            )?;
+            reg!(dst) = v;
+            return Ok(());
+        }
+        let f = reg!(f).clone();
+        let mut args = Self::call_args(proto, regs, site);
+        let v = match (&f, site.block) {
+            // Construction : le bloc `do` remplit les champs.
+            (Value::Type(info), true) => {
+                let block = args.pos.pop().unwrap();
+                if !args.shapes.is_empty() {
+                    args.shapes.remove(site.npos as usize - 1);
+                }
+                let Value::Function(func) = block else {
+                    unreachable!()
+                };
+                let Function::Script(c) = &*func else {
+                    unreachable!()
+                };
+                self.construct(info, args, Some(c), span)?
+            }
+            _ => self.call_value(&f, args, span)?,
+        };
+        reg!(dst) = v;
         Ok(())
     }
 

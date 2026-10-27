@@ -99,6 +99,12 @@ pub struct Jit {
     frem_fn: FuncId,
     /// Fonctions d'aide du code de base (`bk_step`, `bk_iter_next`, `bk_drop`).
     dyn_fns: Option<(FuncId, FuncId, FuncId)>,
+    /// Fonctions d'aide rapides (`FAST`), dans l'ordre de `Fast`.
+    fast_fns: Vec<FuncId>,
+    /// Caches des accès aux champs du code de base : en `Box`, car le code natif garde
+    /// leur adresse.
+    #[allow(clippy::vec_box)]
+    field_caches: Vec<Box<FieldCache>>,
     next: u32,
 }
 
@@ -402,6 +408,9 @@ impl Jit {
         builder.symbol("bk_step", bk_step as *const u8);
         builder.symbol("bk_iter_next", bk_iter_next as *const u8);
         builder.symbol("bk_drop", bk_drop as *const u8);
+        for (name, f) in FAST {
+            builder.symbol(*name, *f as *const u8);
+        }
         let mut module = JITModule::new(builder);
         let ptr = module.target_config().pointer_type();
         let mut sig = module.make_signature();
@@ -431,6 +440,8 @@ impl Jit {
             trace_fn,
             frem_fn,
             dyn_fns: None,
+            fast_fns: Vec::new(),
+            field_caches: Vec::new(),
             next: 0,
         })
     }
@@ -1192,6 +1203,215 @@ extern "C" fn bk_drop(slot: *mut Value) {
     }
 }
 
+/// Cache d'un accès à un champ (`p.x`) : dernier type vu et position du champ. Le
+/// `Rc` garde le type en vie, donc son adresse ne peut pas désigner un autre type.
+struct FieldCache {
+    info: Option<Rc<crate::objects::TypeInfo>>,
+    idx: usize,
+    name: crate::intern::Symbol,
+}
+
+/// Fonctions d'aide rapides : `fn(rt, fenêtre, x, y, p) -> statut`. Statut 0 : fait ;
+/// autre : cas non traité, l'interpréteur exécute l'instruction (et produit l'erreur
+/// éventuelle). Pour `Call`, 1 signale une erreur (rangée dans le `Runtime`).
+#[derive(Clone, Copy)]
+enum Fast {
+    GetUp,
+    SetUp,
+    GetCell,
+    SetCell,
+    GetGlobal,
+    SetGlobal,
+    Field,
+    Call,
+}
+
+type FastFn = extern "C" fn(*mut Runtime, *mut NativeFrame, u32, u32, *const u8) -> i32;
+
+const FAST: &[(&str, FastFn)] = &[
+    ("bk_get_up", bk_get_up),
+    ("bk_set_up", bk_set_up),
+    ("bk_get_cell", bk_get_cell),
+    ("bk_set_cell", bk_set_cell),
+    ("bk_get_global", bk_get_global),
+    ("bk_set_global", bk_set_global),
+    ("bk_field", bk_field),
+    ("bk_call", bk_call),
+];
+
+/// Registres de la fenêtre.
+///
+/// # Safety
+/// `f` vient de `Runtime::run_native`, valide pendant l'appel.
+unsafe fn frame_regs<'a>(f: *mut NativeFrame) -> &'a mut [Value] {
+    unsafe { std::slice::from_raw_parts_mut((*f).regs, (*f).nregs) }
+}
+
+/// Lecture d'une variable capturée ou d'une cellule : non traitée si elle n'est pas
+/// encore initialisée (l'interpréteur signale l'erreur).
+fn load_cell(regs: &mut [Value], d: u32, c: &crate::vm::Cell) -> i32 {
+    let v = c.borrow().clone();
+    if let Value::Uninit = v {
+        return 2;
+    }
+    regs[d as usize] = v;
+    0
+}
+
+extern "C" fn bk_get_up(_: *mut Runtime, f: *mut NativeFrame, d: u32, u: u32, _: *const u8) -> i32 {
+    // SAFETY : fenêtre valide pendant l'appel (cf. `frame_regs`).
+    unsafe {
+        let up = &*(*f).upvals.add(u as usize);
+        load_cell(frame_regs(f), d, up)
+    }
+}
+
+extern "C" fn bk_set_up(_: *mut Runtime, f: *mut NativeFrame, u: u32, a: u32, _: *const u8) -> i32 {
+    // SAFETY : idem.
+    unsafe {
+        let up = &*(*f).upvals.add(u as usize);
+        *up.borrow_mut() = frame_regs(f)[a as usize].clone();
+    }
+    0
+}
+
+extern "C" fn bk_get_cell(
+    _: *mut Runtime,
+    f: *mut NativeFrame,
+    d: u32,
+    c: u32,
+    _: *const u8,
+) -> i32 {
+    // SAFETY : idem.
+    unsafe {
+        let cell = &*(*f).cells.add(c as usize);
+        load_cell(frame_regs(f), d, cell)
+    }
+}
+
+extern "C" fn bk_set_cell(
+    _: *mut Runtime,
+    f: *mut NativeFrame,
+    c: u32,
+    a: u32,
+    _: *const u8,
+) -> i32 {
+    // SAFETY : idem.
+    unsafe {
+        let cell = &*(*f).cells.add(c as usize);
+        *cell.borrow_mut() = frame_regs(f)[a as usize].clone();
+    }
+    0
+}
+
+extern "C" fn bk_get_global(
+    rt: *mut Runtime,
+    f: *mut NativeFrame,
+    d: u32,
+    g: u32,
+    _: *const u8,
+) -> i32 {
+    // SAFETY : `rt` et la fenêtre sont valides pendant l'appel.
+    unsafe {
+        match &(*rt).globals.at(g).value {
+            Some(v) => {
+                frame_regs(f)[d as usize] = v.clone();
+                0
+            }
+            None => 2,
+        }
+    }
+}
+
+extern "C" fn bk_set_global(
+    rt: *mut Runtime,
+    f: *mut NativeFrame,
+    g: u32,
+    a: u32,
+    _: *const u8,
+) -> i32 {
+    // SAFETY : idem.
+    unsafe {
+        let rt = &mut *rt;
+        let slot = rt.globals.at(g);
+        if slot.value.is_none() || !slot.mutable {
+            return 2;
+        }
+        let v = frame_regs(f)[a as usize].clone();
+        rt.globals.assign(g, v);
+    }
+    0
+}
+
+extern "C" fn bk_field(_: *mut Runtime, f: *mut NativeFrame, d: u32, a: u32, p: *const u8) -> i32 {
+    // SAFETY : fenêtre valide ; `p` est un `FieldCache` gardé par le `Jit`.
+    unsafe {
+        let cache = &mut *(p as *mut FieldCache);
+        let regs = frame_regs(f);
+        let Value::Object(o) = &regs[a as usize] else {
+            return 2;
+        };
+        let Ok(obj) = o.try_borrow() else {
+            return 2;
+        };
+        let idx = match &cache.info {
+            Some(info) if Rc::ptr_eq(info, &obj.info) => cache.idx,
+            _ => {
+                // `class` : champs privés, accès par un getter (cas général).
+                if obj.info.kind == crate::ast::TypeDeclKind::Class {
+                    return 2;
+                }
+                let Some(i) = obj.info.field_index(cache.name) else {
+                    return 2;
+                };
+                cache.info = Some(obj.info.clone());
+                cache.idx = i;
+                i
+            }
+        };
+        let v = obj.fields[idx].clone();
+        drop(obj);
+        regs[d as usize] = v;
+    }
+    0
+}
+
+extern "C" fn bk_call(
+    rt: *mut Runtime,
+    f: *mut NativeFrame,
+    lo: u32,
+    hi: u32,
+    ins: *const u8,
+) -> i32 {
+    // SAFETY : comme pour `bk_step`.
+    unsafe {
+        let rt = &mut *rt;
+        let Instr::Call {
+            dst,
+            f: callee,
+            site,
+        } = &*(ins as *const Instr)
+        else {
+            unreachable!()
+        };
+        let proto = &*(*f).proto;
+        match rt.call_instr(
+            proto,
+            frame_regs(f),
+            *dst,
+            *callee,
+            *site,
+            Span::new(lo, hi),
+        ) {
+            Ok(()) => 0,
+            Err(e) => {
+                rt.set_pending(e);
+                1
+            }
+        }
+    }
+}
+
 struct Dyn<'a> {
     regs_ty: &'a [RegTy],
     regs: CValue,
@@ -1199,6 +1419,7 @@ struct Dyn<'a> {
     frame: CValue,
     step: FuncRef,
     drop: FuncRef,
+    fast: Vec<FuncRef>,
     fail: CBlock,
 }
 
@@ -1270,6 +1491,36 @@ impl Dyn<'_> {
         bx.switch_to_block(cont);
     }
 
+    /// Fonction d'aide rapide ; si elle ne traite pas le cas (statut non nul),
+    /// l'instruction passe par l'interpréteur.
+    #[allow(clippy::too_many_arguments)]
+    fn fast(
+        &self,
+        bx: &mut FunctionBuilder,
+        which: Fast,
+        x: u32,
+        y: u32,
+        p: *const u8,
+        ins: &Instr,
+        span: Span,
+    ) {
+        let ptr = bx.func.dfg.value_type(self.regs);
+        let x = bx.ins().iconst(types::I32, x as i64);
+        let y = bx.ins().iconst(types::I32, y as i64);
+        let p = bx.ins().iconst(ptr, p as i64);
+        let call = bx
+            .ins()
+            .call(self.fast[which as usize], &[self.rt, self.frame, x, y, p]);
+        let status = bx.inst_results(call)[0];
+        let slow = bx.create_block();
+        let next = bx.create_block();
+        bx.ins().brif(status, slow, &[], next, &[]);
+        bx.switch_to_block(slow);
+        self.step(bx, ins, span);
+        bx.ins().jump(next, &[]);
+        bx.switch_to_block(next);
+    }
+
     /// Vérité d'un registre (`nil` et `false` sont faux), en `i8` (1 : vrai).
     fn truthy(&self, bx: &mut FunctionBuilder, r: Reg) -> CValue {
         match self.regs_ty[r as usize] {
@@ -1312,6 +1563,11 @@ impl Jit {
         let step = self.module.declare_func_in_func(helpers.0, &mut ctx.func);
         let iter = self.module.declare_func_in_func(helpers.1, &mut ctx.func);
         let drop = self.module.declare_func_in_func(helpers.2, &mut ctx.func);
+        let fast: Vec<FuncRef> = self
+            .fast_fns
+            .iter()
+            .map(|&id| self.module.declare_func_in_func(id, &mut ctx.func))
+            .collect();
         let tc = self.module.target_config();
         let mut fctx = FunctionBuilderContext::new();
         let mut bx = FunctionBuilder::new(&mut ctx.func, &mut fctx);
@@ -1338,12 +1594,13 @@ impl Jit {
             frame,
             step,
             drop,
+            fast,
             fail,
         };
         for (bi, b) in p.blocks.iter().enumerate() {
             bx.switch_to_block(blocks[bi]);
             for (ins, &span) in b.instrs.iter().zip(&b.spans) {
-                dyn_instr(&d, &mut bx, ins, span);
+                dyn_instr(&d, &mut bx, ins, span, &mut self.field_caches);
             }
             match &b.term {
                 Term::Jump(t) => {
@@ -1460,16 +1717,97 @@ impl Jit {
             .module
             .declare_function("bk_drop", Linkage::Import, &sig)
             .ok()?;
+        let mut sig = self.module.make_signature();
+        for t in [ptr, ptr, types::I32, types::I32, ptr] {
+            sig.params.push(AbiParam::new(t));
+        }
+        sig.returns.push(AbiParam::new(types::I32));
+        for (name, _) in FAST {
+            let id = self
+                .module
+                .declare_function(name, Linkage::Import, &sig)
+                .ok()?;
+            self.fast_fns.push(id);
+        }
         self.dyn_fns = Some((step, iter, drop));
         self.dyn_fns
     }
 }
 
 /// Traduit une instruction : en ligne pour les cas simples, sinon `bk_step`.
-fn dyn_instr(d: &Dyn, bx: &mut FunctionBuilder, ins: &Instr, span: Span) {
+#[allow(clippy::vec_box)]
+fn dyn_instr(
+    d: &Dyn,
+    bx: &mut FunctionBuilder,
+    ins: &Instr,
+    span: Span,
+    caches: &mut Vec<Box<FieldCache>>,
+) {
     use Instr::*;
     let ty = |r: Reg| d.regs_ty[r as usize];
+    let null = std::ptr::null::<u8>();
     match ins {
+        GetUp(r, u) => d.fast(bx, Fast::GetUp, *r, *u, null, ins, span),
+        SetUp(u, a) => d.fast(bx, Fast::SetUp, *u, *a, null, ins, span),
+        GetCell(r, c) => d.fast(bx, Fast::GetCell, *r, *c, null, ins, span),
+        SetCell(c, a) => d.fast(bx, Fast::SetCell, *c, *a, null, ins, span),
+        GetGlobal(r, g) => d.fast(bx, Fast::GetGlobal, *r, *g, null, ins, span),
+        SetGlobal(g, a) => d.fast(bx, Fast::SetGlobal, *g, *a, null, ins, span),
+        Field(r, a, name) => {
+            caches.push(Box::new(FieldCache {
+                info: None,
+                idx: 0,
+                name: *name,
+            }));
+            let p = &**caches.last().unwrap() as *const FieldCache as *const u8;
+            d.fast(bx, Fast::Field, *r, *a, p, ins, span);
+        }
+        Call { .. } => {
+            let ptr = bx.func.dfg.value_type(d.regs);
+            let ip = bx.ins().iconst(ptr, ins as *const Instr as i64);
+            let lo = bx.ins().iconst(types::I32, span.start as i64);
+            let hi = bx.ins().iconst(types::I32, span.end as i64);
+            let call = bx
+                .ins()
+                .call(d.fast[Fast::Call as usize], &[d.rt, d.frame, lo, hi, ip]);
+            let status = bx.inst_results(call)[0];
+            let cont = bx.create_block();
+            bx.ins().brif(status, d.fail, &[], cont, &[]);
+            bx.switch_to_block(cont);
+        }
+        // Garde : l'étiquette attendue, ou un `int` vers `float` ; sinon l'interpréteur
+        // produit l'erreur.
+        Guard(r, a, t) if *t != RegTy::Value && ty(*r) == *t => {
+            let (tag, cty) = scalar(*t);
+            let at = d.tag(bx, *a);
+            let ok = bx.ins().icmp_imm_s(IntCC::Equal, at, tag as i64);
+            let fast = bx.create_block();
+            let other = bx.create_block();
+            let slow = bx.create_block();
+            let next = bx.create_block();
+            bx.ins().brif(ok, fast, &[], other, &[]);
+            bx.switch_to_block(fast);
+            let v = d.payload(bx, *a, cty);
+            d.write_const(bx, *r, tag, Some(v));
+            bx.ins().jump(next, &[]);
+            bx.switch_to_block(other);
+            if *t == RegTy::Float {
+                let conv = bx.create_block();
+                let is_int = bx.ins().icmp_imm_s(IntCC::Equal, at, TAG_INT as i64);
+                bx.ins().brif(is_int, conv, &[], slow, &[]);
+                bx.switch_to_block(conv);
+                let x = d.payload(bx, *a, types::I64);
+                let v = bx.ins().fcvt_from_sint(types::F64, x);
+                d.write_const(bx, *r, TAG_FLOAT, Some(v));
+                bx.ins().jump(next, &[]);
+            } else {
+                bx.ins().jump(slow, &[]);
+            }
+            bx.switch_to_block(slow);
+            d.step(bx, ins, span);
+            bx.ins().jump(next, &[]);
+            bx.switch_to_block(next);
+        }
         Int(r, n) => {
             let v = bx.ins().iconst(types::I64, *n);
             d.write_const(bx, *r, TAG_INT, Some(v));
