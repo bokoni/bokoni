@@ -191,10 +191,25 @@ Modeled on Crystal (see `syntax.md`, *Error handling*).
       (typed or baseline) reach them as before
 - [x] Static checks: type of the `rescue` variable, `raise` of a value that is neither a
       string nor an object
-- [ ] Inheritance, so that custom errors can be rescued as an `Error`
+- [x] Custom errors inherit from `Error` (see v0.8)
 - [x] `?` variants that return `nil` instead of raising: `to_i?`, `to_f?`, `xs[i]?`
       (the other built-in methods already return `nil`); names of functions and
       methods may end with `?`
+
+### v0.8 — Single inheritance
+
+- [x] `class B < A` (classes only): fields of the parent first in the objects, so its
+      methods keep reading them by index; methods inherited, `init` included, and
+      redefinable
+- [x] `super(args)` in any method (and its `do` blocks): the parent's version
+- [x] Subtypes: checked statically (`[Animal]` accepts a `Dog`) and at run time
+      (annotations, `rescue e: Error`)
+- [x] `Error` is a class of the prelude: custom errors inherit from it
+- [x] Parent from a previous script; `TypeDesc::parent` in the Rust API
+- [x] A type or enum declared twice in a block is an error (the checker used to panic,
+      found by the fuzzer)
+- [ ] Abstract classes and methods
+- [ ] Interfaces / traits (default methods? nominal or structural?)
 
 ### Next
 
@@ -203,8 +218,7 @@ In suggested order:
 1. **Modules / imports** between files.
 2. **Generics** (`[T]` in signatures): typed `map` / `filter` and user functions over
    lists; lets the typed JIT compile more code.
-3. **Inheritance or interfaces** for `class` (single inheritance + mixins, or structural
-   interfaces); custom errors would then be rescued as an `Error`.
+3. **Traits / interfaces** and abstract methods, on top of single inheritance.
 4. **Crystal-style macros** (v3 of `syntax.md`): hygiene and AST exposure still open;
    benefit from generics and modules.
 

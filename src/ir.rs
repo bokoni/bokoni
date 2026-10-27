@@ -255,6 +255,10 @@ pub enum Decl {
 pub struct TypeDeclIr {
     pub name: Symbol,
     pub kind: TypeDeclKind,
+    /// `class B < A`: global slot of `A`, and its number of fields when `B` was compiled
+    /// (they come first in `B`'s objects, its methods refer to them by index).
+    pub parent: Option<(u32, u32)>,
+    /// Own fields (after the parent's).
     pub fields: Vec<FieldIr>,
     pub methods: Vec<(Symbol, Rc<Proto>)>,
     pub annotations: Annotations,
@@ -414,6 +418,14 @@ pub enum Instr {
     Call {
         dst: Reg,
         f: Reg,
+        site: u32,
+    },
+    /// `super(args)`: method `name` of the class in global `parent`, on `this`.
+    CallSuper {
+        dst: Reg,
+        this: Reg,
+        parent: u32,
+        name: Symbol,
         site: u32,
     },
     CallMethod {
@@ -657,6 +669,17 @@ impl Proto {
             }
             Closure(d, p) => format!("r{d} = closure {}", self.children[*p as usize].name),
             Call { dst, f, site } => format!("r{dst} = call r{f}({})", self.show_args(*site, i)),
+            CallSuper {
+                dst,
+                this,
+                parent,
+                name,
+                site,
+            } => format!(
+                "r{dst} = super global[{parent}].{}(r{this}; {})",
+                s(name),
+                self.show_args(*site, i)
+            ),
             CallMethod {
                 dst,
                 recv,

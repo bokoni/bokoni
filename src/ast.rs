@@ -356,6 +356,8 @@ pub struct TypeDecl {
     pub kind: TypeDeclKind,
     pub name: Symbol,
     pub name_span: Span,
+    /// `class B < A`: the parent class.
+    pub parent: Option<(Symbol, Span)>,
     pub members: Vec<Member>,
     pub annotations: Vec<AnnotationUse>,
     pub span: Span,
@@ -577,6 +579,8 @@ pub enum ExprKind {
     Begin(ControlId),
     /// `raise value`
     Raise(ExprId),
+    /// `super(args)`: the parent class's version of the current method.
+    Super(Slice<Arg>),
     Return(Option<ExprId>),
     Break,
     Next,

@@ -282,22 +282,24 @@ End-of-line modifiers: `expr if cond`, `expr unless cond`.
 > Modeled on [Crystal](https://crystal-lang.org/reference/1.22/syntax_and_semantics/exception_handling.html): exceptions, `raise`, `begin` / `rescue` / `else` / `ensure`.
 
 ```ruby
-type ConfigError
-  message: str
-  path: str
+class ConfigError < Error
+  def init(@path: str)
+    super("missing #{path}")
+  end
+  def path = @path
 end
 
 def load(path: str): str
-  raise ConfigError(message: "missing #{path}", path: path) unless exists(path)
+  raise ConfigError(path) unless exists(path)
   read(path)
 end
 
 let text = begin
   load("app.yml")
-rescue e: ConfigError          # by type (`A | B` for several)
+rescue e: ConfigError          # by class (`A | B` for several)
   print("config: #{e.message} (#{e.path})")
   ""
-rescue e: Error                # runtime errors: division by zero, index…
+rescue e: Error                # any other error: division by zero, index…
   print(e.message)
   ""
 else                           # no error in the body
@@ -308,16 +310,17 @@ ensure                         # always: after the body, a `rescue`, a `return`�
 end
 ```
 
-- `raise "message"` raises an `Error` (a `type` of the prelude, with a `message: str`
-  field); `raise obj` raises an object of any `type` / `class` as is. Any other value is
-  a type error.
+- `raise "message"` raises an `Error`, a class of the prelude (`Error("message")`,
+  `e.message`); `raise obj` raises an object of any `type` / `class` as is. Any other
+  value is a type error. Custom errors inherit from `Error`: `rescue e: Error` then
+  catches them too.
 - Runtime errors (`1 / 0`, an index out of bounds, a type error at run time, too many
   nested calls…) can be rescued as an `Error`. Syntax errors and errors reported by the
   static checks cannot: the script does not run.
 - `rescue`, `rescue e`, `rescue e: T`, `rescue T`: clauses are tried in order; a name
   that starts with an uppercase letter is a type. With no clause matching, the error
-  goes on up unchanged (position and call stack included). There is no inheritance yet:
-  a custom error type is not an `Error`, rescue it by its type or with a bare `rescue`.
+  goes on up unchanged (position and call stack included). A clause for a class also
+  catches its subclasses: put the most specific first.
 - The value of a `begin` is the value of its body (or of the `else`), or that of the
   `rescue` clause that ran; the value of `ensure` is ignored.
 - `ensure` also runs when `return`, `break` or `next` leaves the `begin`, and when the
@@ -500,6 +503,41 @@ print(u.name)
 - `self` denotes the instance. `to_s` is used by `print` and interpolation.
 - Two instances are equal only if they are the same object.
 - No destructor.
+
+### Inheritance
+
+Single inheritance, for classes only (a `type` describes data and does not inherit):
+
+```ruby
+class Animal
+  def init(@name: str)
+  end
+  def speak(): str = "..."
+  def describe(): str = "#{@name} says #{self.speak()}"
+end
+
+class Dog < Animal
+  def speak(): str = "woof"                 # redefined
+end
+
+class Puppy < Dog
+  def init(@name: str, @age: int)          # `@name`: the field of `Animal`
+  end
+  def speak(): str = super() + " (#{@age})" # `Dog`'s version
+end
+
+let pets: [Animal] = [Dog("rex"), Puppy("bit", 1)]
+pets.map(|p| p.describe())                 # ["rex says woof", "bit says woof (1)"]
+```
+
+- The subclass has the parent's fields (first) and methods, `init` included; it can
+  redefine a method, and add fields (not redeclare one of the parent's).
+- `super(args)` calls the parent's version of the current method, in any method
+  (`init` included), and also inside a `do` block of the method.
+- A subclass instance is accepted wherever the parent is expected (`a: Animal`,
+  `[Animal]`, `rescue e: Animal`); the reverse is a type error.
+- The parent must be declared before, in the same script or a previous one. No multiple
+  inheritance; interfaces / traits may come later.
 
 ## Comments
 
@@ -700,7 +738,7 @@ Point(x: 1).to_s()            # "Point(x=1, y=0)"
 ## Reserved words
 
 `let def end if elsif else unless then case when while for in do break next return
-begin rescue ensure raise type class enum annotation macro true false nil and or not`
+begin rescue ensure raise super type class enum annotation macro true false nil and or not`
 
 ## Open questions
 

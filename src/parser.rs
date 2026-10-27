@@ -337,6 +337,7 @@ fn is_keyword(kind: TokenKind) -> bool {
             | T::Rescue
             | T::Ensure
             | T::Raise
+            | T::Super
             | T::Type
             | T::Class
             | T::Enum
@@ -971,6 +972,17 @@ impl Parser<'_, '_> {
             _ => (TypeDeclKind::Annotation, "annotation"),
         };
         let (name, name_span) = self.ident(&format!("after `{opener}`"))?;
+        let parent = if self.at(T::Lt) {
+            if kind != TypeDeclKind::Class {
+                return self.error_here(format!(
+                    "only a `class` can inherit (a `{opener}` cannot)"
+                ));
+            }
+            self.bump();
+            Some(self.ident("after `<`")?)
+        } else {
+            None
+        };
         let mut members: Vec<Member> = Vec::new();
         loop {
             self.skip_newlines();
@@ -986,6 +998,7 @@ impl Parser<'_, '_> {
             kind,
             name,
             name_span,
+            parent,
             members,
             annotations,
             span: self.span_from(kw.span),
@@ -1625,6 +1638,16 @@ impl Parser<'_, '_> {
             T::Raise => {
                 self.bump();
                 ExprKind::Raise(self.expr()?)
+            }
+            T::Super => {
+                self.bump();
+                if !self.at(T::LParen) {
+                    return self.error_here(format!(
+                        "expected `(` after `super`, found {}",
+                        self.found()
+                    ));
+                }
+                ExprKind::Super(self.args()?)
             }
             T::Return => {
                 self.bump();

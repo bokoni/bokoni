@@ -113,8 +113,11 @@ pub enum DeclKind {
 pub struct TypeDesc {
     pub name: String,
     pub kind: DeclKind,
+    /// Parent class (`class B < A`).
+    pub parent: Option<String>,
+    /// Fields, the parent's first.
     pub fields: Vec<FieldDesc>,
-    /// Methods, in declaration order.
+    /// Methods, in declaration order (inherited ones included).
     pub methods: Vec<FnDesc>,
     annotations: Vec<Annotation>,
 }
@@ -289,6 +292,7 @@ impl Runtime {
                 crate::ast::TypeDeclKind::Class => DeclKind::Class,
                 crate::ast::TypeDeclKind::Annotation => DeclKind::Annotation,
             },
+            parent: info.parent.as_ref().map(|p| p.name.to_string()),
             fields,
             methods: self.methods_desc(&info.methods)?,
             annotations: self.eval_annotations(&info.annotations)?,

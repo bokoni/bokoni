@@ -25,12 +25,16 @@ use std::rc::Rc;
 pub struct TypeInfo {
     pub name: Rc<str>,
     pub kind: TypeDeclKind,
+    /// Parent class (`class B < A`); its fields come first in `fields`, and its methods
+    /// are in `methods` unless redefined.
+    pub parent: Option<Rc<TypeInfo>>,
     pub fields: Vec<FieldInfo>,
     pub methods: FxHashMap<Symbol, Rc<Proto>>,
     pub script: Rc<Script>,
     pub annotations: crate::ir::Annotations,
 }
 
+#[derive(Clone)]
 pub struct FieldInfo {
     pub name: Symbol,
     pub ty: Option<TypeRef>,
@@ -42,6 +46,20 @@ pub struct FieldInfo {
 impl TypeInfo {
     pub fn field_index(&self, name: Symbol) -> Option<usize> {
         self.fields.iter().position(|f| f.name == name)
+    }
+
+    /// Is it `other`, or a class that inherits from it?
+    pub fn is_a(self: &Rc<Self>, other: &Rc<TypeInfo>) -> bool {
+        let mut t = self;
+        loop {
+            if Rc::ptr_eq(t, other) {
+                return true;
+            }
+            match &t.parent {
+                Some(p) => t = p,
+                None => return false,
+            }
+        }
     }
 }
 

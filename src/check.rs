@@ -42,6 +42,8 @@ pub fn check(
         types: Vec::new(),
         enums: Vec::new(),
         fns: vec![FnCtx::default()],
+        method: None,
+        decl_ids: FxHashMap::default(),
         quiet: 0,
         imported: FxHashMap::default(),
         prims: Prims::default(),
@@ -206,6 +208,8 @@ struct ParamSig {
 struct TypeDef {
     name: Symbol,
     kind: TypeDeclKind,
+    /// Parent class (its fields and methods are included in `fields` / `methods`).
+    parent: Option<TypeId>,
     fields: Vec<FieldDef>,
     methods: FxHashMap<Symbol, Rc<FnSig>>,
     deprecated: Option<Dep>,
@@ -214,6 +218,7 @@ struct TypeDef {
 /// `@[Deprecated(message?)]`: the message, if written as a literal.
 type Dep = Option<Rc<str>>;
 
+#[derive(Clone)]
 struct FieldDef {
     name: Symbol,
     ty: Ty,
@@ -280,6 +285,10 @@ struct Checker<'a> {
     types: Vec<TypeDef>,
     enums: Vec<EnumDef>,
     fns: Vec<FnCtx>,
+    /// Method being checked (class, name): target of `super`.
+    method: Option<(TypeId, Symbol)>,
+    /// Type of each hoisted declaration (key: address of the `TypeDecl`).
+    decl_ids: FxHashMap<usize, TypeId>,
     /// > 0: errors are not reported (importing declarations already executed).
     quiet: u32,
     /// Types and enums already defined at runtime, imported (key: address of the `Rc`).
@@ -628,11 +637,13 @@ impl Checker<'_> {
         self.types.push(TypeDef {
             name,
             kind: info.kind,
+            parent: None,
             fields: Vec::new(),
             methods: FxHashMap::default(),
             deprecated,
         });
         self.imported.insert(key, Ty::TypeValue(id));
+        self.types[id].parent = info.parent.as_ref().map(|p| self.import_type(p));
         self.quiet += 1;
         let fields = info
             .fields
@@ -797,7 +808,21 @@ impl Checker<'_> {
                         .all(|(n, t)| a.iter().any(|(m, u)| m == n && self.assignable(u, t)))
             }
             (Fn(_) | TypeValue(_), Fn(_)) => true,
+            (Object(a), Object(b)) => self.descends(*a, *b),
             _ => from == to,
+        }
+    }
+
+    /// Is `a` the class `b` or one of its descendants?
+    fn descends(&self, mut a: TypeId, b: TypeId) -> bool {
+        loop {
+            if a == b {
+                return true;
+            }
+            match self.types.get(a).and_then(|t| t.parent) {
+                Some(p) => a = p,
+                None => return false,
+            }
         }
     }
 
@@ -839,14 +864,29 @@ impl Checker<'_> {
     fn hoist(&mut self, b: &Block) {
         // 1. Names of types and enums (they may refer to each other).
         let mut pending_types = Vec::new();
+        let mut seen: FxHashMap<Symbol, ()> = FxHashMap::default();
         for s in &b.stmts {
+            let name = match &s.kind {
+                StmtKind::Type(t) => Some((t.name, t.name_span)),
+                StmtKind::Enum(e) => Some((e.name, e.name_span)),
+                _ => None,
+            };
+            if let Some((n, span)) = name
+                && seen.insert(n, ()).is_some()
+            {
+                let msg = format!("`{}` is declared twice in this block", self.name(n));
+                self.error(msg, span);
+                continue;
+            }
             match &s.kind {
                 StmtKind::Type(t) => {
+                    self.decl_ids.insert(&**t as *const TypeDecl as usize, self.types.len());
                     let id = self.types.len();
                     let deprecated = self.ast_deprecation(&t.annotations);
                     self.types.push(TypeDef {
                         name: t.name,
                         kind: t.kind,
+                        parent: None,
                         fields: Vec::new(),
                         methods: FxHashMap::default(),
                         deprecated,
@@ -875,13 +915,50 @@ impl Checker<'_> {
                 _ => {}
             }
         }
-        // 2. Fields and method signatures.
-        for (id, t) in pending_types {
-            let mut fields = Vec::new();
-            let mut methods = FxHashMap::default();
+        // 2. Fields and method signatures (a parent class's first: it must be declared
+        // before).
+        let ids: Vec<TypeId> = pending_types.iter().map(|(id, _)| *id).collect();
+        for (k, (id, t)) in pending_types.into_iter().enumerate() {
+            let parent = t.parent.and_then(|(p, span)| {
+                let found = match self.lookup(p) {
+                    Some((v, _)) => Some(v.ty.clone()),
+                    None => self.global_ty(p).map(|(t, _)| t),
+                };
+                match found {
+                    Some(Ty::TypeValue(pid))
+                        if self.types[pid].kind == TypeDeclKind::Class
+                            && !ids[k..].contains(&pid) =>
+                    {
+                        Some(pid)
+                    }
+                    _ => {
+                        let msg = format!(
+                            "`{}` is not a class declared before `{}`",
+                            self.name(p),
+                            self.name(t.name)
+                        );
+                        self.error(msg, span);
+                        None
+                    }
+                }
+            });
+            let (mut fields, mut methods) = match parent {
+                Some(pid) => (self.types[pid].fields.clone(), self.types[pid].methods.clone()),
+                None => (Vec::new(), FxHashMap::default()),
+            };
+            self.types[id].parent = parent;
             for m in &t.members {
                 match m {
                     Member::Field(f) => {
+                        if parent.is_some() && fields.iter().any(|x: &FieldDef| x.name == f.name) {
+                            let msg = format!(
+                                "field `{}` is already declared by `{}`",
+                                self.name(f.name),
+                                self.name(t.parent.unwrap().0)
+                            );
+                            self.error(msg, f.span);
+                            continue;
+                        }
                         let ty = f.ty.as_ref().map_or(Ty::Any, |t| self.resolve(t));
                         // Type inferred from the literal default value (`port = 80`).
                         let ty = match (&f.ty, f.default) {
@@ -1203,7 +1280,8 @@ impl Checker<'_> {
     }
 
     fn type_decl(&mut self, t: &TypeDecl) {
-        let Some(Ty::TypeValue(id)) = self.lookup(t.name).map(|(v, _)| v.ty.clone()) else {
+        // Not hoisted (declared twice): already reported.
+        let Some(&id) = self.decl_ids.get(&(t as *const TypeDecl as usize)) else {
             return;
         };
         // Default values: they can see the other fields.
@@ -1233,7 +1311,9 @@ impl Checker<'_> {
             match m {
                 Member::Method(f) => {
                     let sig = self.types[id].methods.get(&f.name).cloned().unwrap();
+                    let saved = self.method.replace((id, f.name));
                     self.function(f, &sig, Some(Ty::Object(id)));
+                    self.method = saved;
                 }
                 Member::Stmt(s) => self.error(
                     "only fields and methods are allowed in a `type` / `class` \
@@ -1262,7 +1342,10 @@ impl Checker<'_> {
             self.annotations(&v.annotations);
         }
         for m in &e.methods {
-            let sig = self.enums[id].methods.get(&m.name).cloned().unwrap();
+            // `None`: enum declared twice (reported), the name refers to the first one.
+            let Some(sig) = self.enums[id].methods.get(&m.name).cloned() else {
+                continue;
+            };
             self.function(m, &sig, Some(Ty::Variant(id)));
         }
         self.annotations(&e.annotations);
@@ -1614,6 +1697,35 @@ impl Checker<'_> {
                     self.block(b);
                 }
                 union(types)
+            }
+            ExprKind::Super(args) => {
+                let target = self.method.and_then(|(id, m)| Some((self.types[id].parent?, m)));
+                let Some((parent, m)) = target else {
+                    self.error(
+                        "`super` can only be used in a method of a class that inherits",
+                        span,
+                    );
+                    for a in ast.get(args) {
+                        self.expr(a.value, None);
+                    }
+                    return Ty::Any;
+                };
+                match self.types[parent].methods.get(&m).cloned() {
+                    Some(sig) => {
+                        let what = format!("`super` (`{}.{}`)", self.name(self.types[parent].name), self.name(m));
+                        self.check_args(&sig, args, None, span, &what);
+                        sig.ret.borrow().clone()
+                    }
+                    None => {
+                        let msg = format!(
+                            "`super`: `{}` has no method `{}`",
+                            self.name(self.types[parent].name),
+                            self.name(m)
+                        );
+                        self.error(msg, span);
+                        Ty::Any
+                    }
+                }
             }
             ExprKind::Raise(v) => {
                 let t = self.expr(v, None);

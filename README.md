@@ -30,7 +30,8 @@ type error: `str` has no method `lenght` (did you mean `len`?)
 Gradual typing: only certain errors are reported; everything else is checked at run
 time.
 
-Errors are exceptions, as in Crystal:
+Errors are exceptions, as in Crystal (custom errors are classes that inherit from
+`Error`):
 
 ```ruby
 let ratio = begin

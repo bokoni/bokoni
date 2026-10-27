@@ -527,10 +527,10 @@ impl Runtime {
         let msg = Value::str(&e.message);
         let slot = self.globals.slot(self.syms.error);
         match &self.globals.at(slot).value {
-            Some(Value::Type(info)) if info.fields.len() == 1 => {
+            Some(Value::Type(info)) => {
                 let info = info.clone();
                 let span = e.span.unwrap_or_default();
-                self.construct_regs(&info, std::slice::from_ref(&msg), &[], span)
+                self.construct(&info, CallArgs::plain(vec![msg.clone()]), None, span)
                     .unwrap_or(msg)
             }
             _ => msg,
@@ -1118,11 +1118,52 @@ impl Runtime {
                 };
                 reg!(*d) = Value::Bool(hit);
             }
+            Instr::CallSuper {
+                dst,
+                this,
+                parent,
+                name,
+                site,
+            } => {
+                let site = &proto.calls[*site as usize];
+                let args = Self::call_args(proto, regs, site);
+                let method = match &self.globals.at(*parent).value {
+                    Some(Value::Type(info)) => info.methods.get(name).cloned(),
+                    _ => None,
+                };
+                let Some(m) = method else {
+                    let p = self.name(self.globals.at(*parent).name).to_string();
+                    return rt_err(
+                        format!("`super`: `{p}` has no method `{}`", self.name(*name)),
+                        span,
+                    );
+                };
+                let this = reg!(*this).clone();
+                reg!(*dst) = self.call_method(this, &m, args, span)?;
+            }
             Instr::DefType { slot, decl } => {
                 let Decl::Type(t) = &proto.decls[*decl as usize] else {
                     unreachable!()
                 };
-                let info = TypeInfo::new(t, &proto.script, &self.interner);
+                let parent = match t.parent {
+                    Some((p, nfields)) => match &self.globals.at(p).value {
+                        Some(Value::Type(info))
+                            if info.kind == TypeDeclKind::Class
+                                && info.fields.len() == nfields as usize =>
+                        {
+                            Some(info.clone())
+                        }
+                        _ => {
+                            let n = self.name(self.globals.at(p).name).to_string();
+                            return type_err(
+                                format!("`{n}` is not the class `{}` was compiled with", self.name(t.name)),
+                                span,
+                            );
+                        }
+                    },
+                    None => None,
+                };
+                let info = TypeInfo::new(t, parent, &proto.script, &self.interner);
                 self.globals
                     .set_slot(*slot, Value::Type(Rc::new(info)), false);
             }
@@ -1647,7 +1688,7 @@ impl Runtime {
                 };
                 match found {
                     Some(Value::Type(info)) => {
-                        matches!(v, Value::Object(o) if Rc::ptr_eq(&o.borrow().info, info))
+                        matches!(v, Value::Object(o) if o.borrow().info.is_a(info))
                     }
                     Some(Value::Enum(e)) => matches!(v, Value::Variant(x, _) if Rc::ptr_eq(x, e)),
                     _ => return Err(format!("unknown type `{}`", self.name(*name))),
@@ -1820,21 +1861,30 @@ fn float_op(op: BinOp, x: f64, y: f64) -> Value {
 }
 
 impl TypeInfo {
-    pub(crate) fn new(t: &TypeDeclIr, script: &Rc<Script>, i: &Interner) -> Self {
+    pub(crate) fn new(
+        t: &TypeDeclIr,
+        parent: Option<Rc<TypeInfo>>,
+        script: &Rc<Script>,
+        i: &Interner,
+    ) -> Self {
+        let own = t.fields.iter().map(|f| crate::objects::FieldInfo {
+            name: f.name,
+            ty: f.ty.clone(),
+            default: f.default.clone(),
+            annotations: f.annotations.clone(),
+        });
+        let (mut fields, mut methods) = match &parent {
+            Some(p) => (p.fields.clone(), p.methods.clone()),
+            None => (Vec::new(), FxHashMap::default()),
+        };
+        fields.extend(own);
+        methods.extend(t.methods.iter().cloned());
         TypeInfo {
             name: i.resolve(t.name).into(),
             kind: t.kind,
-            fields: t
-                .fields
-                .iter()
-                .map(|f| crate::objects::FieldInfo {
-                    name: f.name,
-                    ty: f.ty.clone(),
-                    default: f.default.clone(),
-                    annotations: f.annotations.clone(),
-                })
-                .collect(),
-            methods: t.methods.iter().cloned().collect(),
+            parent,
+            fields,
+            methods,
             annotations: t.annotations.clone(),
             script: script.clone(),
         }

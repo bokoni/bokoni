@@ -58,6 +58,7 @@ pub fn compile(
         assign: r.assign,
         fns: Vec::new(),
         errors: Vec::new(),
+        classes: FxHashMap::default(),
     };
     let main = c.main(&program.body);
     if c.errors.is_empty() {
@@ -397,6 +398,10 @@ impl Resolver<'_> {
                 true
             }
             ExprKind::Raise(v) => self.expr(v),
+            ExprKind::Super(args) => {
+                self.refer(SELF);
+                self.args(args, None)
+            }
             ExprKind::Return(v) => {
                 if let Some(v) = v {
                     self.expr(v);
@@ -488,6 +493,9 @@ struct Fn_ {
     ret: Option<TypeRef>,
     /// Fields of `self` (method of a `type` / `class`, and its lambdas).
     this: Option<Rc<[Symbol]>>,
+    /// Method of a class that inherits (and its lambdas): (global slot of the parent,
+    /// name of the method), for `super`.
+    sup: Option<(u32, Symbol)>,
     /// Register 0 is `self`.
     has_self: bool,
     /// Fields of the type whose default value is being computed.
@@ -517,6 +525,8 @@ struct Compiler<'a> {
     assign: Vec<bool>,
     fns: Vec<Fn_>,
     errors: Vec<Error>,
+    /// Fields (parents' included) of the classes compiled so far.
+    classes: FxHashMap<Symbol, Rc<[Symbol]>>,
 }
 
 type Op = (Reg, RegTy);
@@ -531,6 +541,7 @@ impl Compiler<'_> {
     fn begin(&mut self, kind: ProtoKind, name: Rc<str>) {
         let parent = self.fns.last();
         let this = parent.and_then(|p| p.this.clone());
+        let sup = parent.and_then(|p| p.sup);
         let ctx_fields = parent.and_then(|p| p.ctx_fields.clone());
         let mut region = parent.and_then(|p| p.region);
         if kind == ProtoKind::DoBlock {
@@ -570,6 +581,7 @@ impl Compiler<'_> {
             params: Vec::new(),
             ret: None,
             this,
+            sup,
             has_self: false,
             ctx_fields,
             region,
@@ -1711,9 +1723,59 @@ impl Compiler<'_> {
         fields
     }
 
+    /// Fields of the parent class (declared before, in this script or a previous one).
+    fn parent_fields(&mut self, t: &TypeDecl) -> Option<(u32, Rc<[Symbol]>)> {
+        let (p, span) = t.parent?;
+        let slot = self.globals.slot(p);
+        if let Some(fields) = self.classes.get(&p) {
+            return Some((slot, fields.clone()));
+        }
+        match &self.globals.at(slot).value {
+            Some(Value::Type(info)) if info.kind == TypeDeclKind::Class => {
+                Some((slot, info.fields.iter().map(|f| f.name).collect()))
+            }
+            _ => {
+                self.errors.push(Error::type_error(
+                    format!(
+                        "`{}` is not a class declared before `{}`",
+                        self.i.resolve(p),
+                        self.i.resolve(t.name)
+                    ),
+                    span,
+                ));
+                None
+            }
+        }
+    }
+
     fn type_decl(&mut self, t: &TypeDecl) {
-        let fields = self.type_fields(t);
-        let names: Rc<[Symbol]> = fields.iter().map(|(n, ..)| *n).collect();
+        let parent = self.parent_fields(t);
+        let inherited: Rc<[Symbol]> = parent.as_ref().map_or(Rc::from([]), |(_, f)| f.clone());
+        let mut fields = self.type_fields(t);
+        // `init(@x)` for a field of the parent: an assignment, not a new field.
+        fields.retain(|(n, ..)| !inherited.contains(n));
+        for m in &t.members {
+            if let Member::Field(f) = m
+                && inherited.contains(&f.name)
+            {
+                self.errors.push(Error::type_error(
+                    format!(
+                        "field `{}` is already declared by `{}`",
+                        self.i.resolve(f.name),
+                        self.i.resolve(t.parent.unwrap().0)
+                    ),
+                    f.span,
+                ));
+            }
+        }
+        let names: Rc<[Symbol]> = inherited
+            .iter()
+            .copied()
+            .chain(fields.iter().map(|(n, ..)| *n))
+            .collect();
+        if t.kind == TypeDeclKind::Class {
+            self.classes.insert(t.name, names.clone());
+        }
         let mut fir = Vec::new();
         for (name, ty, default, anns) in &fields {
             let annotations = self.annotations_ir(anns);
@@ -1742,6 +1804,10 @@ impl Compiler<'_> {
             match m {
                 Member::Method(f) => {
                     let saved = self.f().this.replace(names.clone());
+                    let saved_sup = std::mem::replace(
+                        &mut self.f().sup,
+                        parent.as_ref().map(|(slot, _)| (*slot, f.name)),
+                    );
                     let pname = format!("{}.{}", self.i.resolve(t.name), self.i.resolve(f.name));
                     let p = self.function_proto(
                         ProtoKind::Method,
@@ -1754,6 +1820,7 @@ impl Compiler<'_> {
                         Some(f.span.start),
                     );
                     self.f().this = saved;
+                    self.f().sup = saved_sup;
                     methods.push((f.name, p));
                 }
                 Member::Stmt(s) => self.errors.push(Error::syntax(
@@ -1768,6 +1835,7 @@ impl Compiler<'_> {
         let decl = TypeDeclIr {
             name: t.name,
             kind: t.kind,
+            parent: parent.map(|(slot, f)| (slot, f.len() as u32)),
             fields: fir,
             methods,
             annotations,
@@ -2209,6 +2277,29 @@ impl Compiler<'_> {
             }
             ExprKind::For(c) => self.for_loop(ast.for_(c), span),
             ExprKind::Begin(c) => self.begin_expr(c, span),
+            ExprKind::Super(args) => {
+                let Some((parent, name)) = self.f().sup else {
+                    return self.fail(
+                        "`super` can only be used in a method of a class that inherits",
+                        span,
+                    );
+                };
+                let this = self.self_value(span);
+                let this = self.boxed(this, span);
+                let site = self.call_site(args, None);
+                let dst = self.tmp(RegTy::Value);
+                self.emit(
+                    Instr::CallSuper {
+                        dst,
+                        this,
+                        parent,
+                        name,
+                        site,
+                    },
+                    span,
+                );
+                (dst, RegTy::Value)
+            }
             ExprKind::Raise(v) => {
                 let v = self.expr(v);
                 let r = self.boxed(v, span);
@@ -2993,6 +3084,11 @@ fn visit(ast: &Ast, e: ExprId, f: &mut dyn FnMut(ExprId)) {
             }
         }
         ExprKind::Return(Some(x)) | ExprKind::Raise(x) => visit(ast, x, f),
+        ExprKind::Super(args) => {
+            for a in ast.get(args) {
+                visit(ast, a.value, f);
+            }
+        }
         _ => {}
     }
 }

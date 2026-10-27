@@ -108,6 +108,10 @@ impl Printer<'_> {
                 });
                 self.out.push(' ');
                 self.name(t.name);
+                if let Some((p, _)) = t.parent {
+                    self.out.push_str(" < ");
+                    self.name(p);
+                }
                 for m in &t.members {
                     self.out.push(' ');
                     match m {
@@ -568,6 +572,11 @@ impl Printer<'_> {
                     self.block(b);
                     self.out.push(')');
                 }
+                self.out.push(')');
+            }
+            ExprKind::Super(args) => {
+                self.out.push_str("(super");
+                self.args(args, None);
                 self.out.push(')');
             }
             ExprKind::Raise(v) => {

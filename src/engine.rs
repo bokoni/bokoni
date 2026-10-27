@@ -57,7 +57,7 @@ impl Drop for Engine {
 /// Built-in declarations: the `Deprecated` and `Doc` annotations.
 const PRELUDE: &str = "annotation Deprecated\n  message: str? = nil\nend\n\
                        annotation Doc\n  text: str\nend\n\
-                       type Error\n  message: str\nend\n";
+                       class Error\n  def init(@message: str)\n  end\n  def message = @message\nend\n";
 
 impl Engine {
     pub fn new() -> Self {
