@@ -265,3 +265,64 @@ fn field_cache_sees_mutations() {
         "[1, 5]"
     );
 }
+
+#[test]
+fn typed_functions_over_objects() {
+    let src = "type P\n  x: int = 0\n  y: float = 0.5\n  ok: bool = true\nend\n\
+               def dot(a: P, b: P): float = a.x * b.x + a.y * b.y\n\
+               def score(p: P): float = if p.ok then dot(p, p) else 0.0 end\n\
+               def bad(p: P): int = p.x * 4611686018427387904\n";
+    let r = same(&format!(
+        "{src}[score(P(x: 3, y: 2)), score(P(x: 1, ok: false)), dot(P(x: 2), P(x: 5, y: 4))]"
+    ));
+    assert_eq!(r, "[13.0, 0.0, 12.0]");
+    // Erreur dans du code natif sur un objet : même message, même pile.
+    same(&format!("{src}bad(P(x: 3))"));
+    let mut e = Engine::new();
+    e.eval(&format!("{src}score(P(x: 1))")).unwrap();
+    assert!(
+        e.is_native("score") && e.is_native("dot"),
+        "fonctions sur objets compilées"
+    );
+}
+
+#[test]
+fn redeclared_type_falls_back_to_the_interpreter() {
+    // `f` est compilée en supposant `P.x : int` ; `P` est ensuite redéclaré avec `x: str`.
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    e.eval("type P\n  x: int = 1\nend\ndef f(p: P): int = p.x + 1\nf(P())")
+        .unwrap();
+    assert!(e.is_native("f"));
+    e.eval("type P\n  x: str = \"a\"\nend").unwrap();
+    let err = e.eval("f(P())").unwrap_err().to_string();
+    assert!(
+        err.contains("le champ `x` devait être un `int`, reçu str"),
+        "{err}"
+    );
+    assert!(!e.is_native("f"));
+    // Redéclaré avec la même forme, puis une autre disposition : recompilé, correct.
+    e.eval("type P\n  x: int = 2\nend").unwrap();
+    assert_eq!(e.eval_as::<i64>("f(P())").unwrap(), 3);
+    e.eval("type P\n  pad: str = \"\"\n  x: int = 7\nend")
+        .unwrap();
+    assert_eq!(e.eval_as::<i64>("f(P())").unwrap(), 8);
+    assert!(e.is_native("f"));
+}
+
+#[test]
+fn typed_fields_in_untyped_code() {
+    // Champs typés lus dans des fonctions que le JIT typé ne compile pas (retour non
+    // annoté, boucle sur une liste, objet local) : code de base, même résultat.
+    let ty = "type P\n  x: int = 0\n  y: float = 1.5\n  name: str = \"p\"\nend\n";
+    for body in [
+        "def f(p: P) = p.x + p.y\nf(P(x: 2))",
+        "def f(ps: [P]): float\n  let t = 0.0\n  for p in ps\n    t += p.x * p.y\n  end\n  t\nend\nf([P(x: 1), P(x: 2, y: 2.0)])",
+        "def f(n: int): int\n  let p = P(x: n)\n  p.x * 2\nend\nf(21)",
+        "def f(p: P) = \"#{p.name}:#{p.x}\"\nf(P(x: 4))",
+        "def f(p: P): int = p.x * 4611686018427387904\nf(P(x: 3))",
+    ] {
+        same_eager(&format!("{ty}{body}"));
+        same(&format!("{ty}{body}"));
+    }
+}

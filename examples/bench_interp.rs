@@ -35,6 +35,10 @@ const PROGRAMS: &[(&str, &str)] = &[
         "type P\n  x: int = 0\n  y: int = 0\nend\nlet s = 0\nfor i in 0...100000\n  let p = P(x: i, y: 2)\n  s += p.x + p.y\nend\ns",
     ),
     (
+        "objets typés : produit scalaire (1 M)",
+        "type V\n  x: float = 0.0\n  y: float = 0.0\nend\ndef dot(a: V, b: V): float = a.x * b.x + a.y * b.y\ndef run(v: V, n: int): float\n  let t = 0.0\n  let i = 0\n  while i < n\n    t += dot(v, v)\n    i += 1\n  end\n  t\nend\nrun(V(x: 1.5, y: 2.0), 1000000)",
+    ),
+    (
         "chaînes : interpolation (100 k)",
         "let n = 0\nfor i in 0...100000\n  let s = \"item #{i}\"\n  n += s.len()\nend\nn",
     ),

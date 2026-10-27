@@ -103,7 +103,7 @@ c'est le travail du JIT (appels directs, valeurs non boxées).
 
 Temps compilation comprise.
 
-### v0.5 — JIT pour le code non typé (en cours)
+### v0.5 — JIT pour le code non typé et les objets
 
 - [x] Compilation de base de toute fonction (deuxième appel, ou premier s'il y a une
       boucle) : registres `Value` en mémoire (disposition fixe `repr(C, u8)`), constantes,
@@ -125,15 +125,27 @@ Temps compilation comprise.
       des globales
 - Essayé et abandonné : champs d'objet dans l'objet (`SmallVec`) — pas plus rapide,
   les petites allocations coûtent peu
-- [ ] Gain suivant : typer les champs et les closures dans l'IR (le vérificateur connaît
-      souvent `p: P` et `P.x: int`) pour que le JIT typé les compile
+- [x] Champs typés dans l'IR : `p.x` d'un champ **annoté** d'un `type` donne un registre
+      `int` / `float` / `bool` (instruction `FieldAs`) ; un champ au type seulement déduit
+      (`port = 80`) n'est pas vérifié à l'exécution, il reste générique
+- [x] JIT typé : paramètres d'un type déclaré (`def dot(a: V, b: V): float`), passés par
+      pointeur ; type de l'objet vérifié une fois à l'entrée, champs lus directement à
+      leur position ; transmis tels quels aux fonctions natives de même annotation
+- [x] Hypothèse non vérifiée (type redéclaré) : l'appel est refait par l'interpréteur ;
+      la redéclaration du type recompile la fonction pour la nouvelle disposition
+- [x] Analyse de vivacité : un `nil` jamais lu (valeur d'un `while`) n'empêche plus la
+      compilation typée
+- Non fait, volontairement : typer les paramètres des lambdas d'après la liste
+  (`xs.map(|x| …)`) — une liste `[int]` peut recevoir une autre valeur depuis du code
+  non typé, et le coût restant est celui de l'appel, pas du calcul
 
 | Programme                               | v0.4    | maintenant | gain |
 |-----------------------------------------|--------:|-----------:|-----:|
 | listes : map / filter / sum (100 k)     | 16,9 ms | 8,6 ms     | ×2,0 |
 | closures et compteur (300 k appels)     | 27,4 ms | 14,6 ms    | ×1,9 |
 | objets : construction et champs (100 k) | 17,9 ms | 9,2 ms     | ×1,9 |
-| chaînes : interpolation (100 k)         | 11,2 ms | 8,8 ms     | ×1,3 |
+| chaînes : interpolation (100 k)         | 11,2 ms | 8,7 ms     | ×1,3 |
+| objets typés : produit scalaire (1 M)   | 172 ms  | 3,2 ms     | ×54  |
 | `fib(25)` interprété (`--no-jit`)       | 28 ms   | 18 ms      | ×1,6 |
 
 ### Ensuite

@@ -59,6 +59,9 @@ enum ErrKind {
     Overflow,
     DivZero,
     Depth,
+    /// Hypothèse du code natif non vérifiée (champ d'un autre type) : l'appel est refait
+    /// par l'interpréteur.
+    Bail,
 }
 
 struct ErrInfo {
@@ -81,6 +84,43 @@ extern "C" fn bk_frem(a: f64, b: f64) -> f64 {
     a.rem_euclid(b)
 }
 
+/// Champs d'un objet du type `info` (passé en paramètre) ; nul si l'objet est d'un autre
+/// type (type redéclaré depuis la compilation).
+extern "C" fn bk_obj_fields(
+    obj: *const Value,
+    info: *const crate::objects::TypeInfo,
+) -> *const Value {
+    // SAFETY : `obj` désigne un argument vivant pendant l'appel natif. Le code natif est
+    // sans effet de bord : les champs ne changent pas (ni ne sont déplacés) pendant l'appel.
+    unsafe {
+        match &*obj {
+            Value::Object(o) => match o.try_borrow() {
+                Ok(b) if Rc::as_ptr(&b.info) == info => b.fields.as_ptr(),
+                _ => std::ptr::null(),
+            },
+            _ => std::ptr::null(),
+        }
+    }
+}
+
+/// Champ d'un objet passé en paramètre (`FieldAs`) : 0 et la valeur (bits) dans `out`,
+/// ou 1 si l'objet n'a pas ce champ avec ce type.
+extern "C" fn bk_field_native(obj: *const Value, cache: *mut u8, out: *mut u64) -> i32 {
+    // SAFETY : `obj` désigne un argument vivant pendant l'appel natif (cf. `Jit::call`) ;
+    // `cache` est un `FieldCache` gardé par le `Jit`.
+    unsafe {
+        let cache = &mut *(cache as *mut FieldCache);
+        let bits = match cache.get(&*obj) {
+            Some(Value::Int(i)) => i as u64,
+            Some(Value::Float(f)) => f.to_bits(),
+            Some(Value::Bool(b)) => b as u64,
+            _ => return 1,
+        };
+        *out = bits;
+    }
+    0
+}
+
 /// Fonction compilée : identifiant Cranelift et signature.
 struct Compiled {
     id: FuncId,
@@ -97,6 +137,13 @@ pub struct Jit {
     compiled: FxHashMap<usize, Compiled>,
     trace_fn: FuncId,
     frem_fn: FuncId,
+    field_fn: FuncId,
+    fields_fn: FuncId,
+    /// Types dont le code natif connaît la disposition (gardés en vie : leur adresse sert
+    /// d'identité).
+    known_types: Vec<Rc<crate::objects::TypeInfo>>,
+    /// Le dernier appel natif a été abandonné (`ErrKind::Bail`).
+    pub bailed: bool,
     /// Fonctions d'aide du code de base (`bk_step`, `bk_iter_next`, `bk_drop`).
     dyn_fns: Option<(FuncId, FuncId, FuncId)>,
     /// Fonctions d'aide rapides (`FAST`), dans l'ordre de `Fast`.
@@ -118,6 +165,9 @@ enum JTy {
     Nil,
     /// Fonction globale appelée directement (case globale).
     Callee(u32),
+    /// Objet reçu en paramètre (index du paramètre) : pointeur vers la valeur, empruntée
+    /// à l'appelant pour la durée de l'appel.
+    Obj(u32),
 }
 
 fn prim(rt: &RtType) -> Option<RegTy> {
@@ -138,12 +188,12 @@ fn jty(t: RegTy) -> JTy {
     }
 }
 
+/// Type Cranelift d'un registre ; `Value` : pointeur vers un objet.
 fn clif(t: RegTy) -> Type {
     match t {
-        RegTy::Int => types::I64,
+        RegTy::Int | RegTy::Value => types::I64,
         RegTy::Float => types::F64,
         RegTy::Bool => types::I8,
-        RegTy::Value => unreachable!(),
     }
 }
 
@@ -157,9 +207,19 @@ fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
         if prm.has_default || prm.field.is_some() {
             return None;
         }
-        params.push(prim(&prm.ty.as_ref()?.ty)?);
+        let ty = &prm.ty.as_ref()?.ty;
+        // Paramètre d'un type déclaré : l'objet, par pointeur (`Value`).
+        params.push(match &**ty {
+            RtType::Named(..) => RegTy::Value,
+            t => prim(t)?,
+        });
     }
     Some((params, prim(&p.ret.as_ref()?.ty)?))
+}
+
+/// Annotation du paramètre `i`.
+fn param_ann(q: &Proto, i: usize) -> Option<&RtType> {
+    q.params[i].ty.as_ref().map(|t| &*t.ty)
 }
 
 /// Fonction du script dans une case globale.
@@ -187,9 +247,13 @@ fn analyze(p: &Proto, globals: &Globals) -> Option<Plan> {
         .iter()
         .map(|t| (*t != RegTy::Value).then(|| jty(*t)))
         .collect();
-    for (prm, t) in p.params.iter().zip(&params) {
-        tys[prm.reg as usize] = Some(jty(*t));
+    for (k, (prm, t)) in p.params.iter().zip(&params).enumerate() {
+        tys[prm.reg as usize] = Some(match t {
+            RegTy::Value => JTy::Obj(k as u32),
+            t => jty(*t),
+        });
     }
+    let dead = dead_nils(p);
     let mut callees = Vec::new();
     // Signature (paramètres, retour) d'une fonction appelée.
     let sig_of = |slot: u32| global_proto(globals, slot).and_then(|q| native_sig(&q));
@@ -217,12 +281,16 @@ fn analyze(p: &Proto, globals: &Globals) -> Option<Plan> {
                     Int(d, _) => set(&mut tys, *d, JTy::Int)?,
                     Float(d, _) => set(&mut tys, *d, JTy::Float)?,
                     Bool(d, _) => set(&mut tys, *d, JTy::Bool)?,
+                    // `nil` jamais lu (valeur d'un `while`…) : le registre peut servir ailleurs
+                    // avec un autre type.
+                    Nil(_) if dead.contains(&(ins as *const Instr)) => {}
                     Nil(d) => set(&mut tys, *d, JTy::Nil)?,
                     Move(d, a) | Guard(d, a, _) => {
                         if let Some(t) = tys[*a as usize] {
                             set(&mut tys, *d, t)?;
                         }
                     }
+                    FieldAs(d, _, _, t) => set(&mut tys, *d, jty(*t))?,
                     IBin(op, d, _, _) | IBinK(op, d, _, _) | FBin(op, d, _, _) => {
                         let t = if is_cmp(*op) {
                             JTy::Bool
@@ -291,9 +359,12 @@ fn analyze(p: &Proto, globals: &Globals) -> Option<Plan> {
             use Instr::*;
             let ok = match ins {
                 Int(..) | Float(..) | Bool(..) | Nil(..) | GetGlobal(..) => true,
-                Move(_, a) | Guard(_, a, _) => {
-                    matches!(ty(*a), Some(JTy::Int | JTy::Float | JTy::Bool))
-                }
+                Move(_, a) => matches!(
+                    ty(*a),
+                    Some(JTy::Int | JTy::Float | JTy::Bool | JTy::Obj(_))
+                ),
+                Guard(_, a, _) => matches!(ty(*a), Some(JTy::Int | JTy::Float | JTy::Bool)),
+                FieldAs(_, a, _, _) => matches!(ty(*a), Some(JTy::Obj(_))),
                 IBin(_, _, a, b2) => is(*a, JTy::Int) && is(*b2, JTy::Int),
                 IBinK(_, _, a, _) | INeg(_, a) | IToF(_, a) => is(*a, JTy::Int),
                 FBin(_, _, a, b2) => is(*a, JTy::Float) && is(*b2, JTy::Float),
@@ -304,7 +375,10 @@ fn analyze(p: &Proto, globals: &Globals) -> Option<Plan> {
                 }
                 Call { site, .. } => {
                     let site = &p.calls[*site as usize];
-                    (0..site.npos).all(|k| num(site.start + k) || is(site.start + k, JTy::Bool))
+                    (0..site.npos).all(|k| {
+                        let r = site.start + k;
+                        num(r) || is(r, JTy::Bool) || matches!(ty(r), Some(JTy::Obj(_)))
+                    })
                 }
                 _ => false,
             };
@@ -343,6 +417,11 @@ fn analyze(p: &Proto, globals: &Globals) -> Option<Plan> {
                     let at = ty(site.start + k as u32)?;
                     let compatible = match (pt, at) {
                         (RegTy::Float, JTy::Int | JTy::Float) => true,
+                        // Objet transmis tel quel : même annotation, donc déjà vérifié.
+                        (RegTy::Value, JTy::Obj(j)) => {
+                            let callee = global_proto(globals, slot)?;
+                            param_ann(&callee, k) == param_ann(p, j as usize)
+                        }
                         (t, a) => jty(*t) == a,
                     };
                     if !compatible {
@@ -353,6 +432,116 @@ fn analyze(p: &Proto, globals: &Globals) -> Option<Plan> {
         }
     }
     Some(Plan { tys, callees })
+}
+
+/// Registres lus et écrit par une instruction acceptée par le JIT typé ; `None` pour
+/// les autres.
+fn reads_writes(p: &Proto, ins: &Instr) -> Option<(Vec<Reg>, Option<Reg>)> {
+    use Instr::*;
+    Some(match ins {
+        Int(d, _) | Float(d, _) | Bool(d, _) | Nil(d) | GetGlobal(d, _) => (vec![], Some(*d)),
+        Move(d, a)
+        | Guard(d, a, _)
+        | FieldAs(d, a, _, _)
+        | INeg(d, a)
+        | FNeg(d, a)
+        | IToF(d, a)
+        | Not(d, a)
+        | IBinK(_, d, a, _) => (vec![*a], Some(*d)),
+        IBin(_, d, a, b) | FBin(_, d, a, b) | Bin(_, d, a, b) => (vec![*a, *b], Some(*d)),
+        Call { dst, f, site } => {
+            let site = &p.calls[*site as usize];
+            let n = site.npos + site.named.len() as u32;
+            let mut r: Vec<Reg> = (site.start..site.start + n).collect();
+            r.push(*f);
+            (r, Some(*dst))
+        }
+        _ => return None,
+    })
+}
+
+/// Instructions `nil` dont la valeur n'est jamais lue (vivacité des registres).
+fn dead_nils(p: &Proto) -> Vec<*const Instr> {
+    let mut dead = Vec::new();
+    let n = p.regs.len();
+    let term_reads = |t: &Term| -> Option<Vec<Reg>> {
+        Some(match t {
+            Term::Jump(_) => vec![],
+            Term::Branch { cond, .. } => vec![*cond],
+            Term::IfInt { a, b, .. } => vec![*a, *b],
+            Term::IfIntK { a, .. } => vec![*a],
+            Term::Return { reg, .. } => vec![*reg],
+            Term::IterNext { .. } => return None,
+        })
+    };
+    let succs = |t: &Term| -> Vec<usize> {
+        let mut t = t.clone();
+        t.targets_mut().into_iter().map(|x| *x as usize).collect()
+    };
+    // Registres vivants à l'entrée de chaque bloc (point fixe arrière).
+    let mut live_in = vec![vec![false; n]; p.blocks.len()];
+    loop {
+        let mut changed = false;
+        for (bi, b) in p.blocks.iter().enumerate().rev() {
+            let mut live = vec![false; n];
+            for s in succs(&b.term) {
+                for (r, l) in live_in[s].iter().enumerate() {
+                    live[r] |= *l;
+                }
+            }
+            let Some(tr) = term_reads(&b.term) else {
+                return dead;
+            };
+            for r in tr {
+                live[r as usize] = true;
+            }
+            for ins in b.instrs.iter().rev() {
+                let Some((reads, write)) = reads_writes(p, ins) else {
+                    return dead;
+                };
+                if let Some(w) = write {
+                    live[w as usize] = false;
+                }
+                for r in reads {
+                    live[r as usize] = true;
+                }
+            }
+            if live != live_in[bi] {
+                live_in[bi] = live;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Un `nil` est mort si son registre n'est pas vivant juste après.
+    for b in &p.blocks {
+        let mut live = vec![false; n];
+        for s in succs(&b.term) {
+            for (r, l) in live_in[s].iter().enumerate() {
+                live[r] |= *l;
+            }
+        }
+        for r in term_reads(&b.term).unwrap_or_default() {
+            live[r as usize] = true;
+        }
+        for ins in b.instrs.iter().rev() {
+            let (reads, write) = reads_writes(p, ins).unwrap_or_default();
+            if let Instr::Nil(d) = ins
+                && !live[*d as usize]
+            {
+                dead.push(ins as *const Instr);
+            }
+            if let Some(w) = write {
+                live[w as usize] = false;
+            }
+            for r in reads {
+                live[r as usize] = true;
+            }
+        }
+    }
+    dead
 }
 
 fn is_cmp(op: BinOp) -> bool {
@@ -405,6 +594,8 @@ impl Jit {
         let mut builder = JITBuilder::with_isa(isa, default_libcall_names());
         builder.symbol("bk_trace", bk_trace as *const u8);
         builder.symbol("bk_frem", bk_frem as *const u8);
+        builder.symbol("bk_field_native", bk_field_native as *const u8);
+        builder.symbol("bk_obj_fields", bk_obj_fields as *const u8);
         builder.symbol("bk_step", bk_step as *const u8);
         builder.symbol("bk_iter_next", bk_iter_next as *const u8);
         builder.symbol("bk_drop", bk_drop as *const u8);
@@ -426,6 +617,25 @@ impl Jit {
         let frem_fn = module
             .declare_function("bk_frem", Linkage::Import, &sig)
             .ok()?;
+        // Les objets passent par pointeur dans des variables `i64`.
+        if ptr != types::I64 {
+            return None;
+        }
+        let mut sig = module.make_signature();
+        for _ in 0..3 {
+            sig.params.push(AbiParam::new(ptr));
+        }
+        sig.returns.push(AbiParam::new(types::I32));
+        let field_fn = module
+            .declare_function("bk_field_native", Linkage::Import, &sig)
+            .ok()?;
+        let mut sig = module.make_signature();
+        sig.params.push(AbiParam::new(ptr));
+        sig.params.push(AbiParam::new(ptr));
+        sig.returns.push(AbiParam::new(ptr));
+        let fields_fn = module
+            .declare_function("bk_obj_fields", Linkage::Import, &sig)
+            .ok()?;
         Some(Jit {
             module,
             ctx: Box::new(JitCtx {
@@ -439,6 +649,10 @@ impl Jit {
             compiled: FxHashMap::default(),
             trace_fn,
             frem_fn,
+            field_fn,
+            fields_fn,
+            known_types: Vec::new(),
+            bailed: false,
             dyn_fns: None,
             fast_fns: Vec::new(),
             field_caches: Vec::new(),
@@ -559,6 +773,14 @@ impl Jit {
             for slot in callees {
                 globals.watch(slot, &p);
             }
+            // Type d'un paramètre redéclaré : disposition des champs à recompiler.
+            for prm in &p.params {
+                if let Some(ann) = &prm.ty
+                    && let RtType::Named(slot, _) = &*ann.ty
+                {
+                    globals.watch(*slot, &p);
+                }
+            }
         }
         // Les fonctions refusées : réessayées si une fonction qu'elles appellent change.
         for p in &order {
@@ -624,6 +846,28 @@ impl Jit {
         let frem_ref = self
             .module
             .declare_func_in_func(self.frem_fn, &mut ctx.func);
+        let field_ref = self
+            .module
+            .declare_func_in_func(self.field_fn, &mut ctx.func);
+        let fields_ref = self
+            .module
+            .declare_func_in_func(self.fields_fn, &mut ctx.func);
+        // Paramètres objets dont les champs sont lus : type connu maintenant (case globale
+        // de l'annotation), donc position de chaque champ connue.
+        let mut obj_types: Vec<Option<Rc<crate::objects::TypeInfo>>> = vec![None; p.params.len()];
+        for (k, prm) in p.params.iter().enumerate() {
+            if let Some(ann) = &prm.ty
+                && let RtType::Named(slot, _) = &*ann.ty
+                && let Some(Value::Type(info)) = &globals.at(*slot).value
+                && info.kind == crate::ast::TypeDeclKind::Type
+            {
+                obj_types[k] = Some(info.clone());
+                // Gardé en vie : son adresse identifie le type dans le code natif.
+                if !self.known_types.iter().any(|t| Rc::ptr_eq(t, info)) {
+                    self.known_types.push(info.clone());
+                }
+            }
+        }
         // Erreurs et appels de cette fonction, numérotés à la suite des tables.
         let (err_base, trace_base) = (self.errors.len() as i64, self.traces.len() as i64);
         let mut err_sites: Vec<(ErrKind, Span)> = Vec::new();
@@ -639,6 +883,7 @@ impl Jit {
                 Some(JTy::Int) => Some(bx.declare_var(types::I64)),
                 Some(JTy::Float) => Some(bx.declare_var(types::F64)),
                 Some(JTy::Bool) => Some(bx.declare_var(types::I8)),
+                Some(JTy::Obj(_)) => Some(bx.declare_var(types::I64)),
                 _ => None,
             })
             .collect();
@@ -649,6 +894,12 @@ impl Jit {
         bx.append_block_params_for_function_params(entry);
         bx.switch_to_block(entry);
         let ctxv = bx.block_params(entry)[0];
+        // Case de sortie des lectures de champ.
+        let out_slot = bx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            8,
+            3,
+        ));
         // Tous les registres sont définis dès l'entrée (valeur nulle).
         for (k, v) in vars.iter().enumerate() {
             if let Some(v) = v {
@@ -664,6 +915,38 @@ impl Jit {
             let a = bx.block_params(entry)[k + 1];
             bx.def_var(vars[prm.reg as usize].unwrap(), a);
         }
+        // Adresse des champs de chaque objet de type connu (vérifié une fois ici).
+        let reads_fields = |k: usize| {
+            p.blocks.iter().flat_map(|b| &b.instrs).any(|i| {
+                matches!(i, Instr::FieldAs(_, a, ..) if plan.tys[*a as usize] == Some(JTy::Obj(k as u32)))
+            })
+        };
+        let mut fields_ptr: Vec<Option<cranelift_codegen::ir::Value>> = vec![None; p.params.len()];
+        let mut entry_checks = Vec::new();
+        for k in 0..p.params.len() {
+            let Some(info) = &obj_types[k] else { continue };
+            if !reads_fields(k) {
+                continue;
+            }
+            let obj = bx.block_params(entry)[k + 1];
+            let ip = bx.ins().iconst(types::I64, Rc::as_ptr(info) as i64);
+            let call = bx.ins().call(fields_ref, &[obj, ip]);
+            let fp = bx.inst_results(call)[0];
+            entry_checks.push(fp);
+            fields_ptr[k] = Some(fp);
+        }
+        let start = bx.create_block();
+        for fp in entry_checks {
+            let null = bx.ins().icmp_imm_s(IntCC::Equal, fp, 0);
+            err_sites.push((ErrKind::Bail, Span::default()));
+            let eid = err_base + (err_sites.len() - 1) as i64;
+            let cont = bx.create_block();
+            let id = bx.ins().iconst(types::I64, eid);
+            bx.ins().brif(null, fail, &[id.into()], cont, &[]);
+            bx.switch_to_block(cont);
+        }
+        bx.ins().jump(start, &[]);
+        bx.switch_to_block(start);
         bx.ins().jump(blocks[0], &[]);
 
         let var = |r: Reg| vars[r as usize].expect("registre typé");
@@ -710,6 +993,54 @@ impl Jit {
                     IBin(op, d, a, b2) => {
                         let (x, y) = (bx.use_var(var(*a)), bx.use_var(var(*b2)));
                         let v = int_bin(&mut bx, *op, x, y, &mut |bx, c, k| check!(bx, c, k, span));
+                        bx.def_var(var(*d), v);
+                    }
+                    // Champ d'un objet de type connu : lecture directe et vérification de
+                    // l'étiquette.
+                    FieldAs(d, a, name, t)
+                        if let Some(JTy::Obj(k)) = tyof(*a)
+                            && let Some(fp) = fields_ptr[k as usize]
+                            && let Some(idx) = obj_types[k as usize]
+                                .as_ref()
+                                .and_then(|i| i.field_index(*name)) =>
+                    {
+                        let off = idx as i32 * crate::value::layout::SIZE;
+                        let tag = bx.ins().load(types::I8, MemFlagsData::trusted(), fp, off);
+                        let (want, cty) = match t {
+                            RegTy::Int => (crate::value::layout::TAG_INT, types::I64),
+                            RegTy::Float => (crate::value::layout::TAG_FLOAT, types::F64),
+                            _ => (crate::value::layout::TAG_BOOL, types::I8),
+                        };
+                        let bad = bx.ins().icmp_imm_s(IntCC::NotEqual, tag, want as i64);
+                        check!(bx, bad, ErrKind::Bail, span);
+                        let v = bx.ins().load(
+                            cty,
+                            MemFlagsData::trusted(),
+                            fp,
+                            off + crate::value::layout::PAYLOAD,
+                        );
+                        bx.def_var(var(*d), v);
+                    }
+                    FieldAs(d, a, name, t) => {
+                        self.field_caches.push(Box::new(FieldCache {
+                            info: None,
+                            idx: 0,
+                            name: *name,
+                            want: *t,
+                        }));
+                        let cache = &**self.field_caches.last().unwrap() as *const FieldCache;
+                        let obj = bx.use_var(var(*a));
+                        let cache = bx.ins().iconst(types::I64, cache as i64);
+                        let out = bx.ins().stack_addr(types::I64, out_slot, 0);
+                        let call = bx.ins().call(field_ref, &[obj, cache, out]);
+                        let status = bx.inst_results(call)[0];
+                        check!(bx, status, ErrKind::Bail, span);
+                        let bits = bx.ins().load(types::I64, MemFlagsData::trusted(), out, 0);
+                        let v = match t {
+                            RegTy::Float => bx.ins().bitcast(types::F64, MemFlagsData::new(), bits),
+                            RegTy::Bool => bx.ins().ireduce(types::I8, bits),
+                            _ => bits,
+                        };
                         bx.def_var(var(*d), v);
                     }
                     IBinK(op, d, a, k) => {
@@ -1004,7 +1335,8 @@ impl Jit {
                 Value::Int(i) => *i as u64,
                 Value::Float(f) => f.to_bits(),
                 Value::Bool(b) => *b as u64,
-                _ => unreachable!("argument vérifié par la liaison des paramètres"),
+                // Objet : pointeur vers l'argument, vivant pendant tout l'appel.
+                v => v as *const Value as u64,
             };
         }
         // Profondeur permise par la pile native restante (estimation prudente par appel).
@@ -1018,6 +1350,7 @@ impl Jit {
         self.ctx.max_depth = limit as i64;
         self.ctx.err = -1;
         self.ctx.traces.clear();
+        self.bailed = false;
         let mut out = 0u64;
         // SAFETY : `entry` est un point d'entrée généré par `define_entry` avec cette
         // signature ; les arguments ont le nombre et le type attendus.
@@ -1033,6 +1366,10 @@ impl Jit {
             }));
         }
         let info = &self.errors[self.ctx.err as usize];
+        if matches!(info.kind, ErrKind::Bail) {
+            self.bailed = true;
+            return None;
+        }
         if matches!(info.kind, ErrKind::Depth) && limit < max_depth {
             return None;
         }
@@ -1042,6 +1379,7 @@ impl Jit {
             ErrKind::Depth => {
                 format!("trop d'appels imbriqués ({max_depth}) : récursion infinie ?")
             }
+            ErrKind::Bail => unreachable!(),
         };
         let mut e = Error::runtime(msg, info.span);
         e.src = Some((info.script.name.clone(), info.script.src.clone()));
@@ -1209,6 +1547,39 @@ struct FieldCache {
     info: Option<Rc<crate::objects::TypeInfo>>,
     idx: usize,
     name: crate::intern::Symbol,
+    /// Type attendu (`FieldAs`), ou `Value`.
+    want: RegTy,
+}
+
+impl FieldCache {
+    /// Champ `name` de l'objet `v` (`type` uniquement : une `class` passe par un getter).
+    fn get(&mut self, v: &Value) -> Option<Value> {
+        let Value::Object(o) = v else {
+            return None;
+        };
+        let obj = o.try_borrow().ok()?;
+        let idx = match &self.info {
+            Some(info) if Rc::ptr_eq(info, &obj.info) => self.idx,
+            _ => {
+                if obj.info.kind == crate::ast::TypeDeclKind::Class {
+                    return None;
+                }
+                let i = obj.info.field_index(self.name)?;
+                self.info = Some(obj.info.clone());
+                self.idx = i;
+                i
+            }
+        };
+        let v = obj.fields[idx].clone();
+        match (self.want, v) {
+            (RegTy::Value, v)
+            | (RegTy::Int, v @ Value::Int(_))
+            | (RegTy::Float, v @ Value::Float(_))
+            | (RegTy::Bool, v @ Value::Bool(_)) => Some(v),
+            (RegTy::Float, Value::Int(i)) => Some(Value::Float(i as f64)),
+            _ => None,
+        }
+    }
 }
 
 /// Fonctions d'aide rapides : `fn(rt, fenêtre, x, y, p) -> statut`. Statut 0 : fait ;
@@ -1348,32 +1719,14 @@ extern "C" fn bk_field(_: *mut Runtime, f: *mut NativeFrame, d: u32, a: u32, p: 
     unsafe {
         let cache = &mut *(p as *mut FieldCache);
         let regs = frame_regs(f);
-        let Value::Object(o) = &regs[a as usize] else {
-            return 2;
-        };
-        let Ok(obj) = o.try_borrow() else {
-            return 2;
-        };
-        let idx = match &cache.info {
-            Some(info) if Rc::ptr_eq(info, &obj.info) => cache.idx,
-            _ => {
-                // `class` : champs privés, accès par un getter (cas général).
-                if obj.info.kind == crate::ast::TypeDeclKind::Class {
-                    return 2;
-                }
-                let Some(i) = obj.info.field_index(cache.name) else {
-                    return 2;
-                };
-                cache.info = Some(obj.info.clone());
-                cache.idx = i;
-                i
+        match cache.get(&regs[a as usize]) {
+            Some(v) => {
+                regs[d as usize] = v;
+                0
             }
-        };
-        let v = obj.fields[idx].clone();
-        drop(obj);
-        regs[d as usize] = v;
+            None => 2,
+        }
     }
-    0
 }
 
 extern "C" fn bk_call(
@@ -1753,11 +2106,16 @@ fn dyn_instr(
         SetCell(c, a) => d.fast(bx, Fast::SetCell, *c, *a, null, ins, span),
         GetGlobal(r, g) => d.fast(bx, Fast::GetGlobal, *r, *g, null, ins, span),
         SetGlobal(g, a) => d.fast(bx, Fast::SetGlobal, *g, *a, null, ins, span),
-        Field(r, a, name) => {
+        Field(r, a, name) | FieldAs(r, a, name, _) => {
+            let want = match ins {
+                FieldAs(.., t) => *t,
+                _ => RegTy::Value,
+            };
             caches.push(Box::new(FieldCache {
                 info: None,
                 idx: 0,
                 name: *name,
+                want,
             }));
             let p = &**caches.last().unwrap() as *const FieldCache as *const u8;
             d.fast(bx, Fast::Field, *r, *a, p, ins, span);

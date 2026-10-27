@@ -161,3 +161,13 @@ fn ir_uses_typed_instructions() {
     assert!(generic.contains(" + r"), "{generic}");
     assert!(!generic.contains("+i"), "{generic}");
 }
+
+#[test]
+fn annotated_fields_are_typed() {
+    let src = "type P\n  x: int = 0\n  port = 80\nend\ndef f(p: P): int = p.x * 2\ndef g(p: P) = p.port * 2";
+    let out = ir(src);
+    assert!(out.contains("r0.x : int"), "{out}");
+    assert!(out.contains("*i 2"), "{out}");
+    // Type déduit de la valeur par défaut, non vérifié à l'exécution : générique.
+    assert!(out.contains("r0.port\n"), "{out}");
+}

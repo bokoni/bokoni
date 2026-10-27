@@ -35,6 +35,12 @@ pub enum RegTy {
     Bool,
 }
 
+impl RegTy {
+    pub fn name(self) -> &'static str {
+        ty_name(self)
+    }
+}
+
 /// Un programme analysé : son source sert aux messages d'erreur.
 pub struct Script {
     pub src: Rc<str>,
@@ -181,7 +187,7 @@ pub struct TypeRef {
     pub expr: Rc<TypeExpr>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum RtType {
     Any,
     Int,
@@ -326,6 +332,9 @@ pub enum Instr {
     Index(Reg, Reg, Reg),
     SetIndex(Reg, Reg, Reg),
     Field(Reg, Reg, Symbol),
+    /// Champ dont le vérificateur connaît le type (`int` / `float` / `bool`), vers un
+    /// registre de ce type.
+    FieldAs(Reg, Reg, Symbol, RegTy),
     SetField {
         obj: Reg,
         name: Symbol,
@@ -569,6 +578,7 @@ impl Proto {
             Index(d, a, b) => format!("r{d} = r{a}[r{b}]"),
             SetIndex(a, b, v) => format!("r{a}[r{b}] = r{v}"),
             Field(d, a, f) => format!("r{d} = r{a}.{}", s(f)),
+            FieldAs(d, a, f, t) => format!("r{d} = r{a}.{} : {}", s(f), t.name()),
             SetField { obj, name, src, .. } => format!("r{obj}.{} = r{src}", s(name)),
             FieldAt(d, a, f) => format!("r{d} = r{a}.#{f}"),
             SetFieldAt { obj, idx, src, .. } => format!("r{obj}.#{idx} = r{src}"),

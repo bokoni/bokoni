@@ -46,8 +46,15 @@ pub fn check(program: &Program, interner: &Interner, globals: &Globals) -> (Vec<
     (c.errors, c.prims)
 }
 
-/// Type déduit des variables, par position de leur déclaration.
-pub type Prims = FxHashMap<u32, RegTy>;
+/// Types `int` / `float` / `bool` connus avec certitude, transmis au compilateur.
+#[derive(Default)]
+pub struct Prims {
+    /// Variables, par position de leur déclaration.
+    pub vars: FxHashMap<u32, RegTy>,
+    /// Lectures de champ (`p.x`), par expression : champ annoté d'un `type`, dont la
+    /// valeur est vérifiée à chaque construction et affectation.
+    pub fields: FxHashMap<u32, RegTy>,
+}
 
 fn prim(t: &Ty) -> Option<RegTy> {
     match t {
@@ -200,6 +207,8 @@ struct FieldDef {
     name: Symbol,
     ty: Ty,
     has_default: bool,
+    /// Type annoté (vérifié à l'exécution), et non déduit de la valeur par défaut.
+    annotated: bool,
 }
 
 struct EnumDef {
@@ -523,6 +532,7 @@ impl Checker<'_> {
                 name: f.name,
                 ty: f.ty.as_ref().map_or(Ty::Any, |t| self.resolve(&t.expr)),
                 has_default: f.default.is_some(),
+                annotated: f.ty.is_some(),
             })
             .collect();
         let methods = info
@@ -748,6 +758,7 @@ impl Checker<'_> {
                             name: f.name,
                             ty,
                             has_default: f.default.is_some(),
+                            annotated: f.ty.is_some(),
                         });
                     }
                     Member::Method(f) => {
@@ -775,6 +786,7 @@ impl Checker<'_> {
                             name: p.name,
                             ty,
                             has_default: false,
+                            annotated: p.ty.is_some(),
                         });
                     }
                 }
@@ -910,7 +922,7 @@ impl Checker<'_> {
         match p {
             Pattern::Name(n, span) => {
                 if let Some(p) = prim(&ty) {
-                    self.prims.insert(span.start, p);
+                    self.prims.vars.insert(span.start, p);
                 }
                 self.declare(*n, ty, VarKind::Let)
             }
@@ -1297,6 +1309,16 @@ impl Checker<'_> {
             }
             ExprKind::Field(recv, name) => {
                 let r = self.expr(recv, None);
+                if let Ty::Object(id) = r {
+                    let def = &self.types[id];
+                    if def.kind == TypeDeclKind::Type
+                        && let Some(f) = def.fields.iter().find(|f| f.name == name)
+                        && f.annotated
+                        && let Some(p) = prim(&f.ty)
+                    {
+                        self.prims.fields.insert(e.0, p);
+                    }
+                }
                 self.field_ty(&r, name, span)
             }
             ExprKind::TupleIndex(recv, idx) => {
@@ -1383,7 +1405,7 @@ impl Checker<'_> {
                 self.push_scope();
                 for ((n, vspan), t) in x.vars.iter().zip(vars) {
                     if let Some(p) = prim(&t) {
-                        self.prims.insert(vspan.start, p);
+                        self.prims.vars.insert(vspan.start, p);
                     }
                     self.declare(*n, t, VarKind::Let);
                 }

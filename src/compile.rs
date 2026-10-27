@@ -29,8 +29,7 @@ type FxHashSet<T> = HashSet<T, FxBuild>;
 /// Nom réservé de `self` dans les portées.
 const SELF: Symbol = Symbol(u32::MAX);
 
-/// Types déduits par le vérificateur pour les variables, par position de leur déclaration.
-pub type Prims = FxHashMap<u32, RegTy>;
+pub use crate::check::Prims;
 
 pub fn compile(
     program: &Program,
@@ -806,7 +805,7 @@ impl Compiler<'_> {
         if let Some(t) = ann {
             return prim_of(t, self.i);
         }
-        self.prims.get(&key).copied()
+        self.prims.vars.get(&key).copied()
     }
 
     /// Déclare une variable locale dans la portée courante.
@@ -1962,6 +1961,12 @@ impl Compiler<'_> {
             }
             ExprKind::Field(recv, name) => {
                 let r = self.expr(recv);
+                // Type du champ connu : lecture et vérification vers un registre typé.
+                if let Some(&t) = self.prims.fields.get(&e.0) {
+                    let d = self.tmp(t);
+                    self.emit(Instr::FieldAs(d, r.0, name, t), span);
+                    return (d, t);
+                }
                 let d = self.tmp(RegTy::Value);
                 self.emit(Instr::Field(d, r.0, name), span);
                 (d, RegTy::Value)
@@ -2517,6 +2522,7 @@ fn dest_mut(ins: &mut Instr) -> Option<&mut Reg> {
         List(d, _, _) | Tuple(d, _, _) | Hash(d, _, _) | Record(d, _, _) | Concat(d, _, _) => d,
         Index(d, _, _)
         | Field(d, _, _)
+        | FieldAs(d, _, _, _)
         | FieldAt(d, _, _)
         | TupleIndex(d, _, _)
         | Variant(d, _, _) => d,

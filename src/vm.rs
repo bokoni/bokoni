@@ -570,6 +570,11 @@ impl Runtime {
                 let r = reg!(*a).clone();
                 reg!(*d) = self.field(&r, *name, span)?;
             }
+            Instr::FieldAs(d, a, name, t) => {
+                let r = reg!(*a).clone();
+                let v = self.field(&r, *name, span)?;
+                reg!(*d) = self.field_as(v, *t, *name, span)?;
+            }
             Instr::FieldAt(d, a, idx) => {
                 let Value::Object(o) = &reg!(*a) else {
                     return rt_err("`@champ` : `self` n'est pas un objet", span);
@@ -1092,7 +1097,13 @@ impl Runtime {
             .map(|p| regs[p.reg as usize].clone())
             .collect();
         let jit = self.jit.as_mut()?;
-        jit.call(code, &args, self.depth, self.max_depth)
+        let r = jit.call(code, &args, self.depth, self.max_depth);
+        if r.is_none() && jit.bailed {
+            // Hypothèse non vérifiée : la fonction reste interprétée.
+            drop(state);
+            *proto.jit.borrow_mut() = JitState::Rejected;
+        }
+        r
     }
 
     // ─── Aides de l'exécution ────────────────────────────────────────────────
@@ -1123,6 +1134,27 @@ impl Runtime {
     }
 
     /// Valeur dynamique rangée dans un registre typé.
+    /// Valeur d'un champ dont le vérificateur connaît le type. Ne peut échouer que si le
+    /// type a été redéclaré depuis la vérification (REPL).
+    fn field_as(&self, v: Value, ty: RegTy, name: Symbol, span: Span) -> R {
+        match (ty, &v) {
+            (RegTy::Int, Value::Int(_))
+            | (RegTy::Float, Value::Float(_))
+            | (RegTy::Bool, Value::Bool(_))
+            | (RegTy::Value, _) => Ok(v),
+            (RegTy::Float, Value::Int(i)) => Ok(Value::Float(*i as f64)),
+            (t, v) => type_err(
+                format!(
+                    "le champ `{}` devait être un `{}`, reçu {} : son type a-t-il été redéclaré ?",
+                    self.name(name),
+                    t.name(),
+                    v.type_label()
+                ),
+                span,
+            ),
+        }
+    }
+
     fn guard(&self, v: Value, ty: RegTy, span: Span) -> R {
         match (ty, &v) {
             (RegTy::Int, Value::Int(_))
