@@ -2494,6 +2494,22 @@ impl Compiler<'_> {
             self.f().loops.pop();
             self.term(Term::Jump(step), span);
             self.switch(step);
+            // Intervalle inclusif : sortie après la borne, sans l'incrémenter (pas de
+            // dépassement pour `a..i64::MAX`).
+            if inclusive {
+                let last = self.tmp(RegTy::Bool);
+                self.emit(Instr::IBin(BinOp::Eq, last, k, end), span);
+                let inc = self.new_block();
+                self.term(
+                    Term::Branch {
+                        cond: last,
+                        then: exit,
+                        else_: inc,
+                    },
+                    span,
+                );
+                self.switch(inc);
+            }
             self.emit(Instr::IBinK(BinOp::Add, k, k, 1), span);
             self.term(Term::Jump(head), span);
             self.pop_scope();

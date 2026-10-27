@@ -50,21 +50,32 @@ pub struct Range {
 }
 
 impl Range {
-    /// Borne supérieure exclue.
-    pub fn end(&self) -> i64 {
-        if self.inclusive {
-            self.hi.saturating_add(1)
-        } else {
-            self.hi
+    /// Valeurs de l'intervalle, dans l'ordre (sans débordement, même jusqu'à `i64::MAX`).
+    pub fn values(&self) -> std::ops::RangeInclusive<i64> {
+        match (self.inclusive, self.hi.checked_sub(1)) {
+            (true, _) => self.lo..=self.hi,
+            (false, Some(last)) => self.lo..=last,
+            // `lo...i64::MIN` : vide (intervalle déjà épuisé).
+            (false, None) => {
+                let mut empty = 0..=0;
+                empty.next();
+                empty
+            }
         }
     }
 
     pub fn contains(&self, n: i64) -> bool {
-        n >= self.lo && n < self.end()
+        n >= self.lo
+            && if self.inclusive {
+                n <= self.hi
+            } else {
+                n < self.hi
+            }
     }
 
     pub fn len(&self) -> usize {
-        (self.end() - self.lo).max(0) as usize
+        let n = self.hi as i128 - self.lo as i128 + self.inclusive as i128;
+        n.clamp(0, usize::MAX as i128) as usize
     }
 
     pub fn is_empty(&self) -> bool {

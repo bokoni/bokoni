@@ -241,6 +241,8 @@ fn big_numbers_in_loops_and_recursion() {
                 def range_sum(n: int, k: int): int\n  let t = 0\n  for i in 0...n\n    t += i * k - (k / 2)\n  end\n  t\nend\n\
                 def tri(n: int, acc: int): int = if n == 0 then acc else tri(n - 1, acc * 3 + n) end\n\
                 def pw(x: float, n: int): float = if n == 0 then 1.0 else x * pw(x, n - 1) end\n\
+                def tail(n: int): int\n  let t = 0\n  for i in n..9223372036854775807\n    t += i - n + 1\n  end\n  t\nend\n\
+                def head(n: int): int\n  let t = 0\n  for i in -9223372036854775808...n\n    t += 1\n  end\n  t\nend\n\
                 def total(xs: [int]): int\n  let t = 0\n  for x in xs\n    t += x\n  end\n  t\nend\n\
                 def avg(xs: [float]): float\n  let t = 0.0\n  for x in xs\n    t += x\n  end\n  t / xs.len()\nend\n";
     let mut t = Trio::new(defs);
@@ -261,6 +263,10 @@ fn big_numbers_in_loops_and_recursion() {
         "pw(-1e10, 31)",
         "pw(0.5, 1074)",
         "pw(0.5, 1075)",
+        "tail(9223372036854775800)",
+        "tail(9223372036854775807)",
+        "head(-9223372036854775800)",
+        "head(-9223372036854775808)",
         "total([9223372036854775807, 0, -1])",
         "total([9223372036854775807, 1])",
         "total([-9223372036854775808, -1])",

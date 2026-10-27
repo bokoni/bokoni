@@ -627,3 +627,59 @@ fn float_display() {
         assert_eq!(a.to_bits(), b.to_bits(), "{src} → {shown}");
     }
 }
+
+#[test]
+fn range_limits() {
+    let run = |src: &str| {
+        let mut e = Engine::new();
+        e.set_output(|_| {});
+        e.eval(src)
+            .map(|v| e.inspect(&v))
+            .unwrap_or_else(|err| err.to_string())
+    };
+    let max = i64::MAX;
+    let min = i64::MIN;
+    // La borne `i64::MAX` est incluse, sans débordement.
+    assert_eq!(
+        run(&format!("({}..{max}).to_list()", max - 2)),
+        format!("[{}, {}, {max}]", max - 2, max - 1)
+    );
+    assert_eq!(
+        run(&format!(
+            "let t = []\nfor i in {}..{max}\n  t << i\nend\nt",
+            max - 1
+        )),
+        format!("[{}, {max}]", max - 1)
+    );
+    assert_eq!(
+        run(&format!(
+            "let r = {}..{max}\nlet t = []\nfor i in r\n  t << i\nend\nt",
+            max - 1
+        )),
+        format!("[{}, {max}]", max - 1)
+    );
+    assert_eq!(run(&format!("(0..{max}).contains({max})")), "true");
+    assert_eq!(run(&format!("(0...{max}).contains({max})")), "false");
+    // Longueur réelle 2^64 - 1 : plafonnée à i64::MAX.
+    assert_eq!(run(&format!("({min}..{max}).len()")), max.to_string());
+    assert_eq!(run(&format!("({min}...{max}).len()")), max.to_string());
+    assert_eq!(run("(3...1).len()"), "0");
+    assert_eq!(run(&format!("({min}...{min}).to_list()")), "[]");
+    assert_eq!(run("(5..1).to_list()"), "[]");
+    assert_eq!(
+        run(&format!("({}..{max}).map(|i| i - {max})", max - 1)),
+        "[-1, 0]"
+    );
+    // Les allocations démesurées sont des erreurs, pas un arrêt du processus.
+    assert!(run(&format!("(0...{max}).to_list()")).contains("intervalle trop grand"));
+    assert!(run(&format!("\"ab\" * {max}")).contains("chaîne trop longue"));
+    assert!(run(&format!("\"ab\" * {}", max / 2 + 1)).contains("chaîne trop longue"));
+    assert_eq!(run(&format!("\"\" * {max}")), "\"\"");
+    assert_eq!(run("\"ab\" * 3"), "\"ababab\"");
+    // Parcourir un intervalle immense sans tout matérialiser.
+    assert_eq!(run(&format!("(0...{max}).find(|i| i > 3)")), "4");
+    assert_eq!(
+        run(&format!("({}..{max}).reduce(0, |a, i| a + 1)", max - 9)),
+        "10"
+    );
+}

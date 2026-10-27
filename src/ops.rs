@@ -171,7 +171,15 @@ impl Runtime {
                 if *n < 0 {
                     return rt_err("répétition d'une chaîne par un nombre négatif", span);
                 }
-                Value::Str(s.repeat(*n as usize).into())
+                match s.len().checked_mul(*n as usize) {
+                    Some(len) if len <= MAX_ALLOC => Value::Str(s.repeat(*n as usize).into()),
+                    _ => {
+                        return rt_err(
+                            format!("chaîne trop longue : {} × {n} octets", s.len()),
+                            span,
+                        );
+                    }
+                }
             }
             (Add, Value::List(a), Value::List(b)) => {
                 let mut out = a.borrow().clone();
@@ -541,9 +549,8 @@ impl Runtime {
             ) => {
                 n(1)?;
                 let f = args[0].clone();
-                let items = iter_values(&recv);
                 let mut out = Vec::new();
-                for v in items {
+                for v in iter_lazy(&recv) {
                     match m {
                         M::Map => out.push(self.call1(&f, v, span)?),
                         M::Filter => {
@@ -583,7 +590,7 @@ impl Runtime {
                 n(2)?;
                 let f = args[1].clone();
                 let mut acc = args[0].clone();
-                for v in iter_values(&recv) {
+                for v in iter_lazy(&recv) {
                     acc = self.call_pos(&f, [acc, v], span)?;
                 }
                 Ok(acc)
@@ -592,7 +599,7 @@ impl Runtime {
             // ── Intervalles
             (M::Len, Value::Range(r)) => {
                 n(0)?;
-                Ok(Value::Int(r.len() as i64))
+                Ok(Value::Int(r.len().min(i64::MAX as usize) as i64))
             }
             (M::Contains, Value::Range(r)) => {
                 n(1)?;
@@ -602,7 +609,7 @@ impl Runtime {
             }
             (M::ToList, Value::Range(_)) => {
                 n(0)?;
-                Ok(Value::list(iter_values(&recv)))
+                Ok(Value::list(iter_values(&recv, span)?))
             }
 
             // ── Hash
@@ -706,12 +713,33 @@ pub(crate) fn list_index(i: &Value, len: usize, span: Span) -> R<usize> {
     Ok(pos as usize)
 }
 
-fn iter_values(v: &Value) -> Vec<Value> {
+/// Taille maximale d'une liste créée d'un coup (`intervalle.to_list()`), et d'une chaîne
+/// répétée (`"ab" * n`), en octets : au-delà, erreur plutôt qu'un arrêt du processus
+/// faute de mémoire.
+pub(crate) const MAX_ALLOC: usize = 1 << 31;
+
+/// Éléments d'une liste ou d'un intervalle, sans copie de l'intervalle.
+fn iter_lazy(v: &Value) -> Box<dyn Iterator<Item = Value>> {
     match v {
-        Value::List(l) => l.borrow().clone(),
-        Value::Range(r) => (r.lo..r.end()).map(Value::Int).collect(),
-        _ => Vec::new(),
+        Value::List(l) => Box::new(l.borrow().clone().into_iter()),
+        Value::Range(r) => Box::new(r.values().map(Value::Int)),
+        _ => Box::new(std::iter::empty()),
     }
+}
+
+fn iter_values(v: &Value, span: Span) -> R<Vec<Value>> {
+    if let Value::Range(r) = v
+        && r.len() > MAX_ALLOC / std::mem::size_of::<Value>()
+    {
+        return rt_err(
+            format!(
+                "intervalle trop grand pour en faire une liste ({} éléments)",
+                r.len()
+            ),
+            span,
+        );
+    }
+    Ok(iter_lazy(v).collect())
 }
 
 fn arity(name: &str, args: &[Value], n: usize, span: Span) -> R<()> {

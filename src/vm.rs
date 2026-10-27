@@ -51,7 +51,7 @@ impl CallArgs {
 /// État d'un itérateur de boucle `for` (copie des éléments au début de la boucle).
 pub enum IterState {
     Values(std::vec::IntoIter<Value>),
-    Range(i64, i64),
+    Range(std::ops::RangeInclusive<i64>),
 }
 
 const RED_ZONE: usize = 256 * 1024;
@@ -1332,7 +1332,7 @@ impl Runtime {
         Ok(match v {
             Value::List(l) => IterState::Values(l.borrow().clone().into_iter()),
             Value::Tuple(t) => IterState::Values(t.iter().cloned().collect::<Vec<_>>().into_iter()),
-            Value::Range(r) => IterState::Range(r.lo, r.end()),
+            Value::Range(r) => IterState::Range(r.values()),
             Value::Str(s) => IterState::Values(
                 s.chars()
                     .map(|c| Value::Str(c.to_string().into()))
@@ -1738,10 +1738,7 @@ pub(crate) fn iter_next(regs: &mut [Value], iter: Reg, dst: Reg) -> bool {
     };
     let next = match &mut *it.borrow_mut() {
         IterState::Values(v) => v.next(),
-        IterState::Range(cur, end) => (*cur < *end).then(|| {
-            *cur += 1;
-            Value::Int(*cur - 1)
-        }),
+        IterState::Range(r) => r.next().map(Value::Int),
     };
     match next {
         Some(v) => {
