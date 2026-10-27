@@ -1199,3 +1199,47 @@ fn hashes_records_tuples_in_native_code() {
     assert_eq!(e.eval_as::<i64>("tally([1, 2, 3])").unwrap(), 3);
     assert!(!e.is_native("tally"));
 }
+
+#[test]
+fn rescue_and_ensure_in_native_code() {
+    const ERRS: &str = "class Oops < Error\nend\nclass Other < Error\nend\n";
+    for src in [
+        // Errors detected by native code, by a function called (native or not), raised.
+        "def safe_div(a: int, b: int): int\n  begin\n    a / b\n  rescue e: Error\n    -1\n  end\nend\n[safe_div(7, 2), safe_div(1, 0)]",
+        "def add(a: int, b: int): int\n  begin\n    a + b\n  rescue\n    0\n  end\nend\nadd(9223372036854775807, 1)",
+        "def f(x: int): int = 10 / x\ndef g(x: int): int\n  begin\n    f(x) + 1\n  rescue e: Error\n    e.message.len()\n  end\nend\n[g(5), g(0)]",
+        "def h(x) = x.nope()\ndef g(x: int): str\n  begin\n    h(x)\n    \"ok\"\n  rescue e: Error\n    e.message\n  end\nend\ng(1)",
+        &format!(
+            "{ERRS}def g(x: int): str\n  begin\n    raise Oops(\"o#{{x}}\") if x > 0\n    \"none\"\n  rescue e: Oops\n    e.message\n  end\nend\n[g(0), g(3)]"
+        ),
+        // A clause that does not match: raised again (with its call stack).
+        &format!(
+            "{ERRS}def g(x: int): str\n  begin\n    raise Other(\"x\")\n  rescue e: Oops\n    \"no\"\n  end\nend\ng(1)"
+        ),
+        // `ensure`: on success, on error, with a `return`.
+        "let log = []\ndef g(x: int): int\n  begin\n    100 / x\n  ensure\n    log << x\n  end\nend\n[g(5), begin\n  g(0)\nrescue e: Error\n  -1\nend, log]",
+        "let log = []\ndef g(x: int): int\n  begin\n    return 1 if x > 0\n    2\n  ensure\n    log << \"e\"\n  end\nend\n[g(1), g(0), log]",
+        // Nested, in a loop, errors counted.
+        "def count(xs: [int]): int\n  let bad = 0\n  for x in xs\n    begin\n      begin\n        let y = 10 / x\n      rescue e: Error\n        bad += 1\n        raise e if x == 0 and bad > 5\n      end\n    rescue\n      bad += 100\n    end\n  end\n  bad\nend\ncount([1, 0, 2, 0, 0])",
+        // Resumed in the interpreter inside a protected block.
+        "def g(xs: [int], i: int): int\n  begin\n    xs[i] * 2\n  rescue e: Error\n    -1\n  end\nend\n[g([1, 2], 1), g([1, 2], 5)]",
+        // An error that is not caught (a type error is): out.
+        "def g(x: int): int\n  begin\n    x / 0\n  rescue e: Error\n    raise e\n  end\nend\ng(1)",
+    ] {
+        same(src);
+    }
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    e.eval("def safe_div(a: int, b: int): int\n  begin\n    a / b\n  rescue e: Error\n    -1\n  end\nend")
+        .unwrap();
+    assert_eq!(
+        e.eval_as::<i64>("safe_div(1, 0) + safe_div(9, 3)").unwrap(),
+        2
+    );
+    assert!(e.is_native("safe_div"));
+    // In a loop.
+    e.eval("def bad(xs: [int]): int\n  let n = 0\n  for x in xs\n    begin\n      n += 10 / x\n    rescue e: Error\n      n -= 1\n    end\n  end\n  n\nend")
+        .unwrap();
+    assert_eq!(e.eval_as::<i64>("bad([1, 0, 2, 0])").unwrap(), 13);
+    assert!(e.is_native("bad"));
+}

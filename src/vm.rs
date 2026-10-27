@@ -140,9 +140,9 @@ pub struct Runtime {
     /// String interpolation buffer.
     concat_buf: String,
     /// Errors kept by `rescue` / `ensure` handlers, by call (`Term::Reraise`).
-    caught: Vec<Option<Error>>,
+    pub(crate) caught: Vec<Option<Error>>,
     #[cfg(feature = "jit")]
-    jit: Option<crate::jit::Jit>,
+    pub(crate) jit: Option<crate::jit::Jit>,
     /// Error raised while running baseline native code, waiting to be propagated.
     #[cfg(feature = "jit")]
     pending: Option<Error>,
@@ -462,7 +462,7 @@ impl Runtime {
     // ─── Execution ───────────────────────────────────────────────────────────
 
     fn exec(&mut self, proto: &Proto, upvals: &[Cell], ctx: &Rc<[u32]>, regs: &mut [Value]) -> R {
-        self.exec_at(proto, upvals, ctx, regs, 0, 0, None)
+        self.exec_at(proto, upvals, ctx, regs, 0, 0, None, None)
     }
 
     /// Runs `proto` from instruction `k0` of block `b0` (resumption of native code).
@@ -476,6 +476,7 @@ impl Runtime {
         b0: usize,
         k0: usize,
         cells: Option<Vec<Cell>>,
+        caught: Option<Vec<Option<Error>>>,
     ) -> R {
         // (Resumption of native code: its cells, shared with the lambdas it created.)
         let mut cells: Vec<Cell> = cells.unwrap_or_else(|| {
@@ -492,8 +493,12 @@ impl Runtime {
         }
         let mut b = b0;
         let mut skip = k0;
-        // This call's slots of caught errors: `self.caught[base..]`.
+        // This call's slots of caught errors: `self.caught[base..]` (resumption of native
+        // code: those it kept).
         let base = self.caught.len();
+        if let Some(c) = caught {
+            self.caught.extend(c);
+        }
         macro_rules! reg {
             ($r:expr) => {
                 regs[$r as usize]
@@ -604,7 +609,7 @@ impl Runtime {
     }
 
     /// What a `rescue` receives: the raised object, otherwise an `Error`.
-    fn error_value(&mut self, e: &Error) -> Value {
+    pub(crate) fn error_value(&mut self, e: &Error) -> Value {
         if let Some(Raised(v)) = &e.raised {
             return v.clone();
         }
@@ -1585,11 +1590,13 @@ impl Runtime {
         depth: usize,
         upvals: &[Cell],
         cells: Vec<Cell>,
+        caught: Vec<Option<Error>>,
     ) -> R {
         let saved = self.depth;
         self.depth = depth;
         let ctx = self.no_ctx.clone();
         let cells = (proto.ncells > 0).then_some(cells);
+        let caught = (proto.nslots > 0).then_some(caught);
         let r = self.exec_at(
             proto,
             upvals,
@@ -1598,6 +1605,7 @@ impl Runtime {
             block as usize,
             instr as usize,
             cells,
+            caught,
         );
         self.depth = saved;
         r.map_err(|e| attach_src(e, &proto.script))

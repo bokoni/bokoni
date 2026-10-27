@@ -22,6 +22,9 @@
 //!   method, an operation on such a result (`JTy::Boxed`, a value of any type); any
 //!   other instruction (hash, record, tuple…) by its code on rebuilt values
 //!   (`bk_step_boxed`), unless it is in a loop (the function is then not compiled).
+//! - `rescue` / `ensure`: in a protected block, an error goes to the handler's `catch`
+//!   block (`bk_catch`) instead of out of the function; the errors kept for
+//!   `Term::Reraise` are in the native frame.
 //! - When an assumption does not hold (value of another type, index out of bounds,
 //!   method redefined, native stack nearly full), the native code is not abandoned: the
 //!   interpreter resumes at that instruction, with the registers rebuilt (`DeoptSite`,
@@ -92,6 +95,8 @@ pub struct JitCtx {
     pub env: *const crate::vm::Cell,
     /// The function's own cells (variables captured by its lambdas), for a resumption.
     pub cells: *const crate::vm::Cell,
+    /// The errors it kept (`rescue` / `ensure`, `Term::Reraise`), for a resumption.
+    pub caught: *mut *mut Error,
     /// Call stack of the error (indices into the call table), most recent first.
     pub traces: Vec<u32>,
     /// The runtime, for a resumption in the interpreter (`bk_resume`).
@@ -114,6 +119,7 @@ const MAX_DEPTH_OFFSET: i32 = 8;
 const ERR_OFFSET: i32 = 16;
 const ENV_OFFSET: i32 = 24;
 const CELLS_OFFSET: i32 = 32;
+const CAUGHT_OFFSET: i32 = 40;
 
 #[derive(Clone, Copy)]
 enum ErrKind {
@@ -193,6 +199,22 @@ fn liveness(p: &Proto) -> Vec<Vec<Vec<bool>>> {
             for r in term_reads(&b.term) {
                 cur[r as usize] = true;
             }
+            // A protected block: what its handler reads is live anywhere in it (its
+            // register excepted: the error).
+            let handler: Option<Vec<bool>> = b.handler.map(|h| {
+                let h = p.handlers[h as usize];
+                let mut l = live[h.block as usize][0].clone();
+                l[h.reg as usize] = false;
+                l
+            });
+            let with_handler = |cur: &mut Vec<bool>| {
+                if let Some(h) = &handler {
+                    for (c, l) in cur.iter_mut().zip(h) {
+                        *c |= *l;
+                    }
+                }
+            };
+            with_handler(&mut cur);
             let k = b.instrs.len();
             if live[bi][k] != cur {
                 live[bi][k] = cur.clone();
@@ -214,6 +236,7 @@ fn liveness(p: &Proto) -> Vec<Vec<Vec<bool>>> {
                     // Not compiled: conservatively everything stays live.
                     None => cur.iter_mut().for_each(|l| *l = true),
                 }
+                with_handler(&mut cur);
                 if live[bi][k] != cur {
                     live[bi][k] = cur.clone();
                     changed = true;
@@ -307,6 +330,15 @@ extern "C" fn bk_resume(
         } else {
             std::slice::from_raw_parts((*ctx).cells, p.ncells as usize).to_vec()
         };
+        // The errors it kept: the interpreter's now.
+        let caught: Vec<Option<Error>> = (0..p.nslots as usize)
+            .map(|k| {
+                let slot = (*ctx).caught.add(k);
+                let e = *slot;
+                *slot = std::ptr::null_mut();
+                (!e.is_null()).then(|| *Box::from_raw(e))
+            })
+            .collect();
         let r = (*rt).resume(
             p,
             &mut regs,
@@ -315,6 +347,7 @@ extern "C" fn bk_resume(
             saved.0 as usize,
             env,
             cells,
+            caught,
         );
         (*ctx).depth = saved.0;
         (*ctx).max_depth = saved.1;
@@ -816,6 +849,25 @@ extern "C" fn bk_step_boxed(
         }
         *s.scratch.borrow_mut() = regs;
         status
+    }
+}
+
+/// `v is T` (`ty`: the type): 0 / 1, or 2 (its error, `JitCtx::pending`).
+extern "C" fn bk_is_type(ctx: *mut JitCtx, w: u64, kind: i32, ty: *const RtType, span: u64) -> i32 {
+    // SAFETY: the word is a value written by native code; `ty` a type of the compiled
+    // function.
+    unsafe {
+        let rt = (*ctx).rt;
+        let v = word_value(rt, dkind_of_code(kind), w);
+        let span = Span::new(span as u32, (span >> 32) as u32);
+        match (*rt).matches_rt(&v, &*ty) {
+            Ok(b) => b as i32,
+            Err(m) => {
+                (*ctx).pending = Some(Error::type_error(m, span));
+                (*ctx).err = PENDING;
+                2
+            }
+        }
     }
 }
 
@@ -1518,7 +1570,7 @@ pub struct Jit {
     str_fns: [FuncId; 4],
     /// `bk_call_boxed`, `bk_binary`, `bk_truthy`, `bk_global`, `bk_box_into`,
     /// `bk_new_object`, `bk_init_done`.
-    boxed_fns: [FuncId; 20],
+    boxed_fns: [FuncId; 24],
     /// Calls through the interpreter (addresses held by native code).
     #[allow(clippy::vec_box)]
     boxed_calls: Vec<Box<BoxedCall>>,
@@ -2034,6 +2086,8 @@ impl Analysis<'_> {
             GetCell(..) => JTy::Boxed,
             NewCell(_) => return Some(None),
             Closure(..) => JTy::Boxed,
+            // `x is T` (the type of a `rescue` clause…): by a helper.
+            IsType(_, a, _) if word(g(*a)?) => JTy::Bool,
             // Anything else the interpreter's code can do on values (`Runtime::step`): an
             // operation on a hash, a record, a tuple…; its result any value.
             _ if !matches!(
@@ -2053,10 +2107,12 @@ impl Analysis<'_> {
                     return None;
                 }
                 self.steps.insert(ins as *const Instr as usize);
-                if writes.is_empty() {
-                    return Some(None);
+                match writes[..] {
+                    [] => return Some(None),
+                    // A typed register (`r = x is T`): of its type.
+                    [d] if p.regs[d as usize] != RegTy::Value => jty(p.regs[d as usize]),
+                    _ => JTy::Boxed,
                 }
-                JTy::Boxed
             }
             _ => return None,
         };
@@ -2562,10 +2618,6 @@ fn analyze(
     len: crate::intern::Symbol,
     env: Vec<Value>,
 ) -> Option<Plan> {
-    // `rescue` / `ensure`: left to the interpreter.
-    if !p.handlers.is_empty() {
-        return None;
-    }
     let (_, ret) = native_sig(p)?;
     let method = p.kind == ProtoKind::Method;
     if method != this.is_some() {
@@ -2622,6 +2674,28 @@ fn analyze(
             let Some(mut cur) = entry[bi].clone() else {
                 continue;
             };
+            // A protected block: its handler may be reached from anywhere in it (its
+            // register then holds the error, any value).
+            let handler = b.handler.map(|h| p.handlers[h as usize]);
+            let to_handler = |cur: &[Lat], entry: &mut Vec<Option<Vec<Lat>>>| -> bool {
+                let Some(h) = handler else {
+                    return false;
+                };
+                let mut at: Vec<Lat> = cur.to_vec();
+                at[h.reg as usize] = Lat::T(JTy::Boxed);
+                let s = h.block as usize;
+                let merged = match &entry[s] {
+                    None => at,
+                    Some(old) => old.iter().zip(&at).map(|(a, b)| a.merge(*b)).collect(),
+                };
+                if entry[s].as_ref() != Some(&merged) {
+                    entry[s] = Some(merged);
+                    true
+                } else {
+                    false
+                }
+            };
+            changed |= to_handler(&cur, &mut entry);
             for (k, ins) in b.instrs.iter().enumerate() {
                 // Resumed in the interpreter there before: done by it.
                 let forced = deopted.contains(&(ins as *const Instr as usize));
@@ -2648,6 +2722,7 @@ fn analyze(
                         cur[w as usize] = Lat::T(t);
                     }
                 }
+                changed |= to_handler(&cur, &mut entry);
             }
             let g = |r: Reg| cur[r as usize].get();
             let num = |r: Reg| matches!(g(r), Some(JTy::Int | JTy::Float));
@@ -2698,7 +2773,7 @@ fn analyze(
                     }
                     _ => false,
                 },
-                Term::Reraise(_) => false,
+                Term::Reraise(_) => true,
             };
             if !ok {
                 return None;
@@ -2890,6 +2965,10 @@ impl Jit {
         builder.symbol("bk_closure", bk_closure as *const u8);
         builder.symbol("bk_step_boxed", bk_step_boxed as *const u8);
         builder.symbol("bk_iter_step", bk_iter_step as *const u8);
+        builder.symbol("bk_catch", bk_catch as *const u8);
+        builder.symbol("bk_is_type", bk_is_type as *const u8);
+        builder.symbol("bk_reraise", bk_reraise as *const u8);
+        builder.symbol("bk_caught_drop", bk_caught_drop as *const u8);
         builder.symbol("bk_assign_global", bk_assign_global as *const u8);
         builder.symbol("bk_box_into", bk_box_into as *const u8);
         builder.symbol("bk_new_object", bk_new_object as *const u8);
@@ -3063,6 +3142,18 @@ impl Jit {
             ),
             ("bk_iter_step", &[ptr, ptr][..], types::I32),
             (
+                "bk_catch",
+                &[ptr, types::I64, ptr, ptr, types::I32][..],
+                types::I32,
+            ),
+            ("bk_reraise", &[ptr, ptr, types::I32][..], types::INVALID),
+            (
+                "bk_is_type",
+                &[ptr, types::I64, types::I32, ptr, types::I64][..],
+                types::I32,
+            ),
+            ("bk_caught_drop", &[ptr, types::I64][..], types::INVALID),
+            (
                 "bk_assign_global",
                 &[ptr, types::I32, types::I64, types::I32, types::I64][..],
                 types::I32,
@@ -3077,7 +3168,7 @@ impl Jit {
             }
             boxed_fns.push(module.declare_function(name, Linkage::Import, &sig).ok()?);
         }
-        let boxed_fns: [FuncId; 20] = boxed_fns.try_into().ok()?;
+        let boxed_fns: [FuncId; 24] = boxed_fns.try_into().ok()?;
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr));
         sig.params.push(AbiParam::new(ptr));
@@ -3114,6 +3205,7 @@ impl Jit {
                 err: -1,
                 env: std::ptr::null(),
                 cells: std::ptr::null(),
+                caught: std::ptr::null_mut(),
                 traces: Vec::new(),
                 rt: std::ptr::null_mut(),
                 pending: None,
@@ -3359,6 +3451,10 @@ impl Jit {
             closure_ref,
             step_ref,
             iter_step_ref,
+            catch_ref,
+            reraise_ref,
+            is_type_ref,
+            caught_drop_ref,
             set_global_ref,
         ] = self
             .boxed_fns
@@ -3506,6 +3602,10 @@ impl Jit {
                 break;
             }
         }
+        // The register of a handler receives the error (a value): in its own slot.
+        for h in &p.handlers {
+            borrowed[h.reg as usize] = false;
+        }
         let mut slot_of: FxHashMap<Reg, i32> = FxHashMap::default();
         for r in 0..nregs {
             if reg_ref[r] && !borrowed[r] {
@@ -3551,8 +3651,20 @@ impl Jit {
             .collect();
         let entry = bx.create_block();
         let blocks: Vec<_> = p.blocks.iter().map(|_| bx.create_block()).collect();
-        let fail = bx.create_block();
-        bx.append_block_param(fail, types::I64);
+        // Error exit of the function; in a protected block, that of its handler (`catch`).
+        let fail_fn = bx.create_block();
+        bx.append_block_param(fail_fn, types::I64);
+        let catch: Vec<CBlock> = p
+            .handlers
+            .iter()
+            .map(|_| {
+                let c = bx.create_block();
+                bx.append_block_param(c, types::I64);
+                c
+            })
+            .collect();
+        #[allow(unused_assignments)]
+        let mut fail = fail_fn;
         bx.append_block_params_for_function_params(entry);
         bx.switch_to_block(entry);
         let ctxv = bx.block_params(entry)[0];
@@ -3608,6 +3720,29 @@ impl Jit {
         if ncells > 0 {
             let n = bx.ins().iconst(types::I64, ncells);
             bx.ins().call(cells_init_ref, &[cellsv, n]);
+        }
+        // Result of an instruction done by the interpreter for a typed register (`nil`).
+        let scratch_val = bx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            crate::value::layout::SIZE as u32,
+            3,
+        ));
+        for k in 0..crate::value::layout::SIZE / 8 {
+            let z = bx.ins().iconst(types::I64, 0);
+            bx.ins().stack_store(types::I64, z, scratch_val, k * 8);
+        }
+        // Errors kept by the handlers (for `Term::Reraise`), none on entry.
+        let nkept = p.nslots as i64;
+        let kept_slot = bx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            (nkept.max(1) * 8) as u32,
+            3,
+        ));
+        let keptv = bx.ins().stack_addr(types::I64, kept_slot, 0);
+        for k in 0..nkept {
+            let z = bx.ins().iconst(types::I64, 0);
+            bx.ins()
+                .store(MemFlagsData::trusted(), z, keptv, (k * 8) as i32);
         }
         let live = liveness(p);
         // Checks on entry (until the first block): see `DeoptSite::entry`.
@@ -3710,6 +3845,10 @@ impl Jit {
                 if ncells > 0 {
                     $bx.ins()
                         .store(MemFlagsData::trusted(), cellsv, ctxv, CELLS_OFFSET);
+                }
+                if nkept > 0 {
+                    $bx.ins()
+                        .store(MemFlagsData::trusted(), keptv, ctxv, CAUGHT_OFFSET);
                 }
                 let call = $bx.ins().call(resume_ref, &[ctxv, sp, buf, outp]);
                 let status = $bx.inst_results(call)[0];
@@ -3956,6 +4095,10 @@ impl Jit {
                     let n = $bx.ins().iconst(types::I64, ncells);
                     $bx.ins().call(cells_drop_ref, &[cellsv, n]);
                 }
+                if nkept > 0 {
+                    let n = $bx.ins().iconst(types::I64, nkept);
+                    $bx.ins().call(caught_drop_ref, &[keptv, n]);
+                }
             }};
         }
         // Builds into the slot of `d` the object or list described by `items` (native values
@@ -4039,6 +4182,10 @@ impl Jit {
         for (bi, b) in p.blocks.iter().enumerate() {
             bx.switch_to_block(blocks[bi]);
             cur = plan.entry[bi].iter().map(|l| l.get()).collect();
+            fail = match b.handler {
+                Some(h) => catch[h as usize],
+                None => fail_fn,
+            };
             for (k, (ins, &span)) in b.instrs.iter().zip(&b.spans).enumerate() {
                 use Instr::*;
                 (site_b, site_k) = (bi, k);
@@ -4081,8 +4228,13 @@ impl Jit {
                             ));
                         let outs = bx.ins().stack_addr(types::I64, obuf, 0);
                         let mut slots = Vec::new();
+                        let scalar = matches!(dty, Some(JTy::Int | JTy::Float | JTy::Bool));
                         for (j, d) in writes.iter().enumerate() {
-                            let s = own!(bx, *d);
+                            let s = if scalar {
+                                bx.ins().stack_addr(types::I64, scratch_val, 0)
+                            } else {
+                                own!(bx, *d)
+                            };
                             bx.ins()
                                 .store(MemFlagsData::trusted(), s, outs, (j * 8) as i32);
                             slots.push(s);
@@ -4112,8 +4264,34 @@ impl Jit {
                         let none = bx.ins().iconst(types::I64, -1);
                         bx.ins().jump(fail, &[none.into()]);
                         bx.switch_to_block(cont);
-                        for (d, s) in writes.iter().zip(slots) {
-                            bx.def_var(dvar!(*d), s);
+                        if scalar {
+                            // Its payload (the value has the register's type: otherwise
+                            // dropped and resumed in the interpreter).
+                            use crate::value::layout::{TAG_BOOL, TAG_FLOAT, TAG_INT};
+                            let s = slots[0];
+                            let (tag, ty) = match dty {
+                                Some(JTy::Int) => (TAG_INT, types::I64),
+                                Some(JTy::Float) => (TAG_FLOAT, types::F64),
+                                _ => (TAG_BOOL, types::I8),
+                            };
+                            let t = bx.ins().load(types::I8, MemFlagsData::trusted(), s, 0);
+                            let bad = bx.ins().icmp_imm_s(IntCC::NotEqual, t, tag as i64);
+                            let ok = bx.create_block();
+                            let wrong = bx.create_block();
+                            bx.ins().brif(bad, wrong, &[], ok, &[]);
+                            bx.switch_to_block(wrong);
+                            let one = bx.ins().iconst(types::I64, 1);
+                            bx.ins().call(drop_ref, &[s, one]);
+                            let yes = bx.ins().iconst(types::I8, 1);
+                            bail!(bx, yes);
+                            bx.ins().jump(ok, &[]);
+                            bx.switch_to_block(ok);
+                            let v = bx.ins().load(ty, MemFlagsData::trusted(), s, PAYLOAD);
+                            bx.def_var(dvar!(writes[0]), v);
+                        } else {
+                            for (d, s) in writes.iter().zip(slots) {
+                                bx.def_var(dvar!(*d), s);
+                            }
                         }
                     }
                     // A class constructed natively: the object, its `init`, the check
@@ -4429,6 +4607,29 @@ impl Jit {
                             }
                         };
                         bx.def_var(dvar!(*d), v);
+                    }
+                    IsType(d, a, t) if plan.boxed.contains(&key) => {
+                        let (w, k) = boxed_word!(bx, *a);
+                        let k = bx.ins().iconst(types::I32, dkind_code(k));
+                        let tp = bx.ins().iconst(
+                            types::I64,
+                            &*p.types[*t as usize].ty as *const RtType as i64,
+                        );
+                        let sp = bx
+                            .ins()
+                            .iconst(types::I64, span.start as i64 | ((span.end as i64) << 32));
+                        let call = bx.ins().call(is_type_ref, &[ctxv, w, k, tp, sp]);
+                        let r = bx.inst_results(call)[0];
+                        let failed = bx.create_block();
+                        let cont = bx.create_block();
+                        let err = bx.ins().icmp_imm_s(IntCC::Equal, r, 2);
+                        bx.ins().brif(err, failed, &[], cont, &[]);
+                        bx.switch_to_block(failed);
+                        let none = bx.ins().iconst(types::I64, -1);
+                        bx.ins().jump(fail, &[none.into()]);
+                        bx.switch_to_block(cont);
+                        let b8 = bx.ins().ireduce(types::I8, r);
+                        bx.def_var(dvar!(*d), b8);
                     }
                     NewCell(c) => {
                         let cv = bx.ins().iconst(types::I32, *c as i64);
@@ -5226,7 +5427,13 @@ impl Jit {
             dty = plan.term_defs[bi];
             (site_b, site_k) = (bi, b.instrs.len());
             match &b.term {
-                Term::Reraise(_) => unreachable!("function with handlers compiled"),
+                // The error kept, raised again: to the handler of this block, or out.
+                Term::Reraise(slot) => {
+                    let s = bx.ins().iconst(types::I32, *slot as i64);
+                    bx.ins().call(reraise_ref, &[ctxv, keptv, s]);
+                    let none = bx.ins().iconst(types::I64, -1);
+                    bx.ins().jump(fail, &[none.into()]);
+                }
                 Term::Jump(t) => {
                     bx.ins().jump(blocks[*t as usize], &[]);
                 }
@@ -5404,8 +5611,26 @@ impl Jit {
                 }
             }
         }
+        // Handlers: the error caught (unless it cannot be: then out), into the handler's
+        // register, then its block.
+        for (h, &c) in p.handlers.iter().zip(&catch) {
+            bx.switch_to_block(c);
+            let eid = bx.block_params(c)[0];
+            let out = own!(bx, h.reg);
+            let s = bx.ins().iconst(types::I32, h.slot as i64);
+            let call = bx.ins().call(catch_ref, &[ctxv, eid, out, keptv, s]);
+            let status = bx.inst_results(call)[0];
+            let caught = bx.create_block();
+            let none = bx.ins().iconst(types::I64, -1);
+            bx.ins().brif(status, fail_fn, &[none.into()], caught, &[]);
+            bx.switch_to_block(caught);
+            let v = *vars.get(&(h.reg, JTy::Boxed)).ok_or(())?;
+            bx.def_var(v, out);
+            bx.ins().jump(blocks[h.block as usize], &[]);
+        }
         // Error exit: the error index is stored in `ctx` (-1: already stored by the called
         // function).
+        let fail = fail_fn;
         bx.switch_to_block(fail);
         let eid = bx.block_params(fail)[0];
         let set = bx.create_block();
@@ -5579,25 +5804,104 @@ impl Jit {
                     RegTy::Value => result,
                 });
             }
-            let jit = &*jit;
-            let mut e = match (*ctx).err {
-                PENDING => (*ctx).pending.take().expect("error of a resumption"),
-                err => {
-                    let info = &jit.errors[err as usize];
-                    let msg = match info.kind {
-                        ErrKind::Overflow => "integer overflow",
-                        ErrKind::DivZero => "division by zero",
-                    };
-                    let mut e = Error::runtime(msg, info.span);
-                    e.src = Some((info.script.name.clone(), info.script.src.clone()));
-                    e
-                }
-            };
-            for &t in (*ctx).traces.iter().take(16) {
-                let t = &jit.traces[t as usize];
-                e.trace.push((t.name.to_string(), t.span));
+            Err(take_error(&*jit, ctx))
+        }
+    }
+}
+
+/// The error that stopped native code (`JitCtx::err`, or `pending`), with its call stack.
+///
+/// # Safety
+/// `ctx` is the context of `jit`, after an error.
+unsafe fn take_error(jit: &Jit, ctx: *mut JitCtx) -> Error {
+    unsafe {
+        let mut e = match (*ctx).err {
+            PENDING => (*ctx).pending.take().expect("error of a resumption"),
+            err => {
+                let info = &jit.errors[err as usize];
+                let msg = match info.kind {
+                    ErrKind::Overflow => "integer overflow",
+                    ErrKind::DivZero => "division by zero",
+                };
+                let mut e = Error::runtime(msg, info.span);
+                e.src = Some((info.script.name.clone(), info.script.src.clone()));
+                e
             }
-            Err(e)
+        };
+        for &t in (*ctx).traces.iter().take(16) {
+            let t = &jit.traces[t as usize];
+            e.trace.push((t.name.to_string(), t.span));
+        }
+        (*ctx).traces.clear();
+        (*ctx).err = -1;
+        e
+    }
+}
+
+/// An error raised in a block protected by a `rescue` / `ensure` (`eid`: its index, or
+/// -1 if already in `ctx`): if it can be caught, the value its handler receives into
+/// `out` and the error kept in `caught[slot]` (0); otherwise 1 (it goes on up).
+extern "C" fn bk_catch(
+    ctx: *mut JitCtx,
+    eid: i64,
+    out: *mut Value,
+    caught: *mut *mut Error,
+    slot: u32,
+) -> i32 {
+    // SAFETY: `ctx` is the running context, after an error; `out` a slot of the frame;
+    // `caught` its kept errors.
+    unsafe {
+        if eid >= 0 {
+            (*ctx).err = eid;
+        }
+        let catchable = match (*ctx).err {
+            PENDING => (*ctx).pending.as_ref().is_some_and(|e| {
+                matches!(e.kind, crate::ErrorKind::Runtime | crate::ErrorKind::Type)
+            }),
+            _ => true,
+        };
+        if !catchable {
+            return 1;
+        }
+        let rt = (*ctx).rt;
+        let Some(jit) = (*rt).jit.as_ref() else {
+            return 1;
+        };
+        let e = take_error(jit, ctx);
+        let v = with_interpreter(ctx, |rt| rt.error_value(&e));
+        *out = v;
+        let at = caught.add(slot as usize);
+        if !(*at).is_null() {
+            drop(Box::from_raw(*at));
+        }
+        *at = Box::into_raw(Box::new(e));
+        0
+    }
+}
+
+/// Raises again the error kept in `caught[slot]` (end of an `ensure`, no `rescue` clause
+/// matched): in `ctx` (`pending`).
+extern "C" fn bk_reraise(ctx: *mut JitCtx, caught: *mut *mut Error, slot: u32) {
+    // SAFETY: `caught[slot]` holds an error kept by `bk_catch`.
+    unsafe {
+        let at = caught.add(slot as usize);
+        let e = *Box::from_raw(*at);
+        *at = std::ptr::null_mut();
+        (*ctx).pending = Some(e);
+        (*ctx).err = PENDING;
+    }
+}
+
+/// Drops the `n` errors kept at `caught` (before every exit).
+extern "C" fn bk_caught_drop(caught: *mut *mut Error, n: u64) {
+    // SAFETY: `caught` holds `n` null or kept errors.
+    unsafe {
+        for k in 0..n as usize {
+            let at = caught.add(k);
+            if !(*at).is_null() {
+                drop(Box::from_raw(*at));
+                *at = std::ptr::null_mut();
+            }
         }
     }
 }

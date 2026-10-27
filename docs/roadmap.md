@@ -379,6 +379,11 @@ namespaces, `trait` for shared behavior.
       code, which keeps values as they are, does them better there)
 - [x] Fix: a `check` (annotated `let`) of a list or object shared the register it read
       in native code, which could be written again
+- [x] `begin … rescue … ensure` in native code: an error raised in a protected block
+      (detected by native code, by a function called, by the interpreter) goes to its
+      handler (`bk_catch`: the value it receives, the error kept for `Term::Reraise`);
+      `x is T` by a helper; the errors kept given to the interpreter on a resumption. A
+      loop with a `rescue`: ×3 when 1 turn in 10 fails, ×20 or more otherwise
 
 ### Next
 
