@@ -12,6 +12,12 @@
 //!   with the same messages and the same call stack.
 //! - A call to a global function is direct (native code → native code). If the global is
 //!   redefined, the calling code is invalidated, then recompiled when needed.
+//! - A method is compiled for the class that declares it: `self` is a pointer, its
+//!   annotated `int` / `float` / `bool` fields (`@x`) are read and written in place. A
+//!   call `obj.m()` from native code is direct, checked against a redefinition by the
+//!   object's class (otherwise abandoned). Native code must not abandon after a side
+//!   effect: a method that writes fields contains only arithmetic, branches and fields
+//!   (types checked on entry), and native code does not call it.
 //! - A `forall` function (its annotations `T` are `any` at run time) is compiled as a copy
 //!   typed for the arguments of a call (`T = int`, see `Proto::specialize`): one copy per
 //!   type, called directly by native code, or by the interpreter when the arguments fit.
@@ -102,6 +108,50 @@ extern "C" fn bk_obj_fields(
                 _ => std::ptr::null(),
             },
             _ => std::ptr::null(),
+        }
+    }
+}
+
+/// Fields of `self` (method of a class or `type` `info`, or of a subclass: its fields come
+/// first), writable; null if `self` is of another type or is being borrowed.
+extern "C" fn bk_this_fields(
+    obj: *const Value,
+    info: *const crate::objects::TypeInfo,
+) -> *mut Value {
+    // SAFETY: `obj` is an argument alive during the native call; the field vector never
+    // grows, and only this native code accesses it during the call.
+    unsafe {
+        let Value::Object(o) = &*obj else {
+            return std::ptr::null_mut();
+        };
+        let Ok(mut b) = o.try_borrow_mut() else {
+            return std::ptr::null_mut();
+        };
+        let mut t = Some(&b.info);
+        while let Some(i) = t {
+            if Rc::as_ptr(i) == info {
+                return b.fields.as_mut_ptr();
+            }
+            t = i.parent.as_ref();
+        }
+        std::ptr::null_mut()
+    }
+}
+
+/// 0 if method `name` of object `obj` is `proto` (not redefined by a subclass), 1
+/// otherwise.
+extern "C" fn bk_method_is(obj: *const Value, name: u32, proto: *const Proto) -> i32 {
+    // SAFETY: `obj` is a value alive during the native call.
+    unsafe {
+        match &*obj {
+            Value::Object(o) => match o.try_borrow() {
+                Ok(b) => match b.info.methods.get(&crate::intern::Symbol(name)) {
+                    Some(m) if Rc::as_ptr(m) == proto => 0,
+                    _ => 1,
+                },
+                Err(_) => 1,
+            },
+            _ => 1,
         }
     }
 }
@@ -237,6 +287,8 @@ struct Compiled {
     id: FuncId,
     params: Vec<RegTy>,
     ret: RegTy,
+    /// Method that modifies fields of `self`: not called by native code.
+    writes: bool,
 }
 
 pub struct Jit {
@@ -251,6 +303,8 @@ pub struct Jit {
     field_fn: FuncId,
     fields_fn: FuncId,
     list_fn: FuncId,
+    /// `bk_this_fields`, `bk_method_is`.
+    this_fns: [FuncId; 2],
     /// `bk_build`, `bk_clone_into`, `bk_move_out`, `bk_drop_slots`.
     mem_fns: [FuncId; 4],
     /// Construction plans (addresses held by native code).
@@ -287,6 +341,9 @@ enum JTy {
     /// Object of type `anns[i]`: pointer to the value (borrowed from the caller, or in a
     /// slot of the native frame).
     Obj(u32),
+    /// `self` in a method (register 0): pointer to the value; its fields are those of
+    /// `Plan::this`.
+    This,
     /// List of elements of type `anns[i]`: pointer to the value.
     List(u32),
     /// Iterator over a list of elements of type `anns[i]`.
@@ -335,11 +392,16 @@ fn native_ty(rt: &RtType) -> Option<RegTy> {
 }
 
 /// Native signature of a function (parameters and return), otherwise `None`.
+/// For a method (not `init`): `self` first.
 fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
-    if p.kind != ProtoKind::Function || !p.captures.is_empty() || p.ncells != 0 {
+    let method = p.kind == ProtoKind::Method && !p.name.ends_with(".init");
+    if !(p.kind == ProtoKind::Function || method) || !p.captures.is_empty() || p.ncells != 0 {
         return None;
     }
     let mut params = Vec::new();
+    if method {
+        params.push(RegTy::Value);
+    }
     for prm in &p.params {
         if prm.has_default || prm.field.is_some() {
             return None;
@@ -501,9 +563,14 @@ struct Plan {
     term_defs: Vec<Option<JTy>>,
     /// Functions called directly: their global slots.
     callees: Vec<u32>,
-    /// Function called by each `Call` (key: address of the instruction): the one in the
-    /// global, or its copy typed for the arguments (`forall` function).
-    targets: FxHashMap<usize, Rc<Proto>>,
+    /// Function called by each `Call` / `CallMethod` (key: address of the instruction):
+    /// the one in the global, its copy typed for the arguments (`forall` function), or a
+    /// method.
+    targets: FxHashMap<usize, Target>,
+    /// Method: the type of `self` (its fields).
+    this: Option<Rc<crate::objects::TypeInfo>>,
+    /// Method that modifies fields of `self`.
+    writes: bool,
     /// Constructed types (`T(…)`).
     ctors: Vec<u32>,
     /// Types of objects and list elements (`JTy::Obj` / `List` / `Iter`).
@@ -526,7 +593,65 @@ struct Analysis<'a> {
     anns: Vec<RtType>,
     callees: Vec<u32>,
     ctors: Vec<u32>,
-    targets: FxHashMap<usize, Rc<Proto>>,
+    targets: FxHashMap<usize, Target>,
+    this: Option<Rc<crate::objects::TypeInfo>>,
+}
+
+/// Function compiled and called directly; for a method, the type of `self` it is
+/// compiled for (the class that declares it: its subclasses have the same fields first).
+#[derive(Clone)]
+struct Target {
+    proto: Rc<Proto>,
+    this: Option<Rc<crate::objects::TypeInfo>>,
+}
+
+impl Target {
+    fn key(&self) -> usize {
+        Rc::as_ptr(&self.proto) as usize
+    }
+}
+
+/// Native type of field `idx` of `info`: annotated `int` / `float` / `bool` (always
+/// of that type: checked on every assignment).
+fn field_jty(info: &crate::objects::TypeInfo, idx: u32) -> Option<JTy> {
+    let t = info.fields.get(idx as usize)?.ty.as_ref()?;
+    prim(&t.ty).map(jty)
+}
+
+/// A method that modifies fields of `self` may not abandon its native execution after
+/// a write (the interpreter would redo it): only arithmetic, branches and fields.
+fn writes_safely(p: &Proto) -> bool {
+    use Instr::*;
+    p.blocks.iter().all(|b| {
+        matches!(
+            b.term,
+            Term::Jump(_)
+                | Term::Branch { .. }
+                | Term::IfInt { .. }
+                | Term::IfIntK { .. }
+                | Term::Return { .. }
+        ) && b.instrs.iter().all(|i| {
+            matches!(
+                i,
+                Int(..)
+                    | Float(..)
+                    | Bool(..)
+                    | Nil(_)
+                    | Move(..)
+                    | Guard(..)
+                    | IBin(..)
+                    | IBinK(..)
+                    | FBin(..)
+                    | INeg(..)
+                    | FNeg(..)
+                    | IToF(..)
+                    | Not(..)
+                    | Bin(..)
+                    | FieldAt(..)
+                    | SetFieldAt { .. }
+            )
+        })
+    })
 }
 
 impl Analysis<'_> {
@@ -546,6 +671,7 @@ impl Analysis<'_> {
         };
         let numeric = |t: JTy| matches!(t, JTy::Int | JTy::Float);
         let p = self.p;
+        let this = self.this.clone();
         Some(Some(match ins {
             Int(..) => JTy::Int,
             Float(..) => JTy::Float,
@@ -559,6 +685,22 @@ impl Analysis<'_> {
                 JTy::Obj(_) => jty(*t),
                 _ => return None,
             },
+            // `@x` in a method: an annotated field of a simple type.
+            FieldAt(_, a, idx) => match (g(*a)?, &this) {
+                (JTy::This, Some(info)) => field_jty(info, *idx)?,
+                _ => return None,
+            },
+            SetFieldAt { obj, idx, src, .. } => {
+                let (JTy::This, Some(info)) = (g(*obj)?, &this) else {
+                    return None;
+                };
+                let t = field_jty(info, *idx)?;
+                let s = g(*src)?;
+                if !(s == t || (t == JTy::Float && s == JTy::Int)) {
+                    return None;
+                }
+                return Some(None);
+            }
             IterNew { src, .. } => match g(*src)? {
                 JTy::List(a) => JTy::Iter(a),
                 _ => return None,
@@ -567,6 +709,56 @@ impl Analysis<'_> {
                 (JTy::List(e), JTy::Int) => elem_jty(&self.anns, e),
                 _ => return None,
             },
+            // Declared method of an object of known type (`self`, or a parameter): called
+            // directly, if not redefined by the object's class (checked when calling).
+            CallMethod {
+                recv, name, site, ..
+            } if !matches!(g(*recv)?, JTy::List(_)) => {
+                let site = &p.calls[*site as usize];
+                let info = match g(*recv)? {
+                    JTy::This => this?,
+                    JTy::Obj(a) => match &self.anns[a as usize] {
+                        RtType::Named(slot, _) => match &self.globals.at(*slot).value {
+                            Some(Value::Type(info)) => info.clone(),
+                            _ => return None,
+                        },
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                let m = info.methods.get(name)?.clone();
+                let (cparams, _) = native_sig(&m)?;
+                if m.kind != ProtoKind::Method
+                    || site.block
+                    || !site.named.is_empty()
+                    || site.npos as usize + 1 != cparams.len()
+                {
+                    return None;
+                }
+                for (k, pt) in cparams[1..].iter().enumerate() {
+                    let at = g(site.start + k as u32)?;
+                    let ok = match (pt, at) {
+                        (RegTy::Float, JTy::Int | JTy::Float) => true,
+                        (RegTy::Value, JTy::Obj(_) | JTy::List(_)) => {
+                            kind_for(&self.anns, at, ann_of(&m, k)) == Some(Kind::Ref)
+                        }
+                        (t, a) => *t != RegTy::Value && jty(*t) == a,
+                    };
+                    if !ok {
+                        return None;
+                    }
+                }
+                let owner = crate::objects::method_owner(&info, *name, &m);
+                let ret = value_jty(&mut self.anns, &m.ret.as_ref()?.ty);
+                self.targets.insert(
+                    ins as *const Instr as usize,
+                    Target {
+                        proto: m,
+                        this: Some(owner),
+                    },
+                );
+                ret
+            }
             CallMethod {
                 recv, name, site, ..
             } => {
@@ -681,8 +873,13 @@ impl Analysis<'_> {
                         {
                             return None;
                         }
-                        self.targets
-                            .insert(ins as *const Instr as usize, callee.clone());
+                        self.targets.insert(
+                            ins as *const Instr as usize,
+                            Target {
+                                proto: callee.clone(),
+                                this: None,
+                            },
+                        );
                         for (k, pt) in cparams.iter().enumerate() {
                             let at = g(site.start + k as u32)?;
                             let ok = match (pt, at) {
@@ -715,12 +912,29 @@ impl Analysis<'_> {
 }
 
 /// Register types of a compilable function; `None` if it is not compilable.
-fn analyze(p: &Proto, globals: &Globals, len: crate::intern::Symbol) -> Option<Plan> {
+fn analyze(
+    p: &Proto,
+    this: Option<Rc<crate::objects::TypeInfo>>,
+    globals: &Globals,
+    len: crate::intern::Symbol,
+) -> Option<Plan> {
     // `rescue` / `ensure`: left to the interpreter.
     if !p.handlers.is_empty() {
         return None;
     }
     let (_, ret) = native_sig(p)?;
+    let method = p.kind == ProtoKind::Method;
+    if method != this.is_some() {
+        return None;
+    }
+    let writes = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instrs)
+        .any(|i| matches!(i, Instr::SetFieldAt { .. }));
+    if writes && !writes_safely(p) {
+        return None;
+    }
     let mut an = Analysis {
         p,
         globals,
@@ -729,6 +943,7 @@ fn analyze(p: &Proto, globals: &Globals, len: crate::intern::Symbol) -> Option<P
         callees: Vec::new(),
         ctors: Vec::new(),
         targets: FxHashMap::default(),
+        this: this.clone(),
     };
     // Typed IR registers: their type does not change.
     let fixed: Vec<Option<JTy>> = p
@@ -737,6 +952,9 @@ fn analyze(p: &Proto, globals: &Globals, len: crate::intern::Symbol) -> Option<P
         .map(|t| (*t != RegTy::Value).then(|| jty(*t)))
         .collect();
     let mut start: Vec<Lat> = fixed.iter().map(|t| t.map_or(Lat::Undef, Lat::T)).collect();
+    if method {
+        start[0] = Lat::T(JTy::This);
+    }
     for prm in &p.params {
         start[prm.reg as usize] = Lat::T(value_jty(&mut an.anns, &prm.ty.as_ref()?.ty));
     }
@@ -829,6 +1047,8 @@ fn analyze(p: &Proto, globals: &Globals, len: crate::intern::Symbol) -> Option<P
         ctors: an.ctors,
         anns: an.anns,
         targets: an.targets,
+        this,
+        writes,
     })
 }
 
@@ -851,6 +1071,8 @@ fn reads_writes(p: &Proto, ins: &Instr) -> Option<(Vec<Reg>, Option<Reg>)> {
         }
         IterNew { dst, src, .. } => (vec![*src], Some(*dst)),
         List(d, start, n) => ((*start..*start + *n).collect(), Some(*d)),
+        FieldAt(d, a, _) => (vec![*a], Some(*d)),
+        SetFieldAt { obj, src, .. } => (vec![*obj, *src], None),
         CallMethod {
             dst, recv, site, ..
         } => {
@@ -923,6 +1145,8 @@ impl Jit {
         builder.symbol("bk_frem", bk_frem as *const u8);
         builder.symbol("bk_field_native", bk_field_native as *const u8);
         builder.symbol("bk_obj_fields", bk_obj_fields as *const u8);
+        builder.symbol("bk_this_fields", bk_this_fields as *const u8);
+        builder.symbol("bk_method_is", bk_method_is as *const u8);
         builder.symbol("bk_list_view", bk_list_view as *const u8);
         builder.symbol("bk_build", bk_build as *const u8);
         builder.symbol("bk_clone_into", bk_clone_into as *const u8);
@@ -968,6 +1192,17 @@ impl Jit {
         let fields_fn = module
             .declare_function("bk_obj_fields", Linkage::Import, &sig)
             .ok()?;
+        let this_fields_fn = module
+            .declare_function("bk_this_fields", Linkage::Import, &sig)
+            .ok()?;
+        let mut sig = module.make_signature();
+        sig.params.push(AbiParam::new(ptr));
+        sig.params.push(AbiParam::new(types::I32));
+        sig.params.push(AbiParam::new(ptr));
+        sig.returns.push(AbiParam::new(types::I32));
+        let method_fn = module
+            .declare_function("bk_method_is", Linkage::Import, &sig)
+            .ok()?;
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr));
         sig.params.push(AbiParam::new(ptr));
@@ -1010,6 +1245,7 @@ impl Jit {
             field_fn,
             fields_fn,
             list_fn,
+            this_fns: [this_fields_fn, method_fn],
             mem_fns,
             build_plans: Vec::new(),
             known_types: Vec::new(),
@@ -1022,14 +1258,22 @@ impl Jit {
         })
     }
 
-    /// Compiles `root` (and the functions it calls) if possible. Updates the JIT state of
-    /// every function encountered.
-    pub fn compile(&mut self, root: &Rc<Proto>, globals: &mut Globals) {
+    /// Compiles `root` (and the functions it calls) if possible; for a method, `this` is
+    /// the class that declares it. Updates the JIT state of every function encountered.
+    pub fn compile(
+        &mut self,
+        root: &Rc<Proto>,
+        this: Option<Rc<crate::objects::TypeInfo>>,
+        globals: &mut Globals,
+    ) {
         // 1. Functions reachable through direct calls, and their analysis.
         let mut order: Vec<Rc<Proto>> = Vec::new();
         let mut plans: FxHashMap<usize, Option<Plan>> = FxHashMap::default();
-        let mut todo = vec![root.clone()];
-        while let Some(p) = todo.pop() {
+        let mut todo = vec![Target {
+            proto: root.clone(),
+            this,
+        }];
+        while let Some(Target { proto: p, this }) = todo.pop() {
             let key = Rc::as_ptr(&p) as usize;
             if plans.contains_key(&key) {
                 continue;
@@ -1047,7 +1291,7 @@ impl Jit {
                 order.push(p);
                 continue;
             }
-            let plan = analyze(&p, globals, self.len_sym);
+            let plan = analyze(&p, this, globals, self.len_sym);
             if let Some(plan) = &plan {
                 todo.extend(plan.targets.values().cloned());
             }
@@ -1062,9 +1306,15 @@ impl Jit {
                 let Some(Some(plan)) = plans.get(&key) else {
                     continue;
                 };
+                // A method that modifies `self` is not called by native code: an
+                // abandon after the call would redo its writes.
                 let blocked = plan.targets.values().any(|q| {
-                    let k = Rc::as_ptr(q) as usize;
-                    !self.compiled.contains_key(&k) && !matches!(plans.get(&k), Some(Some(_)))
+                    let k = q.key();
+                    match (self.compiled.get(&k), plans.get(&k)) {
+                        (Some(c), _) => c.writes,
+                        (None, Some(Some(qp))) => qp.writes,
+                        _ => true,
+                    }
                 });
                 if blocked {
                     plans.insert(key, None);
@@ -1079,7 +1329,8 @@ impl Jit {
         let mut new = Vec::new();
         for p in &order {
             let key = Rc::as_ptr(p) as usize;
-            if let Some(Some(_)) = plans.get(&key) {
+            if let Some(Some(plan)) = plans.get(&key) {
+                let writes = plan.writes;
                 let (params, ret) = native_sig(p).unwrap();
                 let sig = self.signature(&params, ret);
                 self.next += 1;
@@ -1091,7 +1342,15 @@ impl Jit {
                     Ok(id) => id,
                     Err(_) => return,
                 };
-                self.compiled.insert(key, Compiled { id, params, ret });
+                self.compiled.insert(
+                    key,
+                    Compiled {
+                        id,
+                        params,
+                        ret,
+                        writes,
+                    },
+                );
                 new.push(p.clone());
             }
         }
@@ -1190,13 +1449,13 @@ impl Jit {
         // Called functions, known in this function.
         let mut callee_refs = FxHashMap::default();
         for q in plan.targets.values() {
-            let key = Rc::as_ptr(q) as usize;
+            let key = q.key();
             if callee_refs.contains_key(&key) {
                 continue;
             }
             let cid = self.compiled.get(&key).ok_or(())?.id;
             let r = self.module.declare_func_in_func(cid, &mut ctx.func);
-            callee_refs.insert(key, (r, q.clone()));
+            callee_refs.insert(key, (r, q.proto.clone()));
         }
         let trace_ref = self
             .module
@@ -1213,6 +1472,18 @@ impl Jit {
         let list_ref = self
             .module
             .declare_func_in_func(self.list_fn, &mut ctx.func);
+        let [this_fields_fn, method_fn] = self.this_fns;
+        let this_fields_ref = self
+            .module
+            .declare_func_in_func(this_fields_fn, &mut ctx.func);
+        let method_ref = self.module.declare_func_in_func(method_fn, &mut ctx.func);
+        // Method: its native parameters start with `self`.
+        let base = 1 + plan.this.is_some() as usize;
+        if let Some(info) = &plan.this
+            && !self.known_types.iter().any(|t| Rc::ptr_eq(t, info))
+        {
+            self.known_types.push(info.clone());
+        }
         // Object parameters whose fields are read: their type is known now (global slot of the
         // annotation), hence the offset of every field.
         let mut obj_types: Vec<Option<Rc<crate::objects::TypeInfo>>> = vec![None; plan.anns.len()];
@@ -1322,7 +1593,7 @@ impl Jit {
             let ty = match t {
                 JTy::Float => types::F64,
                 JTy::Bool => types::I8,
-                JTy::Int | JTy::Obj(_) | JTy::List(_) => types::I64,
+                JTy::Int | JTy::Obj(_) | JTy::List(_) | JTy::This => types::I64,
                 _ => continue,
             };
             vars.insert((*r, *t), bx.declare_var(ty));
@@ -1360,7 +1631,8 @@ impl Jit {
             let z = bx.ins().iconst(types::I64, 0);
             bx.ins().store(MemFlagsData::trusted(), z, vals_base, k * 8);
         }
-        let out_param = (ret == RegTy::Value).then(|| bx.block_params(entry)[1 + p.params.len()]);
+        let out_param =
+            (ret == RegTy::Value).then(|| bx.block_params(entry)[base + p.params.len()]);
         // Every register is defined from the entry (zero value).
         for v in iter_vars.values().flatten() {
             let z = bx.ins().iconst(types::I64, 0);
@@ -1375,9 +1647,65 @@ impl Jit {
             bx.def_var(*v, z);
         }
         for (k, prm) in p.params.iter().enumerate() {
-            let a = bx.block_params(entry)[k + 1];
+            let a = bx.block_params(entry)[k + base];
             let t = plan.entry[0][prm.reg as usize].get().ok_or(())?;
             bx.def_var(vars[&(prm.reg, t)], a);
+        }
+        // `self`: its fields (address checked on entry, as well as the type of the fields
+        // read: no abandon once a field is written).
+        let mut this_fp = None;
+        let mut this_checks = Vec::new();
+        if let Some(info) = &plan.this {
+            let obj = bx.block_params(entry)[1];
+            if let Some(v) = vars.get(&(0, JTy::This)) {
+                bx.def_var(*v, obj);
+            }
+            let used: Vec<u32> = p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.instrs)
+                .filter_map(|i| match i {
+                    Instr::FieldAt(_, 0, idx) => Some(*idx),
+                    Instr::SetFieldAt { obj: 0, idx, .. } => Some(*idx),
+                    _ => None,
+                })
+                .collect();
+            if !used.is_empty() {
+                let ip = bx.ins().iconst(types::I64, Rc::as_ptr(info) as i64);
+                let call = bx.ins().call(this_fields_ref, &[obj, ip]);
+                let fp = bx.inst_results(call)[0];
+                // Null address: abandon before reading the fields.
+                let null = bx.ins().icmp_imm_s(IntCC::Equal, fp, 0);
+                err_sites.push((ErrKind::Bail, Span::default()));
+                let id = bx
+                    .ins()
+                    .iconst(types::I64, err_base + (err_sites.len() - 1) as i64);
+                let ok = bx.create_block();
+                bx.ins().brif(null, fail, &[id.into()], ok, &[]);
+                bx.switch_to_block(ok);
+                this_fp = Some(fp);
+                let mut read: Vec<u32> = p
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.instrs)
+                    .filter_map(|i| match i {
+                        Instr::FieldAt(_, 0, idx) => Some(*idx),
+                        _ => None,
+                    })
+                    .collect();
+                read.sort();
+                read.dedup();
+                for idx in read {
+                    let off = idx as i32 * crate::value::layout::SIZE;
+                    let want = match field_jty(info, idx).ok_or(())? {
+                        JTy::Int => crate::value::layout::TAG_INT,
+                        JTy::Float => crate::value::layout::TAG_FLOAT,
+                        _ => crate::value::layout::TAG_BOOL,
+                    };
+                    let tag = bx.ins().load(types::I8, MemFlagsData::trusted(), fp, off);
+                    this_checks.push(bx.ins().icmp_imm_s(IntCC::NotEqual, tag, want as i64));
+                }
+            }
         }
         // Field address of each object of known type (checked once here).
         // Object parameter never reassigned whose fields are read: type checked and field
@@ -1406,6 +1734,14 @@ impl Jit {
             let fp = bx.inst_results(call)[0];
             entry_checks.push(fp);
             fields_ptr.insert(prm.reg, fp);
+        }
+        for bad in this_checks {
+            err_sites.push((ErrKind::Bail, Span::default()));
+            let eid = err_base + (err_sites.len() - 1) as i64;
+            let cont = bx.create_block();
+            let id = bx.ins().iconst(types::I64, eid);
+            bx.ins().brif(bad, fail, &[id.into()], cont, &[]);
+            bx.switch_to_block(cont);
         }
         let start = bx.create_block();
         for fp in entry_checks {
@@ -1604,6 +1940,116 @@ impl Jit {
                         let v = int_bin(&mut bx, *op, x, y, &mut |bx, c, k| check!(bx, c, k, span));
                         bx.def_var(dvar!(*d), v);
                     }
+                    // `@x` of `self`: its type was checked on entry.
+                    FieldAt(d, 0, idx) if tyof!(0) == Some(JTy::This) => {
+                        let fp = this_fp.ok_or(())?;
+                        let off = *idx as i32 * crate::value::layout::SIZE
+                            + crate::value::layout::PAYLOAD;
+                        let cty = match dty {
+                            Some(JTy::Float) => types::F64,
+                            Some(JTy::Bool) => types::I8,
+                            _ => types::I64,
+                        };
+                        let v = bx.ins().load(cty, MemFlagsData::trusted(), fp, off);
+                        bx.def_var(dvar!(*d), v);
+                    }
+                    SetFieldAt {
+                        obj: 0, idx, src, ..
+                    } if tyof!(0) == Some(JTy::This) => {
+                        let fp = this_fp.ok_or(())?;
+                        let info = plan.this.as_ref().ok_or(())?;
+                        let off = *idx as i32 * crate::value::layout::SIZE;
+                        let v = bx.use_var(uvar!(*src));
+                        let (tag, v) = match (field_jty(info, *idx).ok_or(())?, tyof!(*src)) {
+                            (JTy::Float, Some(JTy::Int)) => (
+                                crate::value::layout::TAG_FLOAT,
+                                bx.ins().fcvt_from_sint(types::F64, v),
+                            ),
+                            (JTy::Float, _) => (crate::value::layout::TAG_FLOAT, v),
+                            (JTy::Bool, _) => (crate::value::layout::TAG_BOOL, v),
+                            _ => (crate::value::layout::TAG_INT, v),
+                        };
+                        // The old value is of the same simple type: nothing to drop.
+                        let t = bx.ins().iconst(types::I8, tag as i64);
+                        bx.ins().store(MemFlagsData::trusted(), t, fp, off);
+                        bx.ins().store(
+                            MemFlagsData::trusted(),
+                            v,
+                            fp,
+                            off + crate::value::layout::PAYLOAD,
+                        );
+                    }
+                    // Method called directly: abandon if the object's class redefines it.
+                    CallMethod {
+                        dst,
+                        recv,
+                        name,
+                        site,
+                        ..
+                    } if plan.targets.contains_key(&(ins as *const Instr as usize)) => {
+                        let target = &plan.targets[&(ins as *const Instr as usize)];
+                        let (fref, q) = callee_refs[&target.key()].clone();
+                        let (cparams, cret) = native_sig(&q).ok_or(())?;
+                        let site = &p.calls[*site as usize];
+                        let obj = bx.use_var(uvar!(*recv));
+                        let nm = bx.ins().iconst(types::I32, name.0 as i64);
+                        let pp = bx.ins().iconst(types::I64, Rc::as_ptr(&q) as i64);
+                        let call = bx.ins().call(method_ref, &[obj, nm, pp]);
+                        let other = bx.inst_results(call)[0];
+                        check!(bx, other, ErrKind::Bail, span);
+                        let mut args = vec![ctxv, obj];
+                        for (k, pt) in cparams[1..].iter().enumerate() {
+                            let r = site.start + k as u32;
+                            let v = bx.use_var(uvar!(r));
+                            let v = match (pt, tyof!(r)) {
+                                (RegTy::Float, Some(JTy::Int)) => {
+                                    bx.ins().fcvt_from_sint(types::F64, v)
+                                }
+                                _ => v,
+                            };
+                            args.push(v);
+                        }
+                        let out = if cret == RegTy::Value {
+                            let slot = own!(bx, *dst);
+                            args.push(slot);
+                            Some(slot)
+                        } else {
+                            None
+                        };
+                        let depth =
+                            bx.ins()
+                                .load(types::I64, MemFlagsData::trusted(), ctxv, DEPTH_OFFSET);
+                        let max = bx.ins().load(
+                            types::I64,
+                            MemFlagsData::trusted(),
+                            ctxv,
+                            MAX_DEPTH_OFFSET,
+                        );
+                        let too_deep = bx.ins().icmp(IntCC::SignedGreaterThanOrEqual, depth, max);
+                        check!(bx, too_deep, ErrKind::Depth, span);
+                        let d1 = bx.ins().iadd_imm_s(depth, 1);
+                        bx.ins()
+                            .store(MemFlagsData::trusted(), d1, ctxv, DEPTH_OFFSET);
+                        let call = bx.ins().call(fref, &args);
+                        let (status, result) = {
+                            let r = bx.inst_results(call);
+                            (r[0], r[1])
+                        };
+                        bx.ins()
+                            .store(MemFlagsData::trusted(), depth, ctxv, DEPTH_OFFSET);
+                        call_sites.push((q.name.clone(), span));
+                        let tid = trace_base + (call_sites.len() - 1) as i64;
+                        let failed = bx.create_block();
+                        let cont = bx.create_block();
+                        bx.ins().brif(status, failed, &[], cont, &[]);
+                        bx.switch_to_block(failed);
+                        let t = bx.ins().iconst(types::I32, tid);
+                        bx.ins().call(trace_ref, &[ctxv, t]);
+                        let none = bx.ins().iconst(types::I64, -1);
+                        bx.ins().jump(fail, &[none.into()]);
+                        bx.switch_to_block(cont);
+                        bx.def_var(dvar!(*dst), out.unwrap_or(result));
+                    }
                     // Field of an object of known type: direct read and tag check.
                     FieldAs(d, a, name, t)
                         if let Some(JTy::Obj(k)) = tyof!(*a)
@@ -1756,7 +2202,7 @@ impl Jit {
                             .targets
                             .get(&(ins as *const Instr as usize))
                             .ok_or(())?;
-                        let (fref, q) = callee_refs[&(Rc::as_ptr(target) as usize)].clone();
+                        let (fref, q) = callee_refs[&target.key()].clone();
                         let (cparams, cret) = native_sig(&q).ok_or(())?;
                         let site = &p.calls[*site as usize];
                         let mut args = vec![ctxv];

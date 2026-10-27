@@ -202,6 +202,19 @@ impl Engine {
         }
     }
 
+    /// Whether method `method` of type `ty` was compiled to native code (after at least one
+    /// call).
+    pub fn is_native_method(&self, ty: &str, method: &str) -> bool {
+        let (Some(Value::Type(info)), Some(m)) =
+            (&self.get_global(ty), self.rt.interner.get(method))
+        else {
+            return false;
+        };
+        info.methods
+            .get(&m)
+            .is_some_and(|p| matches!(*p.jit.borrow(), crate::ir::JitState::Native(_)))
+    }
+
     /// Maximum call depth before the "infinite recursion?" error (default: 1000).
     pub fn set_max_call_depth(&mut self, depth: usize) {
         self.rt.max_depth = depth;

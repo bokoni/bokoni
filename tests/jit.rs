@@ -467,3 +467,94 @@ fn native_allocations_are_freed() {
     }
     assert!(e.is_native("loop2") && e.is_native("keep") && e.is_native("again"));
 }
+
+const SHAPES: &str = "class Vec2
+  def init(@x: float, @y: float)
+  end
+  def norm2(): float = @x * @x + @y * @y
+  def dot(o: Vec2): float = @x * o.x() + @y * o.y()
+  def x(): float = @x
+  def y(): float = @y
+  def scaled(): float = self.norm2() * 2.0
+end
+class Vec3 < Vec2
+  def init(@x: float, @y: float, @z: float)
+  end
+  def norm2(): float = @x * @x + @y * @y + @z * @z
+end
+class Counter
+  def init(@count: int, @total: float)
+  end
+  def add(n: int): int
+    @count += n
+    @total = @total + n
+    @count
+  end
+  def count(): int = @count
+end
+def total(ps: [Vec2]): float
+  let t = 0.0
+  for p in ps
+    t += p.norm2()
+  end
+  t
+end
+def bump(c: Counter): int = c.add(1)
+";
+
+#[test]
+fn methods_match_and_are_compiled() {
+    // From the interpreter, from native code (`total`, `scaled`), overridden by a
+    // subclass (abandon: the interpreter redoes the call), fields written.
+    let src = format!(
+        "{SHAPES}let v = Vec2(3.0, 4.0)
+let s = 0.0
+for i in 0..200
+  s += v.norm2() + v.scaled()
+end
+let c = Counter(0, 0.5)
+for i in 1..100
+  c.add(i)
+end
+[s, total([v, Vec2(1.0, 1.0)]), total([v, Vec3(1.0, 2.0, 2.0)]), v.dot(Vec2(2.0, 1.0)),
+ c.count(), bump(c), Vec3(1.0, 1.0, 1.0).scaled()]"
+    );
+    assert_eq!(same(&src), "[15075.0, 27.0, 34.0, 10.0, 5050, 5051, 6.0]");
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    e.eval(&src).unwrap();
+    for (t, m) in [("Vec2", "norm2"), ("Vec2", "dot"), ("Counter", "add")] {
+        assert!(e.is_native_method(t, m), "`{t}.{m}` should be compiled");
+    }
+    // A native caller of a method that writes fields: interpreted (an abandon would
+    // redo the writes).
+    assert!(!e.is_native("bump"));
+    // `total` and `scaled` call `norm2` directly; on a `Vec3` (which redefines it) the
+    // native code is abandoned, and they stay interpreted from then on.
+    let mut e = Engine::new();
+    e.eval(&format!(
+        "{SHAPES}Vec2(1.0, 2.0).scaled() + total([Vec2(1.0, 1.0)])"
+    ))
+    .unwrap();
+    assert!(e.is_native_method("Vec2", "scaled"));
+    assert!(e.is_native("total"));
+    assert_eq!(
+        e.eval_as::<f64>("Vec3(1.0, 1.0, 1.0).scaled()").unwrap(),
+        6.0
+    );
+    assert!(!e.is_native_method("Vec2", "scaled"));
+}
+
+#[test]
+fn methods_errors_match_the_interpreter() {
+    // Field read before being initialized (method called by `init`): abandoned on entry.
+    same(
+        "class A\n  def init(@a: int)\n    @b = self.twice()\n  end\n  b: int = 0\n  def twice(): int = @b * 2\nend\nA(1)",
+    );
+    same(
+        "class A\n  def init(@n: int)\n  end\n  def big(): int = @n * 9223372036854775807\nend\nA(2).big()",
+    );
+    same(
+        "class A\n  def init(@n: int)\n  end\n  def half(d: int): int = @n / d\nend\nlet a = A(4)\n[a.half(2), a.half(0)]",
+    );
+}

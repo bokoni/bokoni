@@ -1310,9 +1310,14 @@ impl Runtime {
     /// Runs `proto` natively if it is (or becomes) compiled; `None` otherwise.
     #[cfg(feature = "jit")]
     fn try_jit(&mut self, proto: &Rc<Proto>, regs: &[Value]) -> Option<R> {
-        if !self.jit_enabled || proto.kind != ProtoKind::Function {
+        if !self.jit_enabled {
             return None;
         }
+        let method = match proto.kind {
+            ProtoKind::Function => false,
+            ProtoKind::Method if matches!(regs[0], Value::Object(_)) => true,
+            _ => return None,
+        };
         // `forall` function: its copy typed for these arguments (`T = int`).
         let spec;
         let proto = if proto.is_generic() {
@@ -1322,6 +1327,15 @@ impl Runtime {
             proto
         };
         if matches!(*proto.jit.borrow(), JitState::Untried) {
+            // Method: compiled for the class that declares it (`self` in register 0).
+            let this = match &regs[0] {
+                Value::Object(o) if method => {
+                    let info = o.borrow().info.clone();
+                    let name = proto.decl.as_ref()?.name;
+                    Some(crate::objects::method_owner(&info, name, proto))
+                }
+                _ => None,
+            };
             if self.jit.is_none() {
                 self.jit = crate::jit::Jit::new();
                 if self.jit.is_none() {
@@ -1332,16 +1346,16 @@ impl Runtime {
             }
             let jit = self.jit.as_mut()?;
             jit.len_sym = self.syms.len;
-            jit.compile(proto, &mut self.globals);
+            jit.compile(proto, this, &mut self.globals);
         }
         let state = proto.jit.borrow();
         let JitState::Native(code) = &*state else {
             return None;
         };
-        let args: Vec<Value> = proto
-            .params
-            .iter()
-            .map(|p| regs[p.reg as usize].clone())
+        let args: Vec<Value> = method
+            .then(|| regs[0].clone())
+            .into_iter()
+            .chain(proto.params.iter().map(|p| regs[p.reg as usize].clone()))
             .collect();
         let jit = self.jit.as_mut()?;
         let r = jit.call(code, &args, self.depth, self.max_depth);
