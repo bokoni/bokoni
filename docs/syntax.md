@@ -420,12 +420,11 @@ print(u.name)
 # commentaire sur une ligne
 ```
 
-## Annotations (prévu : version 2)
+## Annotations
 
 > Inspiré de [Crystal](https://crystal-lang.org/reference/1.22/syntax_and_semantics/annotations/index.html).
-> Pas dans la version 1 : l'AST doit cependant déjà pouvoir les porter.
 
-Une annotation attache des métadonnées à une déclaration. Elle ne change rien à l'exécution par elle-même : elle est lue par les macros ou par le code Rust hôte.
+Une annotation attache des métadonnées à une déclaration. Elle ne change rien à l'exécution par elle-même : elle est lue par le code Rust hôte (et, plus tard, par les macros).
 
 ### Déclaration
 
@@ -477,10 +476,15 @@ end
 - Cibles : `type`, `class`, `enum`, variante d'enum, champ, méthode, fonction, paramètre.
 - Arguments nommés (`min: 1`) ou positionnels dans l'ordre des champs (`Validate(1, 65535)`).
 - Plusieurs annotations, y compris du même type, sur une même cible.
+- Les arguments sont vérifiés avant l'exécution, comme une construction : annotation
+  inconnue, champ inexistant, type d'argument, champ obligatoire manquant.
+- Ils sont évalués **à la lecture** (depuis Rust), pas à la déclaration ; ce sont des
+  constantes : ils peuvent utiliser des globales (`@[Limit(MAX + 2)]`), pas des variables
+  locales.
 
 ### Lecture
 
-Dans une macro (version 3) :
+Dans une macro (prévu : version 3) :
 
 ```ruby
 macro validate_fields
@@ -502,16 +506,23 @@ end
 - `x.annotations(A)` / `x.annotations()` : toutes les annotations `A` / toutes.
 - Les arguments se lisent comme des champs : `v.min`, `v.max`.
 
-Depuis Rust (version 2, sans macros) :
+Depuis Rust :
 
 ```rust
-let ty = engine.type_info("Server")?;
+let ty = engine.type_info("Server")?;          // aussi : function_info, enum_info
 for field in ty.fields() {
     if let Some(v) = field.annotation("Validate") {
         let min: Option<i64> = v.get("min")?;
     }
 }
+let doc = ty.doc();                              // texte de @[Doc("…")]
+let obsolete = ty.field("host").unwrap().deprecated(); // Some(Some("utiliser address"))
 ```
+
+`type_info`, `function_info` et `enum_info` renvoient une description (champs avec leur
+type, méthodes, paramètres, variantes avec leur valeur) qui ne dépend plus du moteur. Sur
+chaque élément : `annotation(nom)` (la dernière), `annotations(nom)`, `all_annotations()`,
+`doc()`, `deprecated()` ; sur une annotation : `name()`, `fields()`, `get::<T>(champ)`.
 
 ### Annotations intégrées
 
@@ -519,6 +530,23 @@ for field in ty.fields() {
 |------------------------|---------------------------------------------------------|
 | `@[Deprecated(msg?)]`  | avertissement à chaque utilisation                      |
 | `@[Doc("…")]`          | documentation (alternative aux commentaires)            |
+
+Elles sont déclarées par le moteur comme des annotations ordinaires
+(`Deprecated(message: str? = nil)`, `Doc(text: str)`).
+
+L'avertissement de `Deprecated` est émis par la vérification, avant l'exécution, à chaque
+utilisation : appel ou mention d'une fonction, d'un type, d'un enum, d'une variante
+(`Protocol::Ftp`), lecture ou passage par nom d'un champ, appel d'une méthode — y compris
+depuis un script suivant. Depuis Rust : `engine.take_warnings()` ou
+`engine.set_warning_handler(…)` ; l'exécutable les affiche sur la sortie d'erreur.
+
+```text
+avertissement: `plus` est obsolète : utiliser add
+ --> script.bk:17:7
+   |
+17 | print(plus(1, 2))
+   |       ^^^^
+```
 
 ## Macros (prévu : version 3)
 
@@ -581,7 +609,7 @@ Point(x: 1).to_s()            # "Point(x=1, y=0)"
 
 - AST complet avec positions source (fichier, ligne, colonne) sur chaque nœud.
 - AST sérialisable et affichable en code source (`stringify`).
-- Le parseur accepte et conserve `@[…]` même si rien ne les exploite encore.
+- Le parseur accepte et conserve `@[…]` (fait : les annotations sont lues depuis Rust).
 
 ## Mots réservés
 

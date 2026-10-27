@@ -50,6 +50,16 @@ let s: i64 = engine.call_as("square", (7,))?;        // 49
 Les arguments et retours sont convertis automatiquement (`i64`, `f64`, `bool`, `String`,
 `Vec<T>`, `Option<T>`, `Value`…) ; une fonction peut renvoyer `Result<T, E: Display>`.
 
+Les déclarations du script et leurs annotations se lisent depuis Rust :
+
+```rust
+engine.eval("annotation Column\n  name: str\nend\n\
+             type User\n  @[Column(\"user_name\")]\n  name: str = \"\"\nend")?;
+let ty = engine.type_info("User")?;
+let col = ty.field("name").unwrap().annotation("Column").unwrap();
+let column: String = col.get("name")?;               // "user_name"
+```
+
 ## Exécutable
 
 ```sh

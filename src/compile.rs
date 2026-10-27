@@ -1606,6 +1606,14 @@ impl Compiler<'_> {
                 ));
                 continue;
             };
+            let text = self
+                .ast
+                .get(u.args)
+                .first()
+                .and_then(|a| match self.ast.kind(a.value) {
+                    ExprKind::Str(s) => Some(Rc::from(self.i.resolve(s))),
+                    _ => None,
+                });
             let label = format!("@[{}]", self.i.resolve(*name));
             self.begin(ProtoKind::Annotation, label.into());
             self.push_scope(false);
@@ -1619,6 +1627,7 @@ impl Compiler<'_> {
                 name: *name,
                 make,
                 span: u.span,
+                text,
             });
         }
         self.fns = saved;

@@ -9,6 +9,9 @@ pub enum ErrorKind {
     Syntax,
     Runtime,
     Type,
+    /// Avertissement (n'empêche pas l'exécution) : utilisation d'une déclaration
+    /// `@[Deprecated]`…
+    Warning,
 }
 
 /// Erreur de compilation ou d'exécution.
@@ -70,6 +73,10 @@ impl Error {
         Error::new(ErrorKind::Type, message, Some(span))
     }
 
+    pub fn warning(message: impl Into<String>, span: Span) -> Self {
+        Error::new(ErrorKind::Warning, message, Some(span))
+    }
+
     /// Affiche l'erreur avec la ligne fautive soulignée.
     ///
     /// ```text
@@ -90,6 +97,7 @@ impl Error {
             ErrorKind::Syntax => "erreur de syntaxe",
             ErrorKind::Runtime => "erreur d'exécution",
             ErrorKind::Type => "erreur de type",
+            ErrorKind::Warning => "avertissement",
         };
         let mut out = format!("{title}: {}\n", self.message);
         let Some(span) = self.span else {

@@ -47,6 +47,8 @@ fn main() -> ExitCode {
     }
 
     let mut engine = Engine::new();
+    // Avertissements (déclarations `@[Deprecated]`…) : affichés avant l'exécution.
+    engine.set_warning_handler(|w| eprint!("{}", w.render("", "")));
     engine.set_jit(jit);
     match code {
         None if ast || ir => usage_error("`--ast` / `--ir` attendent un fichier ou `-e`"),

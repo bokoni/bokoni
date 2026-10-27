@@ -93,6 +93,9 @@ pub struct AnnotationIr {
     /// Construit l'objet annotation : fonction sans paramètre, évaluée à la lecture.
     pub make: Rc<Proto>,
     pub span: Span,
+    /// Premier argument, si c'est une chaîne littérale (message de `Deprecated`, lu par le
+    /// vérificateur sans exécuter le code).
+    pub text: Option<Rc<str>>,
 }
 
 /// Annotations d'une déclaration, dans l'ordre d'écriture.

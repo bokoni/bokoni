@@ -197,3 +197,52 @@ fn constants_and_later_scripts() {
     let err = e.function_info("g").unwrap_err().to_string();
     assert!(err.contains("division par zéro"), "{err}");
 }
+
+#[test]
+fn deprecated_uses_are_warned() {
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    // Déclarations dans un premier script…
+    e.eval(SPEC).unwrap();
+    // Une déclaration n'est pas une utilisation ; `address` lit bien `host`.
+    let w: Vec<String> = e
+        .take_warnings()
+        .iter()
+        .map(|w| w.message.clone())
+        .collect();
+    assert_eq!(w, ["`Server.host` est obsolète : utiliser address"]);
+    // …utilisations dans le suivant (déclarations importées) : avertissements, et le
+    // script s'exécute.
+    let v = e
+        .eval("let s = Server(host: \"a\")\n[plus(1, 2), s.host, Protocol::Ftp.value, Protocol::Tcp.value, s.port]")
+        .unwrap();
+    assert_eq!(e.inspect(&v), "[3, \"a\", \"FTP\", \"TCP\", 80]");
+    let w: Vec<String> = e
+        .take_warnings()
+        .iter()
+        .map(|w| w.message.clone())
+        .collect();
+    assert_eq!(
+        w,
+        [
+            "`Server.host` est obsolète : utiliser address",
+            "`plus` est obsolète : utiliser add",
+            "`Server.host` est obsolète : utiliser address",
+            "`Protocol::Ftp` est obsolète",
+        ]
+    );
+    assert!(e.take_warnings().is_empty());
+
+    // Dans le même script, avec un gestionnaire : appelé avant l'exécution.
+    let mut e = Engine::new();
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let (l1, l2) = (log.clone(), log.clone());
+    e.set_output(move |s| l1.borrow_mut().push(format!("print {s}")));
+    e.set_warning_handler(move |w| l2.borrow_mut().push(w.to_string()));
+    e.eval("@[Deprecated(\"non\")]\ndef old() = 1\nclass C\n  @[Deprecated]\n  def m() = 2\nend\nprint(old() + C().m())").unwrap();
+    let log = log.borrow();
+    assert_eq!(log.len(), 3, "{log:?}");
+    assert!(log[0].contains("`old` est obsolète : non"), "{log:?}");
+    assert!(log[1].contains("`C.m` est obsolète"), "{log:?}");
+    assert!(log[2].starts_with("print 3"), "{log:?}");
+}

@@ -32,7 +32,13 @@ use std::rc::Rc;
 pub struct Engine {
     rt: Runtime,
     static_checks: bool,
+    /// Avertissements de la vérification statique, en attente de lecture.
+    warnings: Vec<Error>,
+    /// Gestionnaire des avertissements (sinon, gardés pour `take_warnings`).
+    on_warning: Option<WarningHandler>,
 }
+
+type WarningHandler = Box<dyn FnMut(&Error)>;
 
 impl Default for Engine {
     fn default() -> Self {
@@ -57,6 +63,8 @@ impl Engine {
         let mut e = Engine {
             rt: Runtime::new(),
             static_checks: true,
+            warnings: Vec::new(),
+            on_warning: None,
         };
         e.eval_named(PRELUDE, "<prélude>")
             .expect("le prélude se compile");
@@ -66,6 +74,18 @@ impl Engine {
     /// Redirige la sortie de `print` (par défaut : la sortie standard).
     pub fn set_output(&mut self, f: impl FnMut(&str) + 'static) {
         self.rt.output = Box::new(f);
+    }
+
+    /// Avertissements de la vérification statique depuis le dernier appel (utilisation
+    /// d'une déclaration `@[Deprecated]`…) : ils n'empêchent pas l'exécution.
+    pub fn take_warnings(&mut self) -> Vec<Error> {
+        std::mem::take(&mut self.warnings)
+    }
+
+    /// Reçoit chaque avertissement dès la vérification, avant l'exécution du script
+    /// (au lieu de les garder pour [`take_warnings`](Self::take_warnings)).
+    pub fn set_warning_handler(&mut self, f: impl FnMut(&Error) + 'static) {
+        self.on_warning = Some(Box::new(f));
     }
 
     /// Active ou désactive la vérification statique des noms et des types avant
@@ -218,8 +238,15 @@ impl Engine {
         };
         let program = parser::parse(src, &mut self.rt.interner).map_err(with_src)?;
         let prims = if self.static_checks {
-            let (errors, prims) =
+            let (errors, warnings, prims) =
                 crate::check::check(&program, &self.rt.interner, &self.rt.globals);
+            for mut w in warnings {
+                w.src = Some((script.name.clone(), script.src.clone()));
+                match &mut self.on_warning {
+                    Some(f) => f(&w),
+                    None => self.warnings.push(w),
+                }
+            }
             if !errors.is_empty() {
                 return Err(with_src(Errors::new(errors)));
             }

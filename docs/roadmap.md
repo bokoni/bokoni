@@ -164,9 +164,23 @@ Temps compilation comprise.
 | vecteurs créés en code typé (1 M)       | 409 ms  | 73 ms      | ×5,6 |
 | `fib(25)` interprété (`--no-jit`)       | 28 ms   | 18 ms      | ×1,6 |
 
+### v0.6 — Annotations
+
+- [x] Arguments vérifiés avant l'exécution (comme une construction de `type`), y compris
+      pour les annotations déclarées dans un script précédent
+- [x] Conservées sur toutes les cibles (type, class, enum, variante, champ, méthode,
+      fonction, paramètre) : chaque `@[…]` est compilé en une petite fonction évaluée à
+      la lecture
+- [x] API Rust : `Engine::type_info` / `function_info` / `enum_info`, descriptions avec
+      `annotation(nom)`, `annotations(nom)`, `doc()`, `deprecated()`,
+      `Annotation::get::<T>(champ)` (module `reflect`)
+- [x] `Deprecated` et `Doc` déclarées par un prélude ; avertissement à chaque utilisation
+      d'une déclaration `@[Deprecated]` (`ErrorKind::Warning`, `Engine::take_warnings`,
+      `Engine::set_warning_handler`, affichés par l'exécutable)
+- [ ] Paramètre `@[Deprecated]` : pas d'avertissement quand l'argument est passé
+
 ### Ensuite
 
-- Annotations lisibles depuis Rust (v2 de `syntax.md`)
 - Macros à la Crystal (v3 de `syntax.md`)
 
 ## Décisions qui engagent le JIT

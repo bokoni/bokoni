@@ -28,7 +28,11 @@ use std::rc::Rc;
 ///
 /// Renvoie les erreurs, et le type déduit des variables `int` / `float` / `bool` (par
 /// position de leur déclaration) : le compilateur en fait des registres typés.
-pub fn check(program: &Program, interner: &Interner, globals: &Globals) -> (Vec<Error>, Prims) {
+pub fn check(
+    program: &Program,
+    interner: &Interner,
+    globals: &Globals,
+) -> (Vec<Error>, Vec<Error>, Prims) {
     let mut c = Checker {
         ast: &program.ast,
         i: interner,
@@ -41,9 +45,11 @@ pub fn check(program: &Program, interner: &Interner, globals: &Globals) -> (Vec<
         quiet: 0,
         imported: FxHashMap::default(),
         prims: Prims::default(),
+        warnings: Vec::new(),
+        deprecated_fns: FxHashMap::default(),
     };
     c.block_stmts(&program.body);
-    (c.errors, c.prims)
+    (c.errors, c.warnings, c.prims)
 }
 
 /// Types `int` / `float` / `bool` connus avec certitude, transmis au compilateur.
@@ -201,7 +207,11 @@ struct TypeDef {
     kind: TypeDeclKind,
     fields: Vec<FieldDef>,
     methods: FxHashMap<Symbol, Rc<FnSig>>,
+    deprecated: Option<Dep>,
 }
+
+/// `@[Deprecated(message?)]` : le message, s'il est écrit en littéral.
+type Dep = Option<Rc<str>>;
 
 struct FieldDef {
     name: Symbol,
@@ -209,6 +219,7 @@ struct FieldDef {
     has_default: bool,
     /// Type annoté (vérifié à l'exécution), et non déduit de la valeur par défaut.
     annotated: bool,
+    deprecated: Option<Dep>,
 }
 
 struct EnumDef {
@@ -216,6 +227,8 @@ struct EnumDef {
     variants: Vec<Symbol>,
     value_ty: Ty,
     methods: FxHashMap<Symbol, Rc<FnSig>>,
+    deprecated: Option<Dep>,
+    variants_deprecated: Vec<Option<Dep>>,
 }
 
 // ─── Portées ────────────────────────────────────────────────────────────────
@@ -271,6 +284,9 @@ struct Checker<'a> {
     /// Types et enums déjà définis à l'exécution, importés (clé : adresse du `Rc`).
     imported: FxHashMap<usize, Ty>,
     prims: Prims,
+    warnings: Vec<Error>,
+    /// Fonctions et méthodes `@[Deprecated]` (clé : adresse de la signature).
+    deprecated_fns: FxHashMap<usize, Dep>,
 }
 
 /// Bloc de construction d'un type inconnu : assignations libres, sans erreur en cascade.
@@ -374,6 +390,68 @@ impl Checker<'_> {
         if self.quiet == 0 {
             self.errors.push(Error::type_error(msg, span));
         }
+    }
+
+    // ─── Déclarations obsolètes (`@[Deprecated]`) ────────────────────────────
+
+    /// `@[Deprecated(message?)]` parmi les annotations source.
+    fn ast_deprecation(&self, anns: &[AnnotationUse]) -> Option<Dep> {
+        let a = anns
+            .iter()
+            .rev()
+            .find(|a| matches!(a.path.as_slice(), [n] if self.name(*n) == "Deprecated"))?;
+        Some(
+            self.ast
+                .get(a.args)
+                .first()
+                .and_then(|arg| match self.ast.kind(arg.value) {
+                    ExprKind::Str(s) => Some(Rc::from(self.name(s))),
+                    _ => None,
+                }),
+        )
+    }
+
+    /// `@[Deprecated(message?)]` parmi les annotations d'une déclaration déjà compilée.
+    fn ir_deprecation(&self, anns: &crate::ir::Annotations) -> Option<Dep> {
+        let a = anns
+            .iter()
+            .rev()
+            .find(|a| self.name(a.name) == "Deprecated")?;
+        Some(a.text.clone())
+    }
+
+    fn mark_fn(&mut self, sig: &Rc<FnSig>, dep: Option<Dep>) {
+        if let Some(d) = dep {
+            self.deprecated_fns.insert(Rc::as_ptr(sig) as usize, d);
+        }
+    }
+
+    /// Avertit si la déclaration utilisée (`what`) est obsolète.
+    fn warn_deprecated(&mut self, dep: Option<&Dep>, what: &str, span: Span) {
+        let Some(dep) = dep else { return };
+        if self.quiet > 0 {
+            return;
+        }
+        let msg = match dep {
+            Some(m) => format!("{what} est obsolète : {m}"),
+            None => format!("{what} est obsolète"),
+        };
+        self.warnings.push(Error::warning(msg, span));
+    }
+
+    /// Avertit si la valeur nommée `name` (fonction, type, enum) est obsolète.
+    fn warn_value(&mut self, ty: &Ty, name: Symbol, span: Span) {
+        let dep = match ty {
+            Ty::Fn(sig) => self
+                .deprecated_fns
+                .get(&(Rc::as_ptr(sig) as usize))
+                .cloned(),
+            Ty::TypeValue(id) if *id != UNKNOWN_TYPE => self.types[*id].deprecated.clone(),
+            Ty::EnumValue(id) => self.enums[*id].deprecated.clone(),
+            _ => None,
+        };
+        let what = format!("`{}`", self.name(name));
+        self.warn_deprecated(dep.as_ref(), &what, span);
     }
 
     fn show(&self, t: &Ty) -> String {
@@ -499,6 +577,8 @@ impl Checker<'_> {
                             false,
                         );
                         self.quiet -= 1;
+                        let dep = self.ir_deprecation(&c.proto.annotations);
+                        self.mark_fn(&sig, dep);
                         Ty::Fn(sig)
                     }
                     None => Ty::Any,
@@ -517,11 +597,13 @@ impl Checker<'_> {
         }
         let id = self.types.len();
         let name = self.i.get(&info.name).unwrap_or(Symbol(0));
+        let deprecated = self.ir_deprecation(&info.annotations);
         self.types.push(TypeDef {
             name,
             kind: info.kind,
             fields: Vec::new(),
             methods: FxHashMap::default(),
+            deprecated,
         });
         self.imported.insert(key, Ty::TypeValue(id));
         self.quiet += 1;
@@ -533,6 +615,7 @@ impl Checker<'_> {
                 ty: f.ty.as_ref().map_or(Ty::Any, |t| self.resolve(&t.expr)),
                 has_default: f.default.is_some(),
                 annotated: f.ty.is_some(),
+                deprecated: self.ir_deprecation(&f.annotations),
             })
             .collect();
         let methods = info
@@ -552,11 +635,19 @@ impl Checker<'_> {
             return *id;
         }
         let id = self.enums.len();
+        let deprecated = self.ir_deprecation(&e.annotations);
+        let variants_deprecated = e
+            .variant_annotations
+            .iter()
+            .map(|a| self.ir_deprecation(a))
+            .collect();
         self.enums.push(EnumDef {
             name: self.i.get(&e.name).unwrap_or(Symbol(0)),
             variants: e.variants.iter().map(|(n, _)| *n).collect(),
             value_ty: union(e.variants.iter().map(|(_, v)| value_ty(v)).collect()),
             methods: FxHashMap::default(),
+            deprecated,
+            variants_deprecated,
         });
         self.imported.insert(key, Ty::EnumValue(id));
         self.quiet += 1;
@@ -573,7 +664,12 @@ impl Checker<'_> {
     /// Signature d'une méthode déjà compilée (à partir de sa déclaration source).
     fn proto_signature(&mut self, p: &crate::ir::Proto) -> Rc<FnSig> {
         match &p.decl {
-            Some(d) => self.signature(d.params.as_deref().unwrap_or(&[]), d.ret.as_ref(), false),
+            Some(d) => {
+                let sig = self.signature(d.params.as_deref().unwrap_or(&[]), d.ret.as_ref(), false);
+                let dep = self.ir_deprecation(&p.annotations);
+                self.mark_fn(&sig, dep);
+                sig
+            }
             None => Rc::new(FnSig {
                 params: Vec::new(),
                 ret: RefCell::new(Ty::Any),
@@ -719,22 +815,32 @@ impl Checker<'_> {
             match &s.kind {
                 StmtKind::Type(t) => {
                     let id = self.types.len();
+                    let deprecated = self.ast_deprecation(&t.annotations);
                     self.types.push(TypeDef {
                         name: t.name,
                         kind: t.kind,
                         fields: Vec::new(),
                         methods: FxHashMap::default(),
+                        deprecated,
                     });
                     self.declare(t.name, Ty::TypeValue(id), VarKind::Type);
                     pending_types.push((id, &**t));
                 }
                 StmtKind::Enum(e) => {
                     let id = self.enums.len();
+                    let deprecated = self.ast_deprecation(&e.annotations);
+                    let variants_deprecated = e
+                        .variants
+                        .iter()
+                        .map(|v| self.ast_deprecation(&v.annotations))
+                        .collect();
                     self.enums.push(EnumDef {
                         name: e.name,
                         variants: e.variants.iter().map(|v| v.name).collect(),
                         value_ty: Ty::Any,
                         methods: FxHashMap::default(),
+                        deprecated,
+                        variants_deprecated,
                     });
                     self.declare(e.name, Ty::EnumValue(id), VarKind::Type);
                 }
@@ -759,6 +865,7 @@ impl Checker<'_> {
                             ty,
                             has_default: f.default.is_some(),
                             annotated: f.ty.is_some(),
+                            deprecated: self.ast_deprecation(&f.annotations),
                         });
                     }
                     Member::Method(f) => {
@@ -767,6 +874,8 @@ impl Checker<'_> {
                             f.ret.as_ref(),
                             false,
                         );
+                        let dep = self.ast_deprecation(&f.annotations);
+                        self.mark_fn(&sig, dep);
                         methods.insert(f.name, sig);
                     }
                     Member::Stmt(_) => {}
@@ -787,6 +896,7 @@ impl Checker<'_> {
                             ty,
                             has_default: false,
                             annotated: p.ty.is_some(),
+                            deprecated: self.ast_deprecation(&p.annotations),
                         });
                     }
                 }
@@ -816,6 +926,8 @@ impl Checker<'_> {
                             m.ret.as_ref(),
                             false,
                         );
+                        let dep = self.ast_deprecation(&m.annotations);
+                        self.mark_fn(&sig, dep);
                         (m.name, sig)
                     })
                     .collect();
@@ -825,6 +937,8 @@ impl Checker<'_> {
         for s in &b.stmts {
             if let StmtKind::Def(f) = &s.kind {
                 let sig = self.signature(f.params.as_deref().unwrap_or(&[]), f.ret.as_ref(), false);
+                let dep = self.ast_deprecation(&f.annotations);
+                self.mark_fn(&sig, dep);
                 self.declare(f.name, Ty::Fn(sig), VarKind::Func);
             }
         }
@@ -893,7 +1007,16 @@ impl Checker<'_> {
             StmtKind::Def(f) => {
                 let sig = match self.lookup(f.name).map(|(v, _)| v.ty.clone()) {
                     Some(Ty::Fn(sig)) => sig,
-                    _ => self.signature(f.params.as_deref().unwrap_or(&[]), f.ret.as_ref(), false),
+                    _ => {
+                        let sig = self.signature(
+                            f.params.as_deref().unwrap_or(&[]),
+                            f.ret.as_ref(),
+                            false,
+                        );
+                        let dep = self.ast_deprecation(&f.annotations);
+                        self.mark_fn(&sig, dep);
+                        sig
+                    }
                 };
                 self.function(f, &sig, None);
                 Ty::Nil
@@ -1459,10 +1582,13 @@ impl Checker<'_> {
                     self.error(msg, span);
                     return Ty::Any;
                 }
-                v.ty.clone()
+                let ty = v.ty.clone();
+                self.warn_value(&ty, name, span);
+                ty
             }
             None => {
                 if let Some((t, _)) = self.global_ty(name) {
+                    self.warn_value(&t, name, span);
                     return t;
                 }
                 let hint = suggest(self.name(name), self.known_names());
@@ -1525,7 +1651,11 @@ impl Checker<'_> {
         };
         match head_ty {
             Some(Ty::EnumValue(id)) => {
-                if !self.enums[id].variants.contains(variant) {
+                if let Some(k) = self.enums[id].variants.iter().position(|v| v == variant) {
+                    let dep = self.enums[id].variants_deprecated.get(k).cloned().flatten();
+                    let what = format!("`{}::{}`", self.name(*head), self.name(*variant));
+                    self.warn_deprecated(dep.as_ref(), &what, span);
+                } else {
                     let names: Vec<&str> = self.enums[id]
                         .variants
                         .iter()
@@ -1923,10 +2053,12 @@ impl Checker<'_> {
             match idx {
                 Some(i) => {
                     given[i] = true;
-                    let (fname, fty) = {
+                    let (fname, fty, dep) = {
                         let f = &self.types[id].fields[i];
-                        (f.name, f.ty.clone())
+                        (f.name, f.ty.clone(), f.deprecated.clone())
                     };
+                    let what = format!("`{tname}.{}`", self.name(fname));
+                    self.warn_deprecated(dep.as_ref(), &what, ast.span(a.value));
                     let label = format!(" pour le champ `{}`", self.name(fname));
                     self.expect(a.value, &fty, &label);
                 }
@@ -2111,6 +2243,14 @@ impl Checker<'_> {
                 let method = def.methods.get(&name).cloned();
                 let is_class = def.kind == TypeDeclKind::Class;
                 let inside = self.this_type() == Some(id);
+                let dep = def
+                    .fields
+                    .iter()
+                    .find(|f| f.name == name)
+                    .and_then(|f| f.deprecated.clone());
+                let full = format!("`{}.{n}`", self.name(def.name));
+                self.warn_deprecated(dep.as_ref(), &full, span);
+                let def = &self.types[id];
                 match (field, method) {
                     (Some(t), _) if !is_class || inside => t,
                     (_, Some(sig)) if sig.params.iter().all(|p| p.has_default) => {
@@ -2225,6 +2365,12 @@ impl Checker<'_> {
                 let id = *id;
                 if let Some(sig) = self.types[id].methods.get(&name).cloned() {
                     let what = format!("`{n}`");
+                    let dep = self
+                        .deprecated_fns
+                        .get(&(Rc::as_ptr(&sig) as usize))
+                        .cloned();
+                    let full = format!("`{}.{n}`", self.name(self.types[id].name));
+                    self.warn_deprecated(dep.as_ref(), &full, span);
                     self.check_args(&sig, args, block, span, &what);
                     let ret = sig.ret.borrow().clone();
                     return ret;
@@ -2245,6 +2391,12 @@ impl Checker<'_> {
             Ty::Variant(id) => {
                 if let Some(sig) = self.enums[*id].methods.get(&name).cloned() {
                     let what = format!("`{n}`");
+                    let dep = self
+                        .deprecated_fns
+                        .get(&(Rc::as_ptr(&sig) as usize))
+                        .cloned();
+                    let full = format!("`{}.{n}`", self.name(self.enums[*id].name));
+                    self.warn_deprecated(dep.as_ref(), &full, span);
                     self.check_args(&sig, args, block, span, &what);
                     let ret = sig.ret.borrow().clone();
                     return ret;
