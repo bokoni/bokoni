@@ -174,9 +174,44 @@ Times include compilation.
 - [x] `@[Deprecated]` parameter: a warning when the argument is passed (by position or
       by name)
 
+### v0.7 — Error handling
+
+Modeled on Crystal (see `syntax.md`, *Error handling*).
+
+- [x] `raise "message"` (an `Error`, declared by the prelude) or `raise obj` (any
+      object); `begin` / `rescue e: T` / `else` / `ensure`, also directly on the body of
+      a `def` or a `do` block
+- [x] Runtime errors (division by zero, index, too many nested calls…) rescued as an
+      `Error`; an error no clause matches goes on up unchanged (position and call stack)
+- [x] `ensure` on every way out: end of the body, `rescue`, `return` / `break` / `next`
+      (its code is repeated before each jump), error going on up
+- [x] Zero cost when nothing is raised: each IR block knows its handler (exception
+      table); the interpreter only looks at it when an instruction fails. Functions
+      with a `rescue` / `ensure` stay interpreted; errors raised in compiled code
+      (typed or baseline) reach them as before
+- [x] Static checks: type of the `rescue` variable, `raise` of a value that is neither a
+      string nor an object
+- [ ] Inheritance, so that custom errors can be rescued as an `Error`
+- [ ] `?` variants of the built-in methods that return `nil` instead of raising
+      (`to_i?`, `[]?`), as in Crystal
+
 ### Next
 
-- Crystal-style macros (v3 of `syntax.md`)
+In suggested order:
+
+1. **Modules / imports** between files.
+2. **Generics** (`[T]` in signatures): typed `map` / `filter` and user functions over
+   lists; lets the typed JIT compile more code.
+3. **Inheritance or interfaces** for `class` (single inheritance + mixins, or structural
+   interfaces); custom errors would then be rescued as an `Error`.
+4. **Crystal-style macros** (v3 of `syntax.md`): hygiene and AST exposure still open;
+   benefit from generics and modules.
+
+No design decision needed:
+
+- Free local functions that capture themselves (reference cycle).
+- `for` without copying the list it walks.
+- Typed registers for globals, not only locals.
 
 ## Decisions that commit the JIT
 

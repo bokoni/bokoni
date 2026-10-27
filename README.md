@@ -30,6 +30,19 @@ type error: `str` has no method `lenght` (did you mean `len`?)
 Gradual typing: only certain errors are reported; everything else is checked at run
 time.
 
+Errors are exceptions, as in Crystal:
+
+```ruby
+let ratio = begin
+  total / count
+rescue e: Error
+  print("cannot compute: #{e.message}")
+  0
+ensure
+  close(file)
+end
+```
+
 Fully typed functions are compiled to native code (Cranelift JIT) on their first call:
 `fib(25)` goes from 28 ms (interpreted) to 0.5 ms. Everything else is interpreted, with
 exactly the same result.

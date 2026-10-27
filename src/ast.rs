@@ -32,7 +32,7 @@ impl LambdaId {
     }
 }
 
-/// Index of a control structure (`if`, `case`, `while`, `for`).
+/// Index of a control structure (`if`, `case`, `while`, `for`, `begin`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ControlId(pub u32);
 
@@ -189,6 +189,7 @@ impl Ast {
             Control::Case(_) => ExprKind::Case(id),
             Control::While(_) => ExprKind::While(id),
             Control::For(_) => ExprKind::For(id),
+            Control::Begin(_) => ExprKind::Begin(id),
         };
         self.controls.push(c);
         self.push(kind, span)
@@ -223,6 +224,13 @@ impl Ast {
         match self.control(id) {
             Control::For(x) => x,
             _ => unreachable!("ControlId does not refer to a `for`"),
+        }
+    }
+
+    pub fn begin(&self, id: ControlId) -> &Begin {
+        match self.control(id) {
+            Control::Begin(x) => x,
+            _ => unreachable!("ControlId does not refer to a `begin`"),
         }
     }
 
@@ -562,6 +570,11 @@ pub enum ExprKind {
     Case(ControlId),
     While(ControlId),
     For(ControlId),
+    /// `begin … rescue … else … ensure … end`, also the body of a `def` or a `do`
+    /// block that has `rescue` / `ensure` clauses.
+    Begin(ControlId),
+    /// `raise value`
+    Raise(ExprId),
     Return(Option<ExprId>),
     Break,
     Next,
@@ -594,6 +607,26 @@ pub struct For {
     pub body: Block,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Begin {
+    pub body: Block,
+    pub rescues: Vec<Rescue>,
+    /// Runs when the body raised nothing (its errors are not rescued here).
+    pub else_: Option<Block>,
+    /// Always runs: after the body, a `rescue`, a `return` / `break` / `next`, or an
+    /// error that goes on up.
+    pub ensure: Option<Block>,
+}
+
+/// `rescue e: T` (the name and the type are optional).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rescue {
+    pub var: Option<(Symbol, Span)>,
+    pub ty: Option<TypeExpr>,
+    pub body: Block,
+    pub span: Span,
+}
+
 /// Control structures, stored separately because they contain blocks.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Control {
@@ -601,4 +634,5 @@ pub enum Control {
     Case(Case),
     While(While),
     For(For),
+    Begin(Begin),
 }

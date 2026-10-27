@@ -33,6 +33,25 @@ pub struct ErrorData {
     /// Script where the error occurred: (name, source). Set by the interpreter, since a
     /// function may come from a script other than the current one.
     pub src: Option<(Rc<str>, Rc<str>)>,
+    /// Object given to `raise` (otherwise a `rescue` receives an `Error`).
+    pub raised: Option<Raised>,
+}
+
+/// Value of a `raise`, carried by the error up to a `rescue`.
+#[derive(Clone)]
+pub struct Raised(pub crate::value::Value);
+
+impl fmt::Debug for Raised {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Raised(…)")
+    }
+}
+
+/// Errors compare by their text: two raised objects are not compared.
+impl PartialEq for Raised {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 impl std::ops::Deref for Error {
@@ -60,6 +79,7 @@ impl Error {
             incomplete: false,
             trace: Vec::new(),
             src: None,
+            raised: None,
         }))
     }
 

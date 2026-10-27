@@ -111,9 +111,9 @@ fn control() {
     assert_eq!(sexp("return"), "(return)");
     assert_eq!(
         sexp(
-            "case port\n  when 80, 443 then \"web\"\n  when 8000..8999\n    \"dev\"\n  else \"autre\"\nend"
+            "case port\n  when 80, 443 then \"web\"\n  when 8000..8999\n    \"dev\"\n  else \"other\"\nend"
         ),
-        "(case port (when (80 443) \"web\") (when ((.. 8000 8999)) \"dev\") (else \"autre\"))"
+        "(case port (when (80 443) \"web\") (when ((.. 8000 8999)) \"dev\") (else \"other\"))"
     );
     assert_eq!(
         sexp("while x < 3\n  x += 1\nend"),
@@ -124,6 +124,22 @@ fn control() {
         "(for (k v) h (call print k))"
     );
     assert_eq!(sexp("for i in 0...n\nend"), "(for (i) (... 0 n))");
+    assert_eq!(
+        sexp(
+            "begin\n  f(1)\nrescue e: A | B\n  1\nrescue Error\n  2\nrescue\n  3\nelse\n  4\nensure\n  5\nend"
+        ),
+        "(begin (call f 1) (rescue e : A | B 1) (rescue : Error 2) (rescue 3) (else 4) (ensure 5))"
+    );
+    assert_eq!(sexp("raise \"x\" if bad"), "(if bad (then (raise \"x\")))");
+    // `def` and `do` blocks with clauses: an implicit `begin`.
+    assert_eq!(
+        sexp("def g()\n  1\nrescue\n  2\nend"),
+        "(def g () (begin 1 (rescue 2)))"
+    );
+    assert_eq!(
+        sexp("xs.map do |x|\n  x\nensure\n  y\nend"),
+        "(.map xs (fn (x) (begin x (ensure y))))"
+    );
 }
 
 #[test]

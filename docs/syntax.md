@@ -277,6 +277,71 @@ end
 
 End-of-line modifiers: `expr if cond`, `expr unless cond`.
 
+## Error handling
+
+> Modeled on [Crystal](https://crystal-lang.org/reference/1.22/syntax_and_semantics/exception_handling.html): exceptions, `raise`, `begin` / `rescue` / `else` / `ensure`.
+
+```ruby
+type ConfigError
+  message: str
+  path: str
+end
+
+def load(path: str): str
+  raise ConfigError(message: "missing #{path}", path: path) unless exists(path)
+  read(path)
+end
+
+let text = begin
+  load("app.yml")
+rescue e: ConfigError          # by type (`A | B` for several)
+  print("config: #{e.message} (#{e.path})")
+  ""
+rescue e: Error                # runtime errors: division by zero, index…
+  print(e.message)
+  ""
+else                           # no error in the body
+  print("loaded")
+  ""
+ensure                         # always: after the body, a `rescue`, a `return`…
+  print("done")
+end
+```
+
+- `raise "message"` raises an `Error` (a `type` of the prelude, with a `message: str`
+  field); `raise obj` raises an object of any `type` / `class` as is. Any other value is
+  a type error.
+- Runtime errors (`1 / 0`, an index out of bounds, a type error at run time, too many
+  nested calls…) can be rescued as an `Error`. Syntax errors and errors reported by the
+  static checks cannot: the script does not run.
+- `rescue`, `rescue e`, `rescue e: T`, `rescue T`: clauses are tried in order; a name
+  that starts with an uppercase letter is a type. With no clause matching, the error
+  goes on up unchanged (position and call stack included). There is no inheritance yet:
+  a custom error type is not an `Error`, rescue it by its type or with a bare `rescue`.
+- The value of a `begin` is the value of its body (or of the `else`), or that of the
+  `rescue` clause that ran; the value of `ensure` is ignored.
+- `ensure` also runs when `return`, `break` or `next` leaves the `begin`, and when the
+  error goes on up. An error raised inside `ensure` replaces the first one.
+- The body of a `def` or of a `do` block can take `rescue` / `else` / `ensure` directly,
+  without `begin`:
+
+```ruby
+def parse_port(s: str): int
+  s.to_i()
+rescue
+  80
+end
+
+let ratios = [4, 0, 2].map do |x|
+  100 / x
+rescue
+  nil
+end                            # [25, nil, 50]
+```
+
+- An uncaught error stops the script: `runtime error: ConfigError: missing app.yml`
+  (the `message` field of the object, if it has one).
+
 ## Enum
 
 ```ruby
@@ -612,12 +677,11 @@ Point(x: 1).to_s()            # "Point(x=1, y=0)"
 ## Reserved words
 
 `let def end if elsif else unless then case when while for in do break next return
-type class enum annotation macro true false nil and or not`
+begin rescue ensure raise type class enum annotation macro true false nil and or not`
 
 ## Open questions
 
 - Inheritance / interfaces for `class` (and `type`?).
 - Modules / imports between files.
-- Error handling (`raise` / `rescue` or `Result`).
 - Methods on `type` (allowed, or reserved for `class`).
 - Generics (`[T]`, `fn<T>`).

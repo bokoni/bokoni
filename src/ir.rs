@@ -85,6 +85,20 @@ pub struct Proto {
     pub plain_params: bool,
     /// Annotations of the function (`@[…]` before `def`).
     pub annotations: Annotations,
+    /// `rescue` / `ensure` handlers, referred to by [`Block::handler`].
+    pub handlers: Vec<Handler>,
+    /// Number of slots where a handler keeps the error it caught (`Term::Reraise`).
+    pub nslots: u32,
+}
+
+/// Where an error raised in a block goes (`begin … rescue` / `ensure`).
+#[derive(Clone, Copy, Debug)]
+pub struct Handler {
+    pub block: BlockId,
+    /// Receives the error as a value (the raised object, or an `Error`).
+    pub reg: Reg,
+    /// Keeps the original error, to raise it again unchanged (span and trace).
+    pub slot: u32,
 }
 
 /// Annotation applied to a declaration (`@[Name(args)]`).
@@ -176,6 +190,8 @@ pub struct Block {
     pub spans: Vec<Span>,
     pub term: Term,
     pub term_span: Span,
+    /// Index in [`Proto::handlers`] of the handler for errors raised here.
+    pub handler: Option<u32>,
 }
 
 /// Call: arguments in registers `start..start + npos + named.len()`.
@@ -286,6 +302,10 @@ pub enum Instr {
     Move(Reg, Reg),
     /// Runtime error (message in the constants).
     Fail(u32),
+    /// `raise value`
+    Raise(Reg),
+    /// Does the value match the type (`rescue e: T`)?
+    IsType(Reg, Reg, u32),
 
     // ── Variables
     GetGlobal(Reg, u32),
@@ -460,6 +480,9 @@ pub enum Term {
         body: BlockId,
         done: BlockId,
     },
+    /// Raises again the error kept in a slot (end of an `ensure`, or no `rescue`
+    /// clause matched).
+    Reraise(u32),
 }
 
 // ─── Display ────────────────────────────────────────────────────────────────
@@ -499,7 +522,18 @@ impl Proto {
             let _ = writeln!(out, "  typed registers: {}", typed.join(" "));
         }
         for (n, b) in self.blocks.iter().enumerate() {
-            let _ = writeln!(out, "  b{n}:");
+            match b.handler.map(|h| self.handlers[h as usize]) {
+                Some(h) => {
+                    let _ = writeln!(
+                        out,
+                        "  b{n}: (rescue r{} slot {} -> b{})",
+                        h.reg, h.slot, h.block
+                    );
+                }
+                None => {
+                    let _ = writeln!(out, "  b{n}:");
+                }
+            }
             for ins in &b.instrs {
                 let _ = writeln!(out, "    {}", self.show_instr(ins, i));
             }
@@ -540,6 +574,8 @@ impl Proto {
             Const(d, c) => format!("r{d} = {}", self.consts[*c as usize].inspect(i)),
             Move(d, a) => format!("r{d} = r{a}"),
             Fail(c) => format!("fail {}", self.consts[*c as usize].inspect(i)),
+            Raise(a) => format!("raise r{a}"),
+            IsType(d, a, t) => format!("r{d} = r{a} is {}", self.types[*t as usize].shown),
             GetGlobal(d, g) => format!("r{d} = global[{g}]"),
             SetGlobal(g, a) => format!("global[{g}] = r{a}"),
             DefGlobal { slot, src, mutable } => {
@@ -691,6 +727,7 @@ fn show_term(t: &Term) -> String {
             format!("if r{a} {}i {k} then b{then} else b{else_}", op.as_str())
         }
         Term::Return { reg, .. } => format!("return r{reg}"),
+        Term::Reraise(slot) => format!("reraise slot {slot}"),
         Term::IterNext {
             iter,
             dst,
@@ -711,7 +748,7 @@ impl Term {
             | Term::IfInt { then, else_, .. }
             | Term::IfIntK { then, else_, .. } => vec![then, else_],
             Term::IterNext { body, done, .. } => vec![body, done],
-            Term::Return { .. } => vec![],
+            Term::Return { .. } | Term::Reraise(_) => vec![],
         }
     }
 }

@@ -163,6 +163,7 @@ impl Tracker {
             | T::Macro
             | T::Case
             | T::For
+            | T::Begin
             | T::Do => true,
             T::If | T::Unless | T::While => !self.prev.is_some_and(|p| {
                 matches!(
@@ -301,6 +302,8 @@ fn ends_expr(kind: TokenKind) -> bool {
             | T::Elsif
             | T::When
             | T::Then
+            | T::Rescue
+            | T::Ensure
             | T::RParen
             | T::RBracket
             | T::RBrace
@@ -330,6 +333,10 @@ fn is_keyword(kind: TokenKind) -> bool {
             | T::Break
             | T::Next
             | T::Return
+            | T::Begin
+            | T::Rescue
+            | T::Ensure
+            | T::Raise
             | T::Type
             | T::Class
             | T::Enum
@@ -874,7 +881,7 @@ impl Parser<'_, '_> {
                     self.found()
                 ));
             }
-            self.block_end("def", start)?
+            self.body_end("def", start)?
         };
         Ok(FnDecl {
             name,
@@ -1474,7 +1481,7 @@ impl Parser<'_, '_> {
             Vec::new()
         };
         let saved = std::mem::replace(&mut self.no_do, false);
-        let body = self.block_end("do", start);
+        let body = self.body_end("do", start);
         self.no_do = saved;
         Ok(Lambda {
             params,
@@ -1588,6 +1595,11 @@ impl Parser<'_, '_> {
             T::Case => return self.case_expr(),
             T::While => return self.while_expr(),
             T::For => return self.for_expr(),
+            T::Begin => return self.begin_expr(),
+            T::Raise => {
+                self.bump();
+                ExprKind::Raise(self.expr()?)
+            }
             T::Return => {
                 self.bump();
                 let value = if ends_expr(self.peek()) {
@@ -1609,6 +1621,12 @@ impl Parser<'_, '_> {
                 return self.error_here(
                     "`do` is not used here: start a new line after the condition",
                 );
+            }
+            T::Rescue | T::Ensure => {
+                return self.error_here(format!(
+                    "{} outside of a `begin`, `def` or `do` block",
+                    t.kind.describe()
+                ));
             }
             T::Let => {
                 return self.error_here(format!(
@@ -1964,6 +1982,84 @@ impl Parser<'_, '_> {
         Ok(self
             .ast
             .push_control(Control::For(For { vars, iter, body }), span))
+    }
+
+    fn begin_expr(&mut self) -> Result<ExprId> {
+        let start = self.bump().span;
+        let body = self.block(&[T::Rescue, T::Else, T::Ensure, T::End])?;
+        self.begin_tail(body, start, "begin")
+    }
+
+    /// Body of a `def` / `do` block, up to its `end`: `rescue` / `ensure` clauses make it
+    /// an implicit `begin`.
+    fn body_end(&mut self, opener: &str, opener_span: Span) -> Result<Block> {
+        let body = self.block(&[T::End, T::Rescue, T::Ensure])?;
+        if !matches!(self.peek(), T::Rescue | T::Ensure) {
+            self.end(opener, opener_span)?;
+            return Ok(body);
+        }
+        let e = self.begin_tail(body, opener_span, opener)?;
+        let span = self.span(e);
+        Ok(expr_block(e, span))
+    }
+
+    /// `rescue` clauses, `else`, `ensure` and `end` after the body of a `begin`.
+    fn begin_tail(&mut self, body: Block, start: Span, opener: &str) -> Result<ExprId> {
+        let mut rescues = Vec::new();
+        while self.at(T::Rescue) {
+            let clause_start = self.bump().span;
+            let mut var = None;
+            let mut ty = None;
+            if self.at(T::Ident) {
+                let first = self.tok().span.text(self.src).chars().next();
+                if first.is_some_and(char::is_uppercase) {
+                    ty = Some(self.type_expr(true)?);
+                } else {
+                    var = Some(self.ident("after `rescue`")?);
+                    if self.eat(T::Colon) {
+                        ty = Some(self.type_expr(true)?);
+                    }
+                }
+            }
+            if !self.eat(T::Then) && !matches!(self.peek(), T::Newline | T::Semi) {
+                return self.error_here(format!(
+                    "expected a line end after `rescue`, found {}",
+                    self.found()
+                ));
+            }
+            let body = self.block(&[T::Rescue, T::Else, T::Ensure, T::End])?;
+            rescues.push(Rescue {
+                var,
+                ty,
+                body,
+                span: self.span_from(clause_start),
+            });
+        }
+        let else_ = if self.at(T::Else) {
+            if rescues.is_empty() {
+                return self.error_here(format!("`else` in a `{opener}` requires a `rescue`"));
+            }
+            self.bump();
+            Some(self.block(&[T::Ensure, T::End])?)
+        } else {
+            None
+        };
+        let ensure = if self.eat(T::Ensure) {
+            Some(self.block(&[T::End])?)
+        } else {
+            None
+        };
+        self.end(opener, start)?;
+        let span = self.span_from(start);
+        Ok(self.ast.push_control(
+            Control::Begin(Begin {
+                body,
+                rescues,
+                else_,
+                ensure,
+            }),
+            span,
+        ))
     }
 
     // ─── Literals ────────────────────────────────────────────────────────────

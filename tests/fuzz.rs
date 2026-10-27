@@ -199,13 +199,21 @@ const VOCAB: &[&str] = &[
     "map",
     "|v|",
     "print",
+    "begin\n",
+    "\nrescue\n",
+    "\nrescue e\n",
+    "\nrescue e: Error\n",
+    "\nensure\n",
+    "raise ",
+    "e.message",
 ];
 
 /// Valid programs used as a base for mutations. No `while`: a mutation easily turns it
 /// into an infinite loop, indistinguishable from a hang.
 const CORPUS: &[&str] = &[
     "let a = 1\nlet b = a + 2\nb * 3",
-    "def f(x: int): int = if x < 2 then x else f(x - 1) + f(x - 2) end\nf(10)",
+    // Linear recursion: a mutated argument (`f(100)`) cannot make it exponential.
+    "def f(x: int): int = if x < 2 then x else f(x - 1) + x % 3 end\nf(10)",
     "def g(a, b) = a * b + 1\n[g(2, 3), g(1.5, 2), g(2, -3)]",
     "let xs = [1, 2, 3, 4]\nxs.map(|v| v * 2).filter(|v| v > 2).sum()",
     "let h = {\"a\" => 1, \"b\" => 2}\nh[\"c\"] = 3\nh.keys()",
@@ -224,6 +232,9 @@ const CORPUS: &[&str] = &[
     "let l: [any] = [1]\nl << l\nlet m: [any] = [1]\nm << m\n[l == m, l.len(), \"#{l}\"]",
     "let h: {str => any} = {\"a\" => 1}\nh[\"self\"] = h\n[h == h, h.keys(), h]",
     "let n = 9223372036854775807\n[n - 1, n / 2, -n, 7 % -3, -7 / 2, 2.0 / 3]",
+    "def d(a, b) = a / b\nlet r = begin\n  d(1, 0)\nrescue e: Error\n  e.message\nelse\n  0\nensure\n  print(1)\nend\nr",
+    "type F\n  message: str\n  code: int\nend\ndef c(n)\n  raise F(message: \"m\", code: n) if n > 2\n  n\nrescue e: Error\n  -1\nend\nlet t = 0\nfor i in 0..4\n  t += begin\n    c(i)\n  rescue f: F\n    f.code * 10\n  end\nend\nt",
+    "def s(xs)\n  let out = []\n  for x in xs\n    begin\n      next if x == 0\n      out << 10 / x\n    ensure\n      out << \"e\"\n    end\n  end\n  out\nend\ns([1, 0, 2])",
 ];
 
 /// Mutates a program: deletes, duplicates or swaps lines, inserts a token, deletes or
@@ -393,8 +404,13 @@ fn program(r: &mut Rng) -> String {
         } else {
             int(r, 3, true)
         };
-        match r.below(5) {
+        match r.below(8) {
             0 => out.push_str(&format!("a = {e}\n")),
+            5 => out.push_str(&format!(
+                "a = begin\n  {e}\nrescue err\n  print(err.message)\n  -1\nend\n"
+            )),
+            6 => out.push_str(&format!("begin\n  n = {e}\nensure\n  a = a + 1\nend\n")),
+            7 => out.push_str(&format!("raise \"r#{{a}}\" if {e} < 0\n")),
             1 => out.push_str(&format!(
                 "for v in xs\n  n = {}\nend\n",
                 e.replace('a', "v")

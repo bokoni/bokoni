@@ -683,6 +683,10 @@ impl Analysis<'_> {
 
 /// Register types of a compilable function; `None` if it is not compilable.
 fn analyze(p: &Proto, globals: &Globals, len: crate::intern::Symbol) -> Option<Plan> {
+    // `rescue` / `ensure`: left to the interpreter.
+    if !p.handlers.is_empty() {
+        return None;
+    }
     let (_, ret) = native_sig(p)?;
     let mut an = Analysis {
         p,
@@ -757,6 +761,7 @@ fn analyze(p: &Proto, globals: &Globals, len: crate::intern::Symbol) -> Option<P
                     }
                     _ => false,
                 },
+                Term::Reraise(_) => false,
             };
             if !ok {
                 return None;
@@ -1831,6 +1836,7 @@ impl Jit {
             }
             dty = plan.term_defs[bi];
             match &b.term {
+                Term::Reraise(_) => unreachable!("function with handlers compiled"),
                 Term::Jump(t) => {
                     bx.ins().jump(blocks[*t as usize], &[]);
                 }
@@ -2621,6 +2627,10 @@ impl Dyn<'_> {
 impl Jit {
     /// Compiles `p` to baseline native code; returns the entry point's address.
     pub fn compile_dynamic(&mut self, p: &Proto) -> Option<usize> {
+        // `rescue` / `ensure`: left to the interpreter.
+        if !p.handlers.is_empty() {
+            return None;
+        }
         let ptr = self.module.target_config().pointer_type();
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(ptr));
@@ -2678,6 +2688,7 @@ impl Jit {
                 dyn_instr(&d, &mut bx, ins, span, &mut self.field_caches);
             }
             match &b.term {
+                Term::Reraise(_) => unreachable!("function with handlers compiled"),
                 Term::Jump(t) => {
                     bx.ins().jump(blocks[*t as usize], &[]);
                 }

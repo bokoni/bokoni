@@ -544,6 +544,36 @@ impl Printer<'_> {
                 self.block(&x.body);
                 self.out.push(')');
             }
+            ExprKind::Begin(c) => {
+                let x = ast.begin(c);
+                self.out.push_str("(begin");
+                self.block(&x.body);
+                for r in &x.rescues {
+                    self.out.push_str(" (rescue");
+                    if let Some((v, _)) = r.var {
+                        self.out.push(' ');
+                        self.name(v);
+                    }
+                    if let Some(t) = &r.ty {
+                        self.out.push_str(" : ");
+                        self.ty(t);
+                    }
+                    self.block(&r.body);
+                    self.out.push(')');
+                }
+                self.else_block(&x.else_);
+                if let Some(b) = &x.ensure {
+                    self.out.push_str(" (ensure");
+                    self.block(b);
+                    self.out.push(')');
+                }
+                self.out.push(')');
+            }
+            ExprKind::Raise(v) => {
+                self.out.push_str("(raise ");
+                self.expr(v);
+                self.out.push(')');
+            }
             ExprKind::Return(v) => {
                 self.out.push_str("(return");
                 if let Some(v) = v {

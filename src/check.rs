@@ -1576,6 +1576,48 @@ impl Checker<'_> {
                 self.pop_scope();
                 Ty::Nil
             }
+            ExprKind::Begin(c) => {
+                let x = ast.begin(c);
+                let mut types = vec![self.block(&x.body)];
+                for r in &x.rescues {
+                    let t = r.ty.as_ref().map_or(Ty::Any, |t| self.resolve(t));
+                    self.push_scope();
+                    if let Some((n, _)) = r.var {
+                        self.declare(n, t, VarKind::Let);
+                    }
+                    types.push(self.block_stmts(&r.body));
+                    self.pop_scope();
+                }
+                if let Some(b) = &x.else_ {
+                    // The body's value is replaced by the `else`'s.
+                    types[0] = self.block(b);
+                }
+                if let Some(b) = &x.ensure {
+                    self.block(b);
+                }
+                union(types)
+            }
+            ExprKind::Raise(v) => {
+                let t = self.expr(v, None);
+                let ok = |t: &Ty| {
+                    matches!(
+                        t,
+                        Ty::Any | Ty::Never | Ty::Str | Ty::LitStr(_) | Ty::Object(_)
+                    )
+                };
+                let fits = match &t {
+                    Ty::Union(items) => items.iter().all(ok),
+                    t => ok(t),
+                };
+                if !fits {
+                    let msg = format!(
+                        "`raise` expects a string or an object, got `{}`",
+                        self.show_v(&t)
+                    );
+                    self.error(msg, ast.span(v));
+                }
+                Ty::Never
+            }
             ExprKind::Return(v) => {
                 let expected = self.fns.last().and_then(|f| f.ret.clone());
                 let t = match (v, &expected) {

@@ -6,7 +6,7 @@
 //! check the type.
 
 use crate::ast::{BinOp, TypeDeclKind};
-use crate::diagnostic::Error;
+use crate::diagnostic::{Error, ErrorKind, Raised};
 use crate::globals::Globals;
 use crate::intern::{FxHashMap, Interner, Symbol};
 use crate::ir::*;
@@ -82,6 +82,8 @@ pub struct Runtime {
     pub jit_eager: bool,
     /// String interpolation buffer.
     concat_buf: String,
+    /// Errors kept by `rescue` / `ensure` handlers, by call (`Term::Reraise`).
+    caught: Vec<Option<Error>>,
     #[cfg(feature = "jit")]
     jit: Option<crate::jit::Jit>,
     /// Error raised while running baseline native code, waiting to be propagated.
@@ -131,6 +133,7 @@ impl Runtime {
             jit_enabled: cfg!(feature = "jit"),
             jit_eager: false,
             concat_buf: String::new(),
+            caught: Vec::new(),
             #[cfg(feature = "jit")]
             jit: None,
             #[cfg(feature = "jit")]
@@ -406,17 +409,28 @@ impl Runtime {
             return self.run_native(entry, proto, upvals, ctx, regs, &mut cells);
         }
         let mut b = 0usize;
+        // This call's slots of caught errors: `self.caught[base..]`.
+        let base = self.caught.len();
         macro_rules! reg {
             ($r:expr) => {
                 regs[$r as usize]
             };
         }
-        loop {
+        'run: loop {
             let block = &proto.blocks[b];
             for (ins, &span) in block.instrs.iter().zip(&block.spans) {
-                self.step(proto, upvals, ctx, regs, &mut cells, ins, span)?;
+                if let Err(e) = self.step(proto, upvals, ctx, regs, &mut cells, ins, span) {
+                    b = self.catch(proto, block, e, regs, base)?;
+                    continue 'run;
+                }
             }
             match &block.term {
+                Term::Reraise(slot) => {
+                    let e = self.caught[base + *slot as usize]
+                        .take()
+                        .expect("caught error");
+                    b = self.catch(proto, block, e, regs, base)?;
+                }
                 Term::Jump(t) => b = *t as usize,
                 Term::Branch { cond, then, else_ } => {
                     b = if reg!(*cond).truthy() { *then } else { *else_ } as usize;
@@ -446,6 +460,9 @@ impl Runtime {
                     b = if int_cmp(*op, x, *k) { *then } else { *else_ } as usize;
                 }
                 Term::Return { reg: r, shape } => {
+                    if self.caught.len() > base {
+                        self.caught.truncate(base);
+                    }
                     let v = std::mem::replace(&mut reg!(*r), Value::Nil);
                     return match &proto.ret {
                         Some(ty) => {
@@ -469,6 +486,91 @@ impl Runtime {
                 }
             }
         }
+    }
+
+    /// Error raised in `block`: to its handler (the error as a value in its register),
+    /// otherwise returned (the call's slots of caught errors are freed). Syntax errors
+    /// and warnings cannot be caught.
+    #[cold]
+    #[inline(never)]
+    fn catch(
+        &mut self,
+        proto: &Proto,
+        block: &Block,
+        e: Error,
+        regs: &mut [Value],
+        base: usize,
+    ) -> R<usize> {
+        let h = match block.handler {
+            Some(h) if matches!(e.kind, ErrorKind::Runtime | ErrorKind::Type) => {
+                proto.handlers[h as usize]
+            }
+            _ => {
+                self.caught.truncate(base);
+                return Err(e);
+            }
+        };
+        regs[h.reg as usize] = self.error_value(&e);
+        let end = base + proto.nslots as usize;
+        if self.caught.len() < end {
+            self.caught.resize_with(end, || None);
+        }
+        self.caught[base + h.slot as usize] = Some(e);
+        Ok(h.block as usize)
+    }
+
+    /// What a `rescue` receives: the raised object, otherwise an `Error`.
+    fn error_value(&mut self, e: &Error) -> Value {
+        if let Some(Raised(v)) = &e.raised {
+            return v.clone();
+        }
+        let msg = Value::str(&e.message);
+        let slot = self.globals.slot(self.syms.error);
+        match &self.globals.at(slot).value {
+            Some(Value::Type(info)) if info.fields.len() == 1 => {
+                let info = info.clone();
+                let span = e.span.unwrap_or_default();
+                self.construct_regs(&info, std::slice::from_ref(&msg), &[], span)
+                    .unwrap_or(msg)
+            }
+            _ => msg,
+        }
+    }
+
+    /// Error of `raise v`: a string becomes the message of an `Error`; an object is
+    /// carried as is (its `message` field, if any, is the text of the error).
+    #[cold]
+    fn raise(&self, v: Value, span: Span) -> Error {
+        let message = match &v {
+            Value::Str(s) => return Error::runtime(s.to_string(), span),
+            Value::Object(o) => {
+                let o = o.borrow();
+                let text = o
+                    .info
+                    .field_index(self.syms.message)
+                    .and_then(|i| match &o.fields[i] {
+                        Value::Str(s) => Some(s.clone()),
+                        _ => None,
+                    });
+                match text {
+                    Some(t) if o.info.name.as_ref() == "Error" => t.to_string(),
+                    Some(t) => format!("{}: {t}", o.info.name),
+                    None => format!("raised {}", short(&v.inspect(&self.interner))),
+                }
+            }
+            _ => {
+                return Error::type_error(
+                    format!(
+                        "`raise` expects a string or an object, got {}",
+                        v.type_label()
+                    ),
+                    span,
+                );
+            }
+        };
+        let mut e = Error::runtime(message, span);
+        e.raised = Some(Raised(v));
+        e
     }
 
     /// Runs one instruction (not a terminator). Used by the interpreter loop (inlined)
@@ -722,6 +824,13 @@ impl Runtime {
         match ins {
             Instr::Fail(c) => {
                 return rt_err(proto.consts[*c as usize].to_display(&self.interner), span);
+            }
+            Instr::Raise(a) => return Err(self.raise(reg!(*a).clone(), span)),
+            Instr::IsType(d, a, t) => {
+                let ok = self
+                    .matches_rt(&reg!(*a), &proto.types[*t as usize].ty)
+                    .map_err(|m| Error::type_error(m, span))?;
+                reg!(*d) = Value::Bool(ok);
             }
 
             Instr::DefGlobal { slot, src, mutable } => {

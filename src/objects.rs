@@ -80,6 +80,8 @@ pub(crate) struct Syms {
     pub values: Symbol,
     pub from: Symbol,
     pub len: Symbol,
+    pub message: Symbol,
+    pub error: Symbol,
 }
 
 impl Syms {
@@ -92,6 +94,8 @@ impl Syms {
             values: i.intern("values"),
             from: i.intern("from"),
             len: i.intern("len"),
+            message: i.intern("message"),
+            error: i.intern("Error"),
         }
     }
 }

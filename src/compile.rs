@@ -17,8 +17,8 @@ use crate::globals::Globals;
 use crate::intern::{FxBuild, FxHashMap, Interner, Symbol};
 use crate::ir::{
     AnnotationIr, Annotations, Block as IrBlock, BlockId, CallSite, Capture, Decl, EnumDeclIr,
-    Fallback, FieldIr, Instr, ParamProto, Proto, ProtoKind, Reg, RegTy, RtType, Script, Shape,
-    Term, TypeDeclIr, TypeRef,
+    Fallback, FieldIr, Handler, Instr, ParamProto, Proto, ProtoKind, Reg, RegTy, RtType, Script,
+    Shape, Term, TypeDeclIr, TypeRef,
 };
 use crate::span::Span;
 use crate::value::Value;
@@ -380,6 +380,23 @@ impl Resolver<'_> {
                 self.scopes.pop();
                 true
             }
+            ExprKind::Begin(c) => {
+                let x = ast.begin(c);
+                self.block(&x.body);
+                for r in &x.rescues {
+                    self.push(false);
+                    if let Some((n, s)) = r.var {
+                        self.declare(n, s.start);
+                    }
+                    self.block_in_scope(&r.body);
+                    self.scopes.pop();
+                }
+                for b in x.else_.iter().chain(&x.ensure) {
+                    self.block(b);
+                }
+                true
+            }
+            ExprKind::Raise(v) => self.expr(v),
             ExprKind::Return(v) => {
                 if let Some(v) = v {
                     self.expr(v);
@@ -423,6 +440,18 @@ struct BB {
     instrs: Vec<Instr>,
     spans: Vec<Span>,
     term: Option<(Term, Span)>,
+    handler: Option<u32>,
+}
+
+/// `ensure` of an enclosing `begin`: run again before a `return` / `break` / `next`
+/// that leaves it.
+#[derive(Clone, Copy)]
+struct EnsureCtx {
+    begin: ControlId,
+    /// Loops open outside the `begin`.
+    loops: usize,
+    /// Handler outside the `begin`.
+    handler: Option<u32>,
 }
 
 struct Fn_ {
@@ -448,6 +477,11 @@ struct Fn_ {
     scopes: Vec<Scope>,
     /// (target of `next`, target of `break`)
     loops: Vec<(BlockId, BlockId)>,
+    handlers: Vec<Handler>,
+    nslots: u32,
+    /// Handler of the blocks being created.
+    handler: Option<u32>,
+    ensures: Vec<EnsureCtx>,
     free: [Vec<Reg>; 4],
     temps: Vec<Reg>,
     params: Vec<ParamProto>,
@@ -514,6 +548,7 @@ impl Compiler<'_> {
                 instrs: Vec::new(),
                 spans: Vec::new(),
                 term: None,
+                handler: None,
             }],
             cur: 0,
             consts: Vec::new(),
@@ -526,6 +561,10 @@ impl Compiler<'_> {
             decls: Vec::new(),
             scopes: Vec::new(),
             loops: Vec::new(),
+            handlers: Vec::new(),
+            nslots: 0,
+            handler: None,
+            ensures: Vec::new(),
             free: Default::default(),
             temps: Vec::new(),
             params: Vec::new(),
@@ -549,9 +588,9 @@ impl Compiler<'_> {
             span,
         );
         let mut f = self.fns.pop().unwrap();
-        thread_jumps(&mut f.blocks);
-        merge_blocks(&mut f.blocks);
-        let reachable = compact(&mut f.blocks);
+        thread_jumps(&mut f.blocks, &mut f.handlers);
+        merge_blocks(&mut f.blocks, &f.handlers);
+        let reachable = compact(&mut f.blocks, &mut f.handlers);
         f.blocks = reachable;
         let plain_params = f.params.iter().all(|p| p.ty.is_none());
         // Loop: a jump to a block that does not come later.
@@ -571,6 +610,7 @@ impl Compiler<'_> {
                     spans: b.spans,
                     term,
                     term_span,
+                    handler: b.handler,
                 }
             })
             .collect();
@@ -593,6 +633,8 @@ impl Compiler<'_> {
             decls: f.decls,
             decl: f.decl,
             annotations: f.annotations,
+            handlers: f.handlers,
+            nslots: f.nslots,
             jit: Default::default(),
             jit_dyn: Default::default(),
             calls_seen: Default::default(),
@@ -662,12 +704,14 @@ impl Compiler<'_> {
         }
     }
 
+    /// New block, protected by the current handler.
     fn new_block(&mut self) -> BlockId {
         let f = self.f();
         f.blocks.push(BB {
             instrs: Vec::new(),
             spans: Vec::new(),
             term: None,
+            handler: f.handler,
         });
         (f.blocks.len() - 1) as BlockId
     }
@@ -2159,14 +2203,30 @@ impl Compiler<'_> {
                 self.nil(span)
             }
             ExprKind::For(c) => self.for_loop(ast.for_(c), span),
+            ExprKind::Begin(c) => self.begin_expr(c, span),
+            ExprKind::Raise(v) => {
+                let v = self.expr(v);
+                let r = self.boxed(v, span);
+                self.emit(Instr::Raise(r), span);
+                let dead = self.new_block();
+                self.switch(dead);
+                self.nil(span)
+            }
             ExprKind::Return(v) => {
-                let (r, shape) = match v {
+                let (mut r, shape) = match v {
                     Some(v) => {
                         let r = self.expr(v);
                         (r, self.shape(v))
                     }
                     None => (self.nil(span), None),
                 };
+                if !self.f().ensures.is_empty() {
+                    // The value is computed before the `ensure`s, which may change it.
+                    let t = self.tmp(r.1);
+                    self.emit(Instr::Move(t, r.0), span);
+                    r = (t, r.1);
+                    self.run_ensures(0);
+                }
                 self.term(Term::Return { reg: r.0, shape }, span);
                 let dead = self.new_block();
                 self.switch(dead);
@@ -2176,6 +2236,8 @@ impl Compiler<'_> {
                 let is_break = matches!(ast.kind(e), ExprKind::Break);
                 match self.f().loops.last().copied() {
                     Some((cont, brk)) => {
+                        let depth = self.f().loops.len();
+                        self.run_ensures(depth);
                         self.term(Term::Jump(if is_break { brk } else { cont }), span);
                         let dead = self.new_block();
                         self.switch(dead);
@@ -2191,6 +2253,155 @@ impl Compiler<'_> {
                 }
             }
         }
+    }
+
+    /// `begin`: the body in the region of the `rescue` handler, itself in the region of
+    /// the `ensure` handler.
+    ///
+    /// ```text
+    /// body (rescue → R) → else → ensure → after
+    /// R: clause 1? clause 2? … otherwise reraise → ensure
+    /// E (ensure handler): ensure; reraise
+    /// ```
+    fn begin_expr(&mut self, id: ControlId, span: Span) -> Op {
+        let ast = self.ast;
+        let x = ast.begin(id);
+        let outer = self.f().handler;
+        // Region of the `ensure`: the body, the `rescue` clauses and the `else`.
+        let ensure = x.ensure.as_ref().map(|_| {
+            let h = self.handler_block();
+            let loops = self.f().loops.len();
+            self.f().ensures.push(EnsureCtx {
+                begin: id,
+                loops,
+                handler: outer,
+            });
+            self.f().handler = Some(h.0);
+            h
+        });
+        let inner = self.f().handler;
+        let rescue = (!x.rescues.is_empty()).then(|| self.handler_block());
+        if let Some((h, _)) = rescue {
+            self.f().handler = Some(h);
+        }
+        let body = self.new_block();
+        self.term(Term::Jump(body), span);
+        self.switch(body);
+        let mut results = Vec::new();
+        let mut v = self.block(&x.body);
+        self.f().handler = inner;
+        if let Some(b) = &x.else_ {
+            // Outside the `rescue` region.
+            let next = self.new_block();
+            self.term(Term::Jump(next), span);
+            self.switch(next);
+            v = self.block(b);
+        }
+        results.push((self.cur(), v));
+        if let Some((h, slot)) = rescue {
+            let reg = self.f().handlers[h as usize].reg;
+            let entry = self.f().handlers[h as usize].block;
+            self.switch(entry);
+            let mut caught = false;
+            for r in &x.rescues {
+                let next = r.ty.as_ref().map(|t| {
+                    let ty = self.type_idx(t);
+                    let c = self.tmp(RegTy::Bool);
+                    self.emit(Instr::IsType(c, reg, ty), r.span);
+                    let (then, next) = (self.new_block(), self.new_block());
+                    self.term(
+                        Term::Branch {
+                            cond: c,
+                            then,
+                            else_: next,
+                        },
+                        r.span,
+                    );
+                    self.switch(then);
+                    next
+                });
+                self.push_scope(false);
+                if let Some((name, vspan)) = r.var {
+                    let v = self.declare_local(name, vspan.start, None, true, vspan);
+                    self.write(v, (reg, RegTy::Value), true, vspan);
+                }
+                let mark = self.temps_mark();
+                let v = self.block_body(&r.body, false);
+                self.release(mark);
+                self.pop_scope();
+                results.push((self.cur(), v));
+                match next {
+                    Some(n) => self.switch(n),
+                    None => {
+                        caught = true;
+                        break;
+                    }
+                }
+            }
+            if !caught {
+                self.term(Term::Reraise(slot), span);
+            }
+        }
+        let v = self.merge(&results, span);
+        let Some((h, slot)) = ensure else {
+            return v;
+        };
+        self.f().ensures.pop();
+        self.f().handler = outer;
+        let after = self.new_block();
+        self.term(Term::Jump(after), span);
+        self.switch(after);
+        let ens = x.ensure.as_ref().unwrap();
+        let mark = self.temps_mark();
+        self.block(ens);
+        self.release(mark);
+        let cont = self.cur();
+        let entry = self.f().handlers[h as usize].block;
+        self.switch(entry);
+        self.block(ens);
+        self.term(Term::Reraise(slot), span);
+        self.switch(cont);
+        v
+    }
+
+    /// Handler (block, slot, register) for the current region; its block is outside.
+    fn handler_block(&mut self) -> (u32, u32) {
+        let block = self.new_block();
+        let reg = self.new_reg(RegTy::Value, false);
+        let f = self.f();
+        let slot = f.nslots;
+        f.nslots += 1;
+        f.handlers.push(Handler { block, reg, slot });
+        ((f.handlers.len() - 1) as u32, slot)
+    }
+
+    /// Before a jump out of `begin`s: runs their `ensure`s, innermost first (those
+    /// entered inside the `loops`-th loop, all of them for `return`).
+    fn run_ensures(&mut self, loops: usize) {
+        let saved_handler = self.f().handler;
+        let saved_ensures = self.f().ensures.clone();
+        let saved_loops = self.f().loops.clone();
+        for (k, e) in saved_ensures.iter().enumerate().rev() {
+            if e.loops < loops {
+                break;
+            }
+            // The `ensure` runs outside its `begin` (and the jumps it contains as well).
+            let f = self.f();
+            f.handler = e.handler;
+            f.ensures.truncate(k);
+            f.loops.truncate(e.loops);
+            let b = self.new_block();
+            self.term(Term::Jump(b), Span::default());
+            self.switch(b);
+            let ens = self.ast.begin(e.begin).ensure.as_ref().unwrap();
+            let mark = self.temps_mark();
+            self.block(ens);
+            self.release(mark);
+        }
+        let f = self.f();
+        f.handler = saved_handler;
+        f.ensures = saved_ensures;
+        f.loops = saved_loops;
     }
 
     /// Gathers the values of the branches (`if`, `case`) into one register.
@@ -2765,7 +2976,17 @@ fn visit(ast: &Ast, e: ExprId, f: &mut dyn FnMut(ExprId)) {
             visit(ast, x.iter, f);
             visit_block(ast, &x.body, f);
         }
-        ExprKind::Return(Some(x)) => visit(ast, x, f),
+        ExprKind::Begin(c) => {
+            let x = ast.begin(c);
+            visit_block(ast, &x.body, f);
+            for r in &x.rescues {
+                visit_block(ast, &r.body, f);
+            }
+            for b in x.else_.iter().chain(&x.ensure) {
+                visit_block(ast, b, f);
+            }
+        }
+        ExprKind::Return(Some(x)) | ExprKind::Raise(x) => visit(ast, x, f),
         _ => {}
     }
 }
@@ -2778,7 +2999,7 @@ fn is_cmp(op: BinOp) -> bool {
 }
 
 /// Jumps to an empty block that only jumps go straight to its target.
-fn thread_jumps(blocks: &mut [BB]) {
+fn thread_jumps(blocks: &mut [BB], handlers: &mut [Handler]) {
     let n = blocks.len();
     let target = |blocks: &[BB], mut b: BlockId| {
         for _ in 0..n {
@@ -2801,11 +3022,15 @@ fn thread_jumps(blocks: &mut [BB]) {
             }
         }
     }
+    for h in handlers {
+        h.block = finals[h.block as usize];
+    }
 }
 
 /// A block that jumps unconditionally to a block whose only predecessor it is absorbs
 /// that block: fewer jumps to run. The absorbed block becomes unreachable.
-fn merge_blocks(blocks: &mut [BB]) {
+/// Only within the same handler: the absorbed instructions keep theirs.
+fn merge_blocks(blocks: &mut [BB], handlers: &[Handler]) {
     loop {
         let mut preds = vec![0u32; blocks.len()];
         preds[0] = 1; // entry point
@@ -2816,8 +3041,16 @@ fn merge_blocks(blocks: &mut [BB]) {
                 }
             }
         }
+        for h in handlers {
+            preds[h.block as usize] += 1;
+        }
         let found = (0..blocks.len()).find_map(|a| match &blocks[a].term {
-            Some((Term::Jump(t), _)) if *t as usize != a && *t != 0 && preds[*t as usize] == 1 => {
+            Some((Term::Jump(t), _))
+                if *t as usize != a
+                    && *t != 0
+                    && preds[*t as usize] == 1
+                    && blocks[*t as usize].handler == blocks[a].handler =>
+            {
                 Some((a, *t as usize))
             }
             _ => None,
@@ -2827,6 +3060,7 @@ fn merge_blocks(blocks: &mut [BB]) {
             instrs,
             spans,
             term,
+            handler,
         } = std::mem::replace(
             &mut blocks[t],
             BB {
@@ -2834,16 +3068,19 @@ fn merge_blocks(blocks: &mut [BB]) {
                 spans: Vec::new(),
                 // Unreachable: it jumps to itself and is never reached again.
                 term: Some((Term::Jump(t as BlockId), Span::default())),
+                handler: None,
             },
         );
+        debug_assert_eq!(handler, blocks[a].handler);
         blocks[a].instrs.extend(instrs);
         blocks[a].spans.extend(spans);
         blocks[a].term = term;
     }
 }
 
-/// Keeps only the blocks reachable from the entry, renumbered in order.
-fn compact(blocks: &mut Vec<BB>) -> Vec<BB> {
+/// Keeps only the blocks reachable from the entry, renumbered in order (handlers of
+/// unreachable blocks are kept, pointing to a block that stays).
+fn compact(blocks: &mut Vec<BB>, handlers: &mut [Handler]) -> Vec<BB> {
     let n = blocks.len();
     let mut seen = vec![false; n];
     let mut todo = vec![0 as BlockId];
@@ -2851,7 +3088,11 @@ fn compact(blocks: &mut Vec<BB>) -> Vec<BB> {
         if std::mem::replace(&mut seen[b as usize], true) {
             continue;
         }
-        if let Some((t, _)) = &mut blocks[b as usize].term {
+        let block = &mut blocks[b as usize];
+        if let Some(h) = block.handler {
+            todo.push(handlers[h as usize].block);
+        }
+        if let Some((t, _)) = &mut block.term {
             todo.extend(t.targets_mut().into_iter().map(|x| *x));
         }
     }
@@ -2862,6 +3103,13 @@ fn compact(blocks: &mut Vec<BB>) -> Vec<BB> {
             index[b] = next;
             next += 1;
         }
+    }
+    for h in handlers.iter_mut() {
+        h.block = if seen[h.block as usize] {
+            index[h.block as usize]
+        } else {
+            0
+        };
     }
     let mut out = Vec::with_capacity(next as usize);
     for (b, block) in std::mem::take(blocks).into_iter().enumerate() {
