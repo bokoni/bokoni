@@ -598,6 +598,49 @@ Shape()                                     # error: an abstract class
 An `abstract class` cannot be instantiated and may declare `abstract def`s; its
 subclasses must define them, unless they are abstract too.
 
+## Modules
+
+A `module` groups declarations under a name: constants, functions, types, classes,
+traits, enums, other modules.
+
+```ruby
+module Http
+  let VERSION = "1.1"
+
+  class Request
+    def init(@url: str)
+    end
+    def url = @url
+  end
+
+  class Failure < Error
+  end
+
+  def get(url: str): Request = Request(url)   # a function of the module
+
+  module Mime
+    let JSON = "application/json"
+  end
+end
+
+let r: Http::Request = Http.get("example.org")   # `::` for a member, `.` for a call
+Http::VERSION                                    # "1.1"
+Http::Mime::JSON
+class ApiError < Http::Failure                    # also after `<` and `include`
+end
+```
+
+- Outside, a member is named `Module::name`; a function of the module is called with
+  `Module.f(…)`. A module is not a value (`let m = Http` is an error).
+- Inside, short names are looked up in the module first, then outside: the module's
+  functions can call the script's functions.
+- A module's body runs when the block that contains it starts, before the block's
+  statements (like the declarations of types): its statements cannot use the script's
+  variables, its functions can (they run later).
+- Everything is public (`private` may come later). A module can be reopened, also by a
+  later script, to add members.
+- A module is declared at the top level of the script, or in a module.
+
 ## Comments
 
 ```ruby
@@ -797,6 +840,7 @@ Point(x: 1).to_s()            # "Point(x=1, y=0)"
 ## Reserved words
 
 `let def end if elsif else unless then case when while for in do break next return
+module
 begin rescue ensure raise super trait abstract include type class enum annotation macro true false nil and or not`
 
 ## Open questions

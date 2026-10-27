@@ -226,16 +226,28 @@ namespaces, `trait` for shared behavior.
 - [x] `TypeDesc::traits`, `TypeDesc::is_abstract`, `DeclKind::Trait`
 - [ ] A trait that includes another one; generic traits (`Comparable(T)`)
 
+### v0.10 — Modules and files
+
+- [x] `module M … end`: constants, functions, types, classes, traits, enums, nested
+      modules; `M::Name` for a member, `M.f(…)` for a function (Crystal's notation)
+- [x] Short names inside a module (its members first); qualified names everywhere a
+      type is expected (`x: Http::Request`, `class A < Http::Failure`,
+      `include Http::Named`, `rescue e: Http::Failure`)
+- [x] Members are globals named `M::name`: no runtime cost, compiled code calls
+      module functions directly
+- [x] Module bodies run with the declarations, before the block's statements; a
+      module can be reopened (also by a later script)
+- [ ] `require "file"`, the files provided by the host
+- [ ] `private`
+
 ### Next
 
 In suggested order:
 
-1. **Modules / imports**: `module Http … end`, `Http::Request`, `Http.get(…)`, and
-   loading of other files (through a callback of the host, for embedding).
-2. **Generics** (`[T]` in signatures): typed `map` / `filter` and user functions over
+1. **Generics** (`[T]` in signatures): typed `map` / `filter` and user functions over
    lists; lets the typed JIT compile more code; then generic traits
    (`Comparable(T)`, `Enumerable(T)`).
-3. **Crystal-style macros** (v3 of `syntax.md`): hygiene and AST exposure still open;
+2. **Crystal-style macros** (v3 of `syntax.md`): hygiene and AST exposure still open;
    benefit from generics and modules.
 
 No design decision needed:

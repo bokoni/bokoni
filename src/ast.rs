@@ -277,6 +277,16 @@ pub enum StmtKind {
     Def(Box<FnDecl>),
     Type(Box<TypeDecl>),
     Enum(Box<EnumDecl>),
+    Module(Box<ModuleDecl>),
+}
+
+/// `module Name … end`: its declarations are named `Name::…` outside.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModuleDecl {
+    pub name: Symbol,
+    pub name_span: Span,
+    pub body: Block,
+    pub span: Span,
 }
 
 /// `let pattern(: type)? = value`

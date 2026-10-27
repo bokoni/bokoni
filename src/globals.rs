@@ -3,7 +3,7 @@
 //! The compiler resolves each global name to a slot index; execution reads the slot
 //! directly, without any lookup by name.
 
-use crate::intern::{FxHashMap, Symbol};
+use crate::intern::{FxHashMap, FxHashSet, Symbol};
 use crate::ir::{JitState, Proto};
 use crate::value::Value;
 use std::rc::{Rc, Weak};
@@ -22,6 +22,9 @@ pub struct GlobalSlot {
 pub struct Globals {
     slots: Vec<GlobalSlot>,
     index: FxHashMap<Symbol, u32>,
+    /// Declared modules, by qualified name (`Http`, `Http::Client`): their members are
+    /// the globals `Http::name`.
+    modules: FxHashSet<Symbol>,
 }
 
 impl Globals {
@@ -89,6 +92,19 @@ impl Globals {
     }
 
     /// Value and mutability of a defined global.
+    pub fn add_module(&mut self, name: Symbol) {
+        self.modules.insert(name);
+    }
+
+    pub fn is_module(&self, name: Symbol) -> bool {
+        self.modules.contains(&name)
+    }
+
+    /// Is the name known (declared by a script compiled before)?
+    pub fn has_slot(&self, name: Symbol) -> bool {
+        self.index.contains_key(&name)
+    }
+
     pub fn get_binding(&self, name: Symbol) -> Option<(Value, bool)> {
         let s = &self.slots[*self.index.get(&name)? as usize];
         Some((s.value.clone()?, s.mutable))

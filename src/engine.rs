@@ -238,6 +238,7 @@ impl Engine {
             errs
         };
         let program = parser::parse(src, &mut self.rt.interner).map_err(with_src)?;
+        crate::compile::intern_module_names(&program, &mut self.rt.interner);
         let prims = if self.static_checks {
             let (errors, warnings, prims) =
                 crate::check::check(&program, &self.rt.interner, &self.rt.globals);

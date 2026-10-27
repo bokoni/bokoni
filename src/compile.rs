@@ -97,10 +97,55 @@ fn block_decls(b: &Block) -> Vec<(Symbol, u32)> {
             StmtKind::Def(f) => out.push((f.name, f.name_span.start)),
             StmtKind::Type(t) => out.push((t.name, t.name_span.start)),
             StmtKind::Enum(e) => out.push((e.name, e.name_span.start)),
-            StmtKind::Expr(_) => {}
+            StmtKind::Expr(_) | StmtKind::Module(_) => {}
         }
     }
     out
+}
+
+/// `prefix::name`
+pub(crate) fn qualify(i: &mut Interner, prefix: Option<Symbol>, name: Symbol) -> Symbol {
+    match prefix {
+        Some(p) => {
+            let q = format!("{}::{}", i.resolve(p), i.resolve(name));
+            i.intern(&q)
+        }
+        None => name,
+    }
+}
+
+/// Interns the qualified names of the modules' declarations (`Http::get`), so that the
+/// checker (which does not intern) can find them.
+pub fn intern_module_names(program: &Program, i: &mut Interner) {
+    fn walk(b: &Block, prefix: Option<Symbol>, i: &mut Interner) {
+        for s in &b.stmts {
+            match &s.kind {
+                StmtKind::Module(m) => {
+                    let q = qualify(i, prefix, m.name);
+                    walk(&m.body, Some(q), i);
+                }
+                _ if prefix.is_none() => {}
+                StmtKind::Let(l) => {
+                    let mut names = Vec::new();
+                    pattern_bindings(&l.pattern, &mut names);
+                    for (n, _) in names {
+                        qualify(i, prefix, n);
+                    }
+                }
+                StmtKind::Def(f) => {
+                    qualify(i, prefix, f.name);
+                }
+                StmtKind::Type(t) => {
+                    qualify(i, prefix, t.name);
+                }
+                StmtKind::Enum(e) => {
+                    qualify(i, prefix, e.name);
+                }
+                StmtKind::Expr(_) => {}
+            }
+        }
+    }
+    walk(&program.body, None, i);
 }
 
 fn pattern_bindings(p: &Pattern, out: &mut Vec<(Symbol, u32)>) {
@@ -185,6 +230,16 @@ impl Resolver<'_> {
 
     fn stmt(&mut self, s: &Stmt) {
         match &s.kind {
+            StmtKind::Module(m) => {
+                self.push(true);
+                for (n, k) in block_decls(&m.body) {
+                    self.declare(n, k);
+                }
+                for s in &m.body.stmts {
+                    self.stmt(s);
+                }
+                self.scopes.pop();
+            }
             StmtKind::Expr(e) => {
                 self.expr(*e);
             }
@@ -441,6 +496,8 @@ struct Scope {
     vars: Vec<Var>,
     /// Main scope: its variables are globals.
     global: bool,
+    /// Body of a module (qualified name): its globals are named `Module::name`.
+    module: Option<Symbol>,
 }
 
 struct BB {
@@ -863,7 +920,120 @@ impl Compiler<'_> {
         self.f().scopes.push(Scope {
             vars: Vec::new(),
             global,
+            module: None,
         });
+    }
+
+    // ─── Modules ─────────────────────────────────────────────────────────────
+
+    /// Enclosing modules, innermost first.
+    fn modules(&self) -> Vec<Symbol> {
+        self.fns[0].scopes.iter().rev().filter_map(|s| s.module).collect()
+    }
+
+    /// Module named by a path written here (`Http`, `Http::Client`): looked up in the
+    /// enclosing modules first.
+    fn module_path(&mut self, path: &[Symbol]) -> Option<Symbol> {
+        let (&head, rest) = path.split_first()?;
+        let mut q = self
+            .modules()
+            .into_iter()
+            .map(Some)
+            .chain([None])
+            .map(|p| qualify(self.i, p, head))
+            .find(|q| self.globals.is_module(*q))?;
+        for &seg in rest {
+            q = qualify(self.i, Some(q), seg);
+            if !self.globals.is_module(q) {
+                return None;
+            }
+        }
+        Some(q)
+    }
+
+    /// The expression names a module (and not a variable).
+    fn module_of(&mut self, e: ExprId) -> Option<Symbol> {
+        match self.ast.kind(e) {
+            ExprKind::Ident(n) if self.resolve(n).is_none() => self.module_path(&[n]),
+            ExprKind::Path(p) => {
+                let p = self.ast.get(p).to_vec();
+                self.module_path(&p)
+            }
+            _ => None,
+        }
+    }
+
+    /// Global slot of a member: `path` = module(s) then the member's name.
+    fn member_slot(&mut self, path: &[Symbol]) -> Option<u32> {
+        let (&last, prefix) = path.split_last()?;
+        let m = self.module_path(prefix)?;
+        let q = qualify(self.i, Some(m), last);
+        Some(self.globals.slot(q))
+    }
+
+    /// Global slot of a name written here: variable in scope, member of an enclosing
+    /// module (also declared by an earlier script), path, or plain global.
+    fn global_slot(&mut self, path: &[Symbol]) -> u32 {
+        if let [name] = path {
+            if let Some((v, _)) = self.resolve(*name)
+                && let Store::Global(s) = v.store
+            {
+                return s;
+            }
+            for m in self.modules() {
+                let q = qualify(self.i, Some(m), *name);
+                if self.globals.has_slot(q) {
+                    return self.globals.slot(q);
+                }
+            }
+            return self.globals.slot(*name);
+        }
+        match self.member_slot(path) {
+            Some(s) => s,
+            None => {
+                let mut q = path[0];
+                for &seg in &path[1..] {
+                    q = qualify(self.i, Some(q), seg);
+                }
+                self.globals.slot(q)
+            }
+        }
+    }
+
+    /// Slot of a declaration of the current scope (in a module: `Module::name`).
+    fn decl_slot(&mut self, name: Symbol) -> u32 {
+        let m = self.f().scopes.last().and_then(|s| s.module);
+        let q = qualify(self.i, m, name);
+        self.globals.slot(q)
+    }
+
+    /// `Http::Base` written as one name (after `<`, `include`): its segments.
+    fn split_path(&mut self, name: Symbol) -> Vec<Symbol> {
+        let text = self.i.resolve(name).to_string();
+        text.split("::").map(|s| self.i.intern(s)).collect()
+    }
+
+    fn module_decl(&mut self, m: &ModuleDecl, span: Span) {
+        let at_top = self.fns.len() == 1 && self.f().scopes.iter().all(|s| s.global);
+        if !at_top {
+            self.errors.push(Error::syntax(
+                "a `module` must be at the top level of the script (or in a module)",
+                span,
+            ));
+            return;
+        }
+        let outer = self.f().scopes.last().and_then(|s| s.module);
+        let q = qualify(self.i, outer, m.name);
+        self.globals.add_module(q);
+        self.f().scopes.push(Scope {
+            vars: Vec::new(),
+            global: true,
+            module: Some(q),
+        });
+        let mark = self.temps_mark();
+        self.block_body(&m.body, true);
+        self.release(mark);
+        self.pop_scope();
     }
 
     fn pop_scope(&mut self) {
@@ -914,7 +1084,7 @@ impl Compiler<'_> {
     }
 
     fn declare_global(&mut self, name: Symbol, mutable: bool) -> Var {
-        let slot = self.globals.slot(name);
+        let slot = self.decl_slot(name);
         let var = Var {
             name,
             store: Store::Global(slot),
@@ -1022,7 +1192,7 @@ impl Compiler<'_> {
         if self.named_access(name, found.map(|(_, o)| o), store) {
             let fallback = match store {
                 Some(s) => Self::fallback(s),
-                None => Fallback::Global(self.globals.slot(name)),
+                None => Fallback::Global(self.global_slot(&[name])),
             };
             let dst = self.tmp(RegTy::Value);
             self.emit(
@@ -1055,7 +1225,14 @@ impl Compiler<'_> {
                 }
             },
             None => {
-                let g = self.globals.slot(name);
+                if let Some(m) = self.module_path(&[name]) {
+                    let m = self.i.resolve(m).to_string();
+                    return self.fail(
+                        format!("`{m}` is a module: use `{m}::Name` or `{m}.f(…)`"),
+                        span,
+                    );
+                }
+                let g = self.global_slot(&[name]);
                 let d = self.tmp(RegTy::Value);
                 self.emit(Instr::GetGlobal(d, g), span);
                 (d, RegTy::Value)
@@ -1172,10 +1349,13 @@ impl Compiler<'_> {
                         "str" => RtType::Str,
                         "bool" => RtType::Bool,
                         "nil" => RtType::Nil,
-                        _ => RtType::Named(self.globals.slot(*name), *name),
+                        _ => RtType::Named(self.global_slot(&[*name]), *name),
                     }
                 } else {
-                    RtType::Named(u32::MAX, path[0])
+                    match self.member_slot(path) {
+                        Some(slot) => RtType::Named(slot, *path.last().unwrap()),
+                        None => RtType::Named(u32::MAX, path[0]),
+                    }
                 }
             }
             TypeKind::List(x) => RtType::List(Box::new(self.rt_type(x))),
@@ -1309,6 +1489,22 @@ impl Compiler<'_> {
                 }
             }
         }
+        // Modules: known first (they may refer to each other), then their bodies run,
+        // in order, before the block's types (which may inherit from their classes).
+        if top {
+            let outer = self.f().scopes.last().and_then(|s| s.module);
+            for s in &b.stmts {
+                if let StmtKind::Module(m) = &s.kind {
+                    let q = qualify(self.i, outer, m.name);
+                    self.globals.add_module(q);
+                }
+            }
+        }
+        for s in &b.stmts {
+            if let StmtKind::Module(m) = &s.kind {
+                self.module_decl(m, s.span);
+            }
+        }
         // 2. Types and enums (main program only).
         for s in &b.stmts {
             match &s.kind {
@@ -1354,6 +1550,8 @@ impl Compiler<'_> {
     fn stmt(&mut self, s: &Stmt) -> Option<Op> {
         match &s.kind {
             StmtKind::Expr(e) => Some(self.expr(*e)),
+            // Run with the declarations (`hoist`).
+            StmtKind::Module(_) => None,
             StmtKind::Let(l) => {
                 let span = self.ast.span(l.value);
                 let mut v = self.expr(l.value);
@@ -1730,8 +1928,9 @@ impl Compiler<'_> {
     /// Fields of the parent class (declared before, in this script or a previous one).
     fn parent_fields(&mut self, t: &TypeDecl) -> Option<(u32, Rc<[Symbol]>)> {
         let (p, span) = t.parent?;
-        let slot = self.globals.slot(p);
-        if let Some(fields) = self.classes.get(&p) {
+        let path = self.split_path(p);
+        let slot = self.global_slot(&path);
+        if let Some(fields) = self.classes.get(&self.globals.at(slot).name) {
             return Some((slot, fields.clone()));
         }
         match &self.globals.at(slot).value {
@@ -1778,7 +1977,9 @@ impl Compiler<'_> {
             .chain(fields.iter().map(|(n, ..)| *n))
             .collect();
         if t.kind == TypeDeclKind::Class {
-            self.classes.insert(t.name, names.clone());
+            let slot = self.decl_slot(t.name);
+            let qname = self.globals.at(slot).name;
+            self.classes.insert(qname, names.clone());
         }
         let mut fir = Vec::new();
         for (name, ty, default, anns) in &fields {
@@ -1810,8 +2011,9 @@ impl Compiler<'_> {
             match m {
                 Member::Abstract(f) => abstracts.push(Rc::new(f.clone())),
                 Member::Include(name, span) => {
-                    let slot = self.globals.slot(*name);
-                    let known = self.traits.contains(name)
+                    let path = self.split_path(*name);
+                    let slot = self.global_slot(&path);
+                    let known = self.traits.contains(&self.globals.at(slot).name)
                         || matches!(&self.globals.at(slot).value,
                             Some(Value::Type(info)) if info.kind == TypeDeclKind::Trait);
                     if known {
@@ -1857,11 +2059,13 @@ impl Compiler<'_> {
             }
         }
         let annotations = self.annotations_ir(&t.annotations);
+        let slot = self.decl_slot(t.name);
+        let qname = self.globals.at(slot).name;
         if t.kind == TypeDeclKind::Trait {
-            self.traits.insert(t.name);
+            self.traits.insert(qname);
         }
         let decl = TypeDeclIr {
-            name: t.name,
+            name: qname,
             kind: t.kind,
             parent: parent.map(|(slot, f)| (slot, f.len() as u32)),
             traits,
@@ -1871,7 +2075,6 @@ impl Compiler<'_> {
             methods,
             annotations,
         };
-        let slot = self.globals.slot(t.name);
         let f = self.f();
         f.decls.push(Decl::Type(Rc::new(decl)));
         let idx = (f.decls.len() - 1) as u32;
@@ -1918,8 +2121,9 @@ impl Compiler<'_> {
             .iter()
             .map(|v| self.annotations_ir(&v.annotations))
             .collect();
+        let slot = self.decl_slot(e.name);
         let decl = EnumDeclIr {
-            name: e.name,
+            name: self.globals.at(slot).name,
             variants: e.variants.iter().map(|v| v.name).collect(),
             explicit,
             repr,
@@ -1928,7 +2132,6 @@ impl Compiler<'_> {
             annotations,
             variant_annotations,
         };
-        let slot = self.globals.slot(e.name);
         let f = self.f();
         f.decls.push(Decl::Enum(Rc::new(decl)));
         let idx = (f.decls.len() - 1) as u32;
@@ -2034,12 +2237,30 @@ impl Compiler<'_> {
             }
             ExprKind::Path(p) => {
                 let p = ast.get(p).to_vec();
-                if p.len() != 2 {
-                    return self.fail("only `Enum::Variant` paths are allowed", span);
+                // Member of a module: `Http::Request`, `Http::VERSION`.
+                if let Some(slot) = self.member_slot(&p) {
+                    let d = self.tmp(RegTy::Value);
+                    self.emit(Instr::GetGlobal(d, slot), span);
+                    return (d, RegTy::Value);
                 }
-                let head = self.read_var(p[0], span);
+                if self.module_path(&p).is_some() {
+                    return self.fail("a module is not a value", span);
+                }
+                // `Enum::Variant`, the enum possibly in a module (`Http::Status::Ok`).
+                let (&variant, head) = p.split_last().unwrap();
+                let head = match head {
+                    [name] => self.read_var(*name, span),
+                    _ => match self.member_slot(head) {
+                        Some(slot) => {
+                            let d = self.tmp(RegTy::Value);
+                            self.emit(Instr::GetGlobal(d, slot), span);
+                            (d, RegTy::Value)
+                        }
+                        None => return self.fail("unknown module in this path", span),
+                    },
+                };
                 let d = self.tmp(RegTy::Value);
-                self.emit(Instr::Variant(d, head.0, p[1]), span);
+                self.emit(Instr::Variant(d, head.0, variant), span);
                 (d, RegTy::Value)
             }
             ExprKind::List(items) => {
@@ -2161,6 +2382,31 @@ impl Compiler<'_> {
                 let dst = self.tmp(RegTy::Value);
                 self.emit(Instr::Call { dst, f: f.0, site }, span);
                 (dst, RegTy::Value)
+            }
+            ExprKind::MethodCall {
+                recv,
+                name,
+                args,
+                block,
+            } if self.module_of(recv).is_some() => {
+                // Function of a module: `Http.get(url)`.
+                let m = self.module_of(recv).unwrap();
+                let q = qualify(self.i, Some(m), name);
+                let slot = self.globals.slot(q);
+                let f = self.tmp(RegTy::Value);
+                self.emit(Instr::GetGlobal(f, slot), span);
+                let site = self.call_site(args, block);
+                let dst = self.tmp(RegTy::Value);
+                self.emit(Instr::Call { dst, f, site }, span);
+                (dst, RegTy::Value)
+            }
+            ExprKind::Field(recv, name) if self.module_of(recv).is_some() => {
+                let m = self.module_of(recv).unwrap();
+                let q = qualify(self.i, Some(m), name);
+                let slot = self.globals.slot(q);
+                let d = self.tmp(RegTy::Value);
+                self.emit(Instr::GetGlobal(d, slot), span);
+                (d, RegTy::Value)
             }
             ExprKind::MethodCall {
                 recv,
@@ -2989,6 +3235,7 @@ fn visit_block(ast: &Ast, b: &Block, f: &mut dyn FnMut(ExprId)) {
     for s in &b.stmts {
         match &s.kind {
             StmtKind::Expr(e) => visit(ast, *e, f),
+            StmtKind::Module(m) => visit_block(ast, &m.body, f),
             StmtKind::Let(l) => visit(ast, l.value, f),
             StmtKind::Def(d) => {
                 for p in d.params.iter().flatten() {

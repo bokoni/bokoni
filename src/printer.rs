@@ -98,6 +98,12 @@ impl Printer<'_> {
                 self.out.push(')');
             }
             StmtKind::Def(f) => self.def(f),
+            StmtKind::Module(m) => {
+                self.out.push_str("(module ");
+                self.name(m.name);
+                self.block(&m.body);
+                self.out.push(')');
+            }
             StmtKind::Type(t) => {
                 self.annotations(&t.annotations);
                 self.out.push('(');

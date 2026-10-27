@@ -44,6 +44,7 @@ pub fn check(
         fns: vec![FnCtx::default()],
         method: None,
         decl_ids: FxHashMap::default(),
+        module_scopes: FxHashMap::default(),
         quiet: 0,
         imported: FxHashMap::default(),
         prims: Prims::default(),
@@ -105,6 +106,8 @@ enum Ty {
     TypeValue(TypeId),
     Variant(EnumId),
     EnumValue(EnumId),
+    /// A module (qualified name): not a value, only `M::x` and `M.f()`.
+    Module(Symbol),
 }
 
 impl PartialEq for Ty {
@@ -131,6 +134,7 @@ impl PartialEq for Ty {
             | (TypeValue(a), TypeValue(b))
             | (Variant(a), Variant(b))
             | (EnumValue(a), EnumValue(b)) => a == b,
+            (Module(a), Module(b)) => a == b,
             _ => false,
         }
     }
@@ -216,6 +220,8 @@ struct TypeDef {
     required: Vec<(Symbol, Rc<str>)>,
     /// `abstract class` or `trait`: cannot be instantiated.
     is_abstract: bool,
+    /// Fields and methods known (a parent or a trait must be, to be used).
+    ready: bool,
     fields: Vec<FieldDef>,
     methods: FxHashMap<Symbol, Rc<FnSig>>,
     deprecated: Option<Dep>,
@@ -265,6 +271,8 @@ struct Var {
 #[derive(Default)]
 struct Scope {
     vars: FxHashMap<Symbol, Var>,
+    /// Body of a module (qualified name).
+    module: Option<Symbol>,
     /// Construction block (`T do … end`): the type being built.
     construct: Option<TypeId>,
     /// Function level of the scope (0: program).
@@ -295,6 +303,8 @@ struct Checker<'a> {
     method: Option<(TypeId, Symbol)>,
     /// Type of each hoisted declaration (key: address of the `TypeDecl`).
     decl_ids: FxHashMap<usize, TypeId>,
+    /// Scope of each module between its two phases (key: address of the `ModuleDecl`).
+    module_scopes: FxHashMap<usize, (Symbol, Scope)>,
     /// > 0: errors are not reported (importing declarations already executed).
     quiet: u32,
     /// Types and enums already defined at runtime, imported (key: address of the `Rc`).
@@ -533,6 +543,7 @@ impl Checker<'_> {
             Ty::TypeValue(id) => format!("type {}", self.name(self.types[*id].name)),
             Ty::Variant(id) => self.name(self.enums[*id].name).into(),
             Ty::EnumValue(id) => format!("enum {}", self.name(self.enums[*id].name)),
+            Ty::Module(m) => format!("module {}", self.name(*m)),
         }
     }
 
@@ -570,6 +581,150 @@ impl Checker<'_> {
         self.scopes.pop();
     }
 
+    // ─── Modules ─────────────────────────────────────────────────────────────
+
+    /// `prefix::name`, if it was interned (declared somewhere).
+    fn qualified(&self, prefix: Symbol, name: Symbol) -> Option<Symbol> {
+        self.i
+            .get(&format!("{}::{}", self.name(prefix), self.name(name)))
+    }
+
+    /// Name of a declaration of the current scope (in a module: `Module::name`).
+    fn decl_name(&self, name: Symbol) -> Symbol {
+        match self.scopes.last().and_then(|s| s.module) {
+            Some(m) => self.qualified(m, name).unwrap_or(name),
+            None => name,
+        }
+    }
+
+    /// Enclosing modules, innermost first.
+    fn modules(&self) -> Vec<Symbol> {
+        self.scopes.iter().rev().filter_map(|s| s.module).collect()
+    }
+
+    fn is_module(&mut self, q: Symbol) -> bool {
+        matches!(self.lookup(q).map(|(v, _)| v.ty.clone()), Some(Ty::Module(_)))
+            || self.globals.is_module(q)
+    }
+
+    /// Module named by a path written here, looked up in the enclosing modules first.
+    fn module_path(&mut self, path: &[Symbol]) -> Option<Symbol> {
+        let (&head, rest) = path.split_first()?;
+        let mut q = match self.lookup(head).map(|(v, _)| v.ty.clone()) {
+            Some(Ty::Module(q)) => q,
+            Some(_) => return None,
+            None => {
+                let mut found = None;
+                for p in self.modules().into_iter().map(Some).chain([None]) {
+                    let q = match p {
+                        Some(p) => self.qualified(p, head),
+                        None => Some(head),
+                    };
+                    if let Some(q) = q
+                        && self.is_module(q)
+                    {
+                        found = Some(q);
+                        break;
+                    }
+                }
+                found?
+            }
+        };
+        for &seg in rest {
+            q = self.qualified(q, seg)?;
+            if !self.is_module(q) {
+                return None;
+            }
+        }
+        Some(q)
+    }
+
+    /// The expression names a module (and not a variable).
+    fn module_of(&mut self, e: ExprId) -> Option<Symbol> {
+        let ast = self.ast;
+        match ast.kind(e) {
+            ExprKind::Ident(n) => self.module_path(&[n]),
+            ExprKind::Path(p) => self.module_path(ast.get(p)),
+            _ => None,
+        }
+    }
+
+    /// Type of member `name` of module `m` (`None`: no such member).
+    fn member_ty(&mut self, m: Symbol, name: Symbol) -> Option<Ty> {
+        // Module being checked: its scope is still open.
+        if let Some(v) = self
+            .scopes
+            .iter()
+            .rev()
+            .find(|s| s.module == Some(m))
+            .and_then(|s| s.vars.get(&name))
+        {
+            return Some(v.ty.clone());
+        }
+        let q = self.qualified(m, name)?;
+        match self.lookup(q).map(|(v, _)| v.ty.clone()) {
+            Some(t) => Some(t),
+            None => self.global_ty(q).map(|(t, _)| t),
+        }
+    }
+
+    /// `M::x`, `M.f`: the member's type, or an error.
+    fn member(&mut self, m: Symbol, name: Symbol, span: Span) -> Ty {
+        match self.member_ty(m, name) {
+            Some(t) => t,
+            None => {
+                let msg = format!("module `{}` has no `{}`", self.name(m), self.name(name));
+                self.error(msg, span);
+                Ty::Any
+            }
+        }
+    }
+
+    /// Module, first phase (with the enclosing block's declarations): its own
+    /// declarations, visible outside by their qualified name.
+    fn module_decls(&mut self, m: &ModuleDecl) {
+        let outer = self.scopes.last().and_then(|s| s.module);
+        let q = match outer {
+            Some(o) => self.qualified(o, m.name).unwrap_or(m.name),
+            None => m.name,
+        };
+        self.push_scope();
+        self.scopes.last_mut().unwrap().module = Some(q);
+        self.hoist(&m.body);
+        self.close_module(m, q);
+    }
+
+    /// Second phase, once the enclosing block is declared: its statements (run when
+    /// the block starts, before the block's own statements).
+    fn module_body(&mut self, m: &ModuleDecl) {
+        let key = m as *const ModuleDecl as usize;
+        let Some((q, scope)) = self.module_scopes.remove(&key) else {
+            return;
+        };
+        self.scopes.push(scope);
+        for s in &m.body.stmts {
+            if let StmtKind::Module(inner) = &s.kind {
+                self.module_body(inner);
+            }
+        }
+        for s in &m.body.stmts {
+            self.stmt(s);
+        }
+        self.close_module(m, q);
+    }
+
+    /// Pops the module's scope (kept for its second phase) and exports its names.
+    fn close_module(&mut self, m: &ModuleDecl, q: Symbol) {
+        let scope = self.scopes.pop().unwrap();
+        for (n, v) in &scope.vars {
+            if let Some(qn) = self.qualified(q, *n) {
+                self.scopes[0].vars.insert(qn, v.clone());
+            }
+        }
+        self.module_scopes
+            .insert(m as *const ModuleDecl as usize, (q, scope));
+    }
+
     fn declare(&mut self, name: Symbol, ty: Ty, kind: VarKind) {
         self.scopes.last_mut().unwrap().vars.insert(
             name,
@@ -604,6 +759,9 @@ impl Checker<'_> {
     /// Type of a global variable defined before this program (previous script, REPL, Rust
     /// function) and whether it is mutable.
     fn global_ty(&mut self, name: Symbol) -> Option<(Ty, bool)> {
+        if self.globals.is_module(name) {
+            return Some((Ty::Module(name), false));
+        }
         let (v, mutable) = self.globals.get_binding(name)?;
         let ty = match &v {
             Value::Type(info) => Ty::TypeValue(self.import_type(info)),
@@ -647,6 +805,7 @@ impl Checker<'_> {
             traits: Vec::new(),
             required: info.required.iter().map(|r| (r.name, r.by.clone())).collect(),
             is_abstract: info.is_abstract,
+            ready: true,
             fields: Vec::new(),
             methods: FxHashMap::default(),
             deprecated,
@@ -747,11 +906,29 @@ impl Checker<'_> {
                         "nil" => return Ty::Nil,
                         _ => {}
                     }
-                    let found = match self.lookup(*name).map(|(v, _)| v.ty.clone()) {
-                        Some(t) => Some(t),
-                        None => self.global_ty(*name).map(|g| g.0),
-                    };
+                    let mut found = self.lookup(*name).map(|(v, _)| v.ty.clone());
+                    if found.is_none() {
+                        for m in self.modules() {
+                            if self.qualified(m, *name).is_some() {
+                                found = self.member_ty(m, *name);
+                                if found.is_some() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if found.is_none() {
+                        found = self.global_ty(*name).map(|g| g.0);
+                    }
                     match found {
+                        Some(Ty::TypeValue(id)) => return Ty::Object(id),
+                        Some(Ty::EnumValue(id)) => return Ty::Variant(id),
+                        _ => {}
+                    }
+                } else if let Some((&last, prefix)) = path.split_last()
+                    && let Some(m) = self.module_path(prefix)
+                {
+                    match self.member_ty(m, last) {
                         Some(Ty::TypeValue(id)) => return Ty::Object(id),
                         Some(Ty::EnumValue(id)) => return Ty::Variant(id),
                         _ => {}
@@ -863,6 +1040,11 @@ impl Checker<'_> {
     /// Statements of a block in the current scope (declarations hoisted).
     fn block_stmts(&mut self, b: &Block) -> Ty {
         self.hoist(b);
+        for s in &b.stmts {
+            if let StmtKind::Module(m) = &s.kind {
+                self.module_body(m);
+            }
+        }
         let mut last = Ty::Nil;
         for s in &b.stmts {
             last = self.stmt(s);
@@ -901,19 +1083,25 @@ impl Checker<'_> {
                     self.decl_ids.insert(&**t as *const TypeDecl as usize, self.types.len());
                     let id = self.types.len();
                     let deprecated = self.ast_deprecation(&t.annotations);
+                    let qname = self.decl_name(t.name);
                     self.types.push(TypeDef {
-                        name: t.name,
+                        name: qname,
                         kind: t.kind,
                         parent: None,
                         traits: Vec::new(),
                         required: Vec::new(),
                         is_abstract: t.is_abstract || t.kind == TypeDeclKind::Trait,
+                        ready: false,
                         fields: Vec::new(),
                         methods: FxHashMap::default(),
                         deprecated,
                     });
                     self.declare(t.name, Ty::TypeValue(id), VarKind::Type);
                     pending_types.push((id, &**t));
+                }
+                StmtKind::Module(m) => {
+                    let q = self.decl_name(m.name);
+                    self.declare(m.name, Ty::Module(q), VarKind::Type);
                 }
                 StmtKind::Enum(e) => {
                     let id = self.enums.len();
@@ -923,8 +1111,9 @@ impl Checker<'_> {
                         .iter()
                         .map(|v| self.ast_deprecation(&v.annotations))
                         .collect();
+                    let qname = self.decl_name(e.name);
                     self.enums.push(EnumDef {
-                        name: e.name,
+                        name: qname,
                         variants: e.variants.iter().map(|v| v.name).collect(),
                         value_ty: Ty::Any,
                         methods: FxHashMap::default(),
@@ -936,10 +1125,22 @@ impl Checker<'_> {
                 _ => {}
             }
         }
+        // Declarations of the modules (their bodies run before the block's types).
+        for s in &b.stmts {
+            if let StmtKind::Module(m) = &s.kind {
+                if self.scopes.iter().skip(1).any(|s| s.module.is_none()) || self.fns.len() > 1 {
+                    self.error(
+                        "a `module` must be at the top level of the script (or in a module)",
+                        s.span,
+                    );
+                } else {
+                    self.module_decls(m);
+                }
+            }
+        }
         // 2. Fields and method signatures (a parent class's first: it must be declared
         // before).
-        let ids: Vec<TypeId> = pending_types.iter().map(|(id, _)| *id).collect();
-        for (k, (id, t)) in pending_types.into_iter().enumerate() {
+        for (id, t) in pending_types {
             let parent = t.parent.and_then(|(p, span)| {
                 let found = match self.lookup(p) {
                     Some((v, _)) => Some(v.ty.clone()),
@@ -947,8 +1148,7 @@ impl Checker<'_> {
                 };
                 match found {
                     Some(Ty::TypeValue(pid))
-                        if self.types[pid].kind == TypeDeclKind::Class
-                            && !ids[k..].contains(&pid) =>
+                        if self.types[pid].kind == TypeDeclKind::Class && self.types[pid].ready =>
                     {
                         Some(pid)
                     }
@@ -987,7 +1187,7 @@ impl Checker<'_> {
                 };
                 match found {
                     Some(Ty::TypeValue(tid))
-                        if self.types[tid].kind == TypeDeclKind::Trait && !ids[k..].contains(&tid) =>
+                        if self.types[tid].kind == TypeDeclKind::Trait && self.types[tid].ready =>
                     {
                         let tr = &self.types[tid];
                         for (name, sig) in &tr.methods {
@@ -1104,6 +1304,7 @@ impl Checker<'_> {
             self.types[id].methods = methods;
             self.types[id].required = required;
             self.types[id].traits = traits;
+            self.types[id].ready = true;
         }
         for s in &b.stmts {
             if let StmtKind::Enum(e) = &s.kind {
@@ -1225,8 +1426,10 @@ impl Checker<'_> {
                 self.function(f, &sig, None);
                 Ty::Nil
             }
+            // Checked with the declarations (`hoist`).
+            StmtKind::Module(_) => Ty::Nil,
             StmtKind::Type(_) | StmtKind::Enum(_)
-                if self.scopes.len() > 1 || self.fns.len() > 1 =>
+                if self.scopes.iter().skip(1).any(|s| s.module.is_none()) || self.fns.len() > 1 =>
             {
                 self.error(
                     "`type`, `class`, `annotation` and `enum` declarations must be at the top level of the script",
@@ -1652,8 +1855,17 @@ impl Checker<'_> {
                 args,
                 block,
             } => {
+                if let Some(m) = self.module_of(recv) {
+                    let f = self.member(m, name, span);
+                    let label = format!("`{}.{}`", self.name(m), self.name(name));
+                    return self.call(&f, args, block, span, Some(&label));
+                }
                 let r = self.expr(recv, None);
                 self.method_call(&r, name, args, block, span)
+            }
+            ExprKind::Field(recv, name) if self.module_of(recv).is_some() => {
+                let m = self.module_of(recv).unwrap();
+                self.member(m, name, span)
             }
             ExprKind::Field(recv, name) => {
                 let r = self.expr(recv, None);
@@ -1892,11 +2104,28 @@ impl Checker<'_> {
                     return Ty::Any;
                 }
                 let ty = v.ty.clone();
+                if let Ty::Module(m) = ty {
+                    let m = self.name(m).to_string();
+                    self.error(format!("`{m}` is a module: use `{m}::Name` or `{m}.f(…)`"), span);
+                    return Ty::Any;
+                }
                 self.warn_value(&ty, name, span);
                 ty
             }
             None => {
+                // Member of an enclosing module declared by an earlier script.
+                for m in self.modules() {
+                    if let Some(t) = self.member_ty(m, name).filter(|_| self.qualified(m, name).is_some())
+                    {
+                        return t;
+                    }
+                }
                 if let Some((t, _)) = self.global_ty(name) {
+                    if let Ty::Module(m) = t {
+                        let m = self.name(m).to_string();
+                        self.error(format!("`{m}` is a module: use `{m}::Name` or `{m}.f(…)`"), span);
+                        return Ty::Any;
+                    }
                     self.warn_value(&t, name, span);
                     return t;
                 }
@@ -1950,13 +2179,29 @@ impl Checker<'_> {
     }
 
     fn path(&mut self, path: &[Symbol], span: Span) -> Ty {
-        let [head, variant] = path else {
-            self.error("only `Enum::Variant` paths are allowed", span);
+        let (&last, prefix) = path.split_last().unwrap();
+        // Member of a module: `Http::Request`.
+        if let Some(m) = self.module_path(prefix) {
+            return self.member(m, last, span);
+        }
+        if self.module_path(path).is_some() {
+            self.error("a module is not a value", span);
             return Ty::Any;
-        };
-        let head_ty = match self.lookup(*head).map(|(v, _)| v.ty.clone()) {
-            Some(t) => Some(t),
-            None => self.global_ty(*head).map(|g| g.0),
+        }
+        // `Enum::Variant`, the enum possibly in a module (`Http::Status::Ok`).
+        let (head, variant) = (&prefix[prefix.len() - 1], &last);
+        let head_ty = match prefix {
+            [h] => match self.lookup(*h).map(|(v, _)| v.ty.clone()) {
+                Some(t) => Some(t),
+                None => self.global_ty(*h).map(|g| g.0),
+            },
+            _ => match self.module_path(&prefix[..prefix.len() - 1]) {
+                Some(m) => self.member_ty(m, *head),
+                None => {
+                    self.error("unknown module in this path", span);
+                    return Ty::Any;
+                }
+            },
         };
         match head_ty {
             Some(Ty::EnumValue(id)) => {

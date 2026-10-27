@@ -161,6 +161,7 @@ impl Tracker {
             | T::Enum
             | T::Annotation
             | T::Macro
+            | T::Module
             | T::Case
             | T::For
             | T::Begin
@@ -349,6 +350,7 @@ fn is_keyword(kind: TokenKind) -> bool {
             | T::Enum
             | T::Annotation
             | T::Macro
+            | T::Module
             | T::True
             | T::False
             | T::Nil
@@ -714,6 +716,17 @@ impl Parser<'_, '_> {
                 StmtKind::Type(Box::new(self.type_decl(annotations)?))
             }
             T::Enum => StmtKind::Enum(Box::new(self.enum_decl(annotations)?)),
+            T::Module => {
+                let start = self.bump().span;
+                let (name, name_span) = self.ident("after `module`")?;
+                let body = self.block_end("module", start)?;
+                StmtKind::Module(Box::new(ModuleDecl {
+                    name,
+                    name_span,
+                    body,
+                    span: self.span_from(start),
+                }))
+            }
             T::Macro => {
                 return self
                     .error_here("macros are not supported yet (planned: version 3)");
@@ -911,6 +924,18 @@ impl Parser<'_, '_> {
         Ok((name, name_span, params, ret))
     }
 
+    /// `Name` or `Module::Name`, as one name.
+    fn qualified_name(&mut self, context: &str) -> Result<(Symbol, Span)> {
+        let (mut name, mut span) = self.ident(context)?;
+        while self.eat(T::ColonColon) {
+            let (seg, s) = self.ident("after `::`")?;
+            span = span.to(s);
+            let q = format!("{}::{}", self.interner.resolve(name), self.interner.resolve(seg));
+            name = self.interner.intern(&q);
+        }
+        Ok((name, span))
+    }
+
     /// A `?` attached to the end of `span` (`to_i?`, `xs[i]?`) is consumed and added
     /// to it.
     fn question_suffix(&mut self, span: Span) -> Span {
@@ -998,7 +1023,7 @@ impl Parser<'_, '_> {
                 ));
             }
             self.bump();
-            Some(self.ident("after `<`")?)
+            Some(self.qualified_name("after `<`")?)
         } else {
             None
         };
@@ -1074,7 +1099,7 @@ impl Parser<'_, '_> {
             }
             (T::Include, _) => {
                 self.bump();
-                let (name, span) = self.ident("after `include`")?;
+                let (name, span) = self.qualified_name("after `include`")?;
                 Member::Include(name, span)
             }
             (T::Ident, T::Colon | T::Eq) => {
