@@ -91,6 +91,9 @@ pub struct Proto {
     pub handlers: Vec<Handler>,
     /// Number of slots where a handler keeps the error it caught (`Term::Reraise`).
     pub nslots: u32,
+    /// `forall` function: its copies typed for given type arguments (`T = int`), for
+    /// the typed JIT.
+    pub specs: std::cell::RefCell<Vec<(Vec<RtType>, Rc<Proto>)>>,
 }
 
 /// Where an error raised in a block goes (`begin … rescue` / `ensure`).
@@ -168,6 +171,7 @@ pub enum ProtoKind {
     Annotation,
 }
 
+#[derive(Clone)]
 pub struct ParamProto {
     pub name: Symbol,
     pub reg: Reg,
@@ -187,6 +191,7 @@ pub enum Capture {
     Up(u32),
 }
 
+#[derive(Clone)]
 pub struct Block {
     pub instrs: Vec<Instr>,
     pub spans: Vec<Span>,
@@ -220,6 +225,7 @@ impl Access {
 }
 
 /// Call: arguments in registers `start..start + npos + named.len()`.
+#[derive(Clone)]
 pub struct CallSite {
     pub start: Reg,
     pub npos: u32,
@@ -270,8 +276,34 @@ pub enum RtType {
     Named(u32, Symbol),
 }
 
+/// Runtime type of annotation `expr` (compiled as `orig`) with the type parameters
+/// `names` replaced by `tys`.
+fn subst_rt(expr: &TypeExpr, orig: &RtType, names: &[Symbol], tys: &[RtType]) -> RtType {
+    use crate::ast::TypeKind;
+    match (&expr.kind, orig) {
+        (TypeKind::Named(path), _) if path.len() == 1 => {
+            match names.iter().position(|n| *n == path[0]) {
+                Some(i) => tys[i].clone(),
+                None => orig.clone(),
+            }
+        }
+        (TypeKind::List(x), RtType::List(o)) => RtType::List(Box::new(subst_rt(x, o, names, tys))),
+        (TypeKind::Optional(x), RtType::Optional(o)) => {
+            RtType::Optional(Box::new(subst_rt(x, o, names, tys)))
+        }
+        (TypeKind::Tuple(xs), RtType::Tuple(os)) if xs.len() == os.len() => RtType::Tuple(
+            xs.iter()
+                .zip(os)
+                .map(|(x, o)| subst_rt(x, o, names, tys))
+                .collect(),
+        ),
+        _ => orig.clone(),
+    }
+}
+
 /// `type` / `class` / `annotation` / `enum` declaration, executed by `DefType` /
 /// `DefEnum`.
+#[derive(Clone)]
 pub enum Decl {
     Type(Rc<TypeDeclIr>),
     Enum(Rc<EnumDeclIr>),
@@ -546,6 +578,95 @@ pub enum Term {
 // ─── Display ────────────────────────────────────────────────────────────────
 
 impl Proto {
+    /// Function with `forall` type parameters (erased: its annotations `T` are `any`).
+    pub fn is_generic(&self) -> bool {
+        self.kind == ProtoKind::Function && self.decl.as_ref().is_some_and(|d| !d.forall.is_empty())
+    }
+
+    /// Type arguments of this `forall` function for a call, each found from a parameter
+    /// written `T` or `[T]` (`arg(k)`: type of argument `k`); `None` if one is unknown.
+    pub fn type_args(&self, arg: &dyn Fn(usize) -> Option<RtType>) -> Option<Vec<RtType>> {
+        use crate::ast::TypeKind;
+        let decl = self.decl.as_ref()?;
+        decl.forall
+            .iter()
+            .map(|tp| {
+                let is_t =
+                    |e: &TypeExpr| matches!(&e.kind, TypeKind::Named(p) if p[..] == [tp.name]);
+                self.params.iter().enumerate().find_map(|(k, p)| {
+                    let e = &p.ty.as_ref()?.expr;
+                    match &e.kind {
+                        _ if is_t(e) => arg(k),
+                        TypeKind::List(x) if is_t(x) => match arg(k)? {
+                            RtType::List(t) => Some(*t),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Copy of this `forall` function with its type parameters replaced by `tys` in the
+    /// annotations of its parameters and its return (created once per `tys`). Same code:
+    /// only the typed JIT, which reads the annotations, sees a difference.
+    pub fn specialize(&self, tys: &[RtType]) -> Rc<Proto> {
+        if let Some((_, p)) = self.specs.borrow().iter().find(|(k, _)| k == tys) {
+            return p.clone();
+        }
+        let names: Vec<Symbol> = self
+            .decl
+            .as_ref()
+            .unwrap()
+            .forall
+            .iter()
+            .map(|p| p.name)
+            .collect();
+        let sub = |t: &TypeRef| TypeRef {
+            ty: Rc::new(subst_rt(&t.expr, &t.ty, &names, tys)),
+            ..t.clone()
+        };
+        let p = Rc::new(Proto {
+            name: self.name.clone(),
+            script: self.script.clone(),
+            kind: self.kind,
+            params: self
+                .params
+                .iter()
+                .map(|p| ParamProto {
+                    ty: p.ty.as_ref().map(sub),
+                    ..p.clone()
+                })
+                .collect(),
+            ret: self.ret.as_ref().map(sub),
+            regs: self.regs.clone(),
+            ncells: self.ncells,
+            captures: self.captures.clone(),
+            blocks: self.blocks.clone(),
+            consts: self.consts.clone(),
+            calls: self.calls.clone(),
+            shapes: self.shapes.clone(),
+            types: self.types.clone(),
+            records: self.records.clone(),
+            children: self.children.clone(),
+            decls: self.decls.clone(),
+            decl: self.decl.clone(),
+            vis: self.vis,
+            jit: Default::default(),
+            jit_dyn: Default::default(),
+            calls_seen: Default::default(),
+            has_loop: self.has_loop,
+            plain_params: self.plain_params,
+            annotations: self.annotations.clone(),
+            handlers: self.handlers.clone(),
+            nslots: self.nslots,
+            specs: Default::default(),
+        });
+        self.specs.borrow_mut().push((tys.to_vec(), p.clone()));
+        p
+    }
+
     /// Readable text of the IR (and of its nested functions).
     pub fn dump(&self, i: &Interner) -> String {
         let mut out = String::new();

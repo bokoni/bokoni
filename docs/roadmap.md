@@ -265,7 +265,10 @@ namespaces, `trait` for shared behavior.
 - [x] Checked statically only, erased at run time (no cost); declarations of previous
       scripts known with their parameters; `TypeDesc::params`
 - [x] Fix: calling a parameter of function type (`f: (int): int`) crashed the checker
-- [ ] Native code specialized by type argument (typed JIT for `forall` functions)
+- [x] Typed JIT for `forall` functions: a copy per type of the arguments
+      (`T = int`, `[float]`, objects), called directly by native code or by the
+      interpreter; ×37 on a generic `max` in a hot loop
+- [ ] Methods of generic classes (methods are not compiled by the typed JIT yet)
 
 ### Next
 
@@ -273,7 +276,6 @@ In suggested order:
 
 1. **Crystal-style macros** (v3 of `syntax.md`): hygiene and AST exposure still open;
    benefit from generics and modules.
-2. Typed JIT for generic functions, specialized by type argument.
 
 No design decision needed:
 

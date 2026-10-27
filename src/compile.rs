@@ -727,6 +727,7 @@ impl Compiler<'_> {
             calls_seen: Default::default(),
             has_loop,
             plain_params,
+            specs: Default::default(),
         })
     }
 

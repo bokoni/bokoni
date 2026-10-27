@@ -186,12 +186,15 @@ impl Engine {
     }
 
     /// Whether the global function `name` was compiled to native code (after at least one
-    /// call).
+    /// call). For a `forall` function: one of its copies typed for the arguments of a call
+    /// (`T = int`).
     pub fn is_native(&self, name: &str) -> bool {
+        let native =
+            |p: &crate::ir::Proto| matches!(*p.jit.borrow(), crate::ir::JitState::Native(_));
         match self.get_global(name).as_ref() {
             Some(Value::Function(f)) => match &**f {
                 Function::Script(c) => {
-                    matches!(*c.proto.jit.borrow(), crate::ir::JitState::Native(_))
+                    native(&c.proto) || c.proto.specs.borrow().iter().any(|(_, s)| native(s))
                 }
                 _ => false,
             },

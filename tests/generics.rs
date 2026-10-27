@@ -272,3 +272,52 @@ fn generic_errors() {
         "expected type `int` for argument 1, got `str`",
     );
 }
+
+#[test]
+#[cfg(feature = "jit")]
+fn forall_functions_are_compiled_per_type() {
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    let src = "def max(a: T, b: T): T forall T = if a > b then a else b end
+def sum(xs: [T], zero: T): T forall T
+  let t = zero
+  for x in xs
+    t = t + x
+  end
+  t
+end
+def clamp(x: int, lo: int, hi: int): int = max(lo, if x > hi then hi else x end)
+let ints = 0
+let floats = 0.0
+for i in 0..300
+  ints += max(i, 150)
+  floats += max(i * 0.5, 10.0)
+end
+[ints, floats, sum([1, 2, 3], 0), sum([0.5, 1.5], 0.0), clamp(7, 0, 5), clamp(-3, 0, 5)]";
+    let v = e.eval(src).unwrap();
+    assert_eq!(e.inspect(&v), "[56475, 22680.0, 6, 2.0, 5, 0]");
+    // A copy per type: `max` called by the interpreter (`int`, `float`) and directly by
+    // the native code of `clamp`.
+    assert!(e.is_native("max"));
+    assert!(e.is_native("sum"));
+    assert!(e.is_native("clamp"));
+    // Not for every value: strings stay interpreted, same result.
+    assert_eq!(e.eval_as::<String>("max(\"a\", \"b\")").unwrap(), "b");
+    // Arguments that do not fit the copy (`T = int` from the first one; without static
+    // checks, which refuse it): interpreted.
+    e.set_static_checks(false);
+    assert_eq!(e.eval_as::<f64>("max(1, 2.5)").unwrap(), 2.5);
+    e.eval("def mixed(x: int): float = max(x, 2.5)").unwrap();
+    assert_eq!(e.eval_as::<f64>("mixed(3)").unwrap(), 3.0);
+    assert!(!e.is_native("mixed"));
+    e.set_static_checks(true);
+    // Recursion: the typed copy calls itself.
+    e.eval("def total(xs: [T], i: int): int forall T = if i >= xs.len() then 0 else 1 + total(xs, i + 1) end")
+        .unwrap();
+    assert_eq!(
+        e.eval_as::<i64>("total([5, 6, 7], 0) + total([0.5], 0)")
+            .unwrap(),
+        4
+    );
+    assert!(e.is_native("total"));
+}

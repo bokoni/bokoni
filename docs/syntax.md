@@ -638,6 +638,8 @@ As in Ruby and Crystal:
 
 Functions and types may take type parameters, as in Crystal. They are checked by the
 checker and erased at run time (a `T` is checked as `any`, a `Box(int)` as a `Box`).
+The JIT compiles a `forall` function once per type it is called with (`max` for
+`int`, `max` for `float`), as fast as a function written for that type.
 
 ```ruby
 def first(xs: [T]): T? forall T = xs[0]?
@@ -1000,5 +1002,4 @@ begin rescue ensure raise super trait abstract include type class enum annotatio
 
 - Variance of generic types: compatible when their arguments are (covariant, like
   lists), which is lenient for a `Box(T)` that can be modified.
-- Native compilation specialized by type argument (a `forall T` function is
-  compiled as untyped code today).
+- Methods of generic classes compiled per type argument, like `forall` functions.

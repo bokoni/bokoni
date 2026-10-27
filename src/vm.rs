@@ -1313,6 +1313,14 @@ impl Runtime {
         if !self.jit_enabled || proto.kind != ProtoKind::Function {
             return None;
         }
+        // `forall` function: its copy typed for these arguments (`T = int`).
+        let spec;
+        let proto = if proto.is_generic() {
+            spec = specialization(proto, regs)?;
+            &spec
+        } else {
+            proto
+        };
         if matches!(*proto.jit.borrow(), JitState::Untried) {
             if self.jit.is_none() {
                 self.jit = crate::jit::Jit::new();
@@ -1960,6 +1968,49 @@ impl TypeInfo {
             script: script.clone(),
         })
     }
+}
+
+/// Copy of `forall` function `proto` typed for its arguments in `regs`: `T` found from a
+/// simple value (`int`, `float`, `bool`) or a list of them, every argument then of
+/// exactly the type of its parameter (the generic function's arguments are not checked:
+/// its annotations are `any`). `None`: no typed copy for these arguments.
+#[cfg(feature = "jit")]
+fn specialization(proto: &Rc<Proto>, regs: &[Value]) -> Option<Rc<Proto>> {
+    fn simple(v: &Value) -> Option<RtType> {
+        match v {
+            Value::Int(_) => Some(RtType::Int),
+            Value::Float(_) => Some(RtType::Float),
+            Value::Bool(_) => Some(RtType::Bool),
+            _ => None,
+        }
+    }
+    fn fits(v: &Value, t: &RtType) -> bool {
+        match (t, v) {
+            (RtType::Int, Value::Int(_))
+            | (RtType::Float, Value::Float(_))
+            | (RtType::Bool, Value::Bool(_)) => true,
+            (RtType::List(e), Value::List(l)) => l.borrow().iter().all(|x| fits(x, e)),
+            (RtType::Any, _) => true,
+            _ => false,
+        }
+    }
+    let arg = |k: usize| {
+        let v = &regs[proto.params.get(k)?.reg as usize];
+        match v {
+            Value::List(l) => {
+                let first = simple(l.borrow().first()?)?;
+                Some(RtType::List(Box::new(first)))
+            }
+            v => simple(v),
+        }
+    };
+    let tys = proto.type_args(&arg)?;
+    let spec = proto.specialize(&tys);
+    let ok = spec.params.iter().all(|p| match &p.ty {
+        Some(t) => fits(&regs[p.reg as usize], &t.ty),
+        None => true,
+    });
+    ok.then_some(spec)
 }
 
 /// Advances the iterator in register `iter`: `true` and the element in `dst`, or `false`.

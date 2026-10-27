@@ -12,6 +12,9 @@
 //!   with the same messages and the same call stack.
 //! - A call to a global function is direct (native code → native code). If the global is
 //!   redefined, the calling code is invalidated, then recompiled when needed.
+//! - A `forall` function (its annotations `T` are `any` at run time) is compiled as a copy
+//!   typed for the arguments of a call (`T = int`, see `Proto::specialize`): one copy per
+//!   type, called directly by native code, or by the interpreter when the arguments fit.
 //!
 //! Internal calling convention: `fn(ctx, params…) -> (status, result)`, status 0 = success,
 //! 1 = error (described in `ctx`). Each function also has an entry point for Rust:
@@ -496,8 +499,11 @@ struct Plan {
     /// if any.
     defs: Vec<Vec<Option<JTy>>>,
     term_defs: Vec<Option<JTy>>,
-    /// Functions called directly.
+    /// Functions called directly: their global slots.
     callees: Vec<u32>,
+    /// Function called by each `Call` (key: address of the instruction): the one in the
+    /// global, or its copy typed for the arguments (`forall` function).
+    targets: FxHashMap<usize, Rc<Proto>>,
     /// Constructed types (`T(…)`).
     ctors: Vec<u32>,
     /// Types of objects and list elements (`JTy::Obj` / `List` / `Iter`).
@@ -520,6 +526,7 @@ struct Analysis<'a> {
     anns: Vec<RtType>,
     callees: Vec<u32>,
     ctors: Vec<u32>,
+    targets: FxHashMap<usize, Rc<Proto>>,
 }
 
 impl Analysis<'_> {
@@ -631,7 +638,11 @@ impl Analysis<'_> {
                     }
                     JTy::Ctor(*slot)
                 } else {
-                    self.sig_of(*slot)?;
+                    // A `forall` function: typed for the arguments at the call.
+                    let generic = global_proto(self.globals, *slot).is_some_and(|q| q.is_generic());
+                    if !generic {
+                        self.sig_of(*slot)?;
+                    }
                     if !self.callees.contains(slot) {
                         self.callees.push(*slot);
                     }
@@ -642,14 +653,36 @@ impl Analysis<'_> {
                 let site = &p.calls[*site as usize];
                 match g(*f)? {
                     JTy::Callee(slot) => {
-                        let (cparams, _) = self.sig_of(slot)?;
+                        let mut callee = global_proto(self.globals, slot)?;
+                        if callee.is_generic() {
+                            let anns = &self.anns;
+                            let arg = |k: usize| {
+                                if k >= site.npos as usize {
+                                    return None;
+                                }
+                                Some(match g(site.start + k as u32)? {
+                                    JTy::Int => RtType::Int,
+                                    JTy::Float => RtType::Float,
+                                    JTy::Bool => RtType::Bool,
+                                    JTy::Obj(a) => anns[a as usize].clone(),
+                                    JTy::List(a) => {
+                                        RtType::List(Box::new(anns[a as usize].clone()))
+                                    }
+                                    _ => return None,
+                                })
+                            };
+                            let tys = callee.type_args(&arg)?;
+                            callee = callee.specialize(&tys);
+                        }
+                        let (cparams, _) = native_sig(&callee)?;
                         if site.block
                             || !site.named.is_empty()
                             || site.npos as usize != cparams.len()
                         {
                             return None;
                         }
-                        let callee = global_proto(self.globals, slot)?;
+                        self.targets
+                            .insert(ins as *const Instr as usize, callee.clone());
                         for (k, pt) in cparams.iter().enumerate() {
                             let at = g(site.start + k as u32)?;
                             let ok = match (pt, at) {
@@ -695,6 +728,7 @@ fn analyze(p: &Proto, globals: &Globals, len: crate::intern::Symbol) -> Option<P
         anns: Vec::new(),
         callees: Vec::new(),
         ctors: Vec::new(),
+        targets: FxHashMap::default(),
     };
     // Typed IR registers: their type does not change.
     let fixed: Vec<Option<JTy>> = p
@@ -794,6 +828,7 @@ fn analyze(p: &Proto, globals: &Globals, len: crate::intern::Symbol) -> Option<P
         callees: an.callees,
         ctors: an.ctors,
         anns: an.anns,
+        targets: an.targets,
     })
 }
 
@@ -1014,11 +1049,7 @@ impl Jit {
             }
             let plan = analyze(&p, globals, self.len_sym);
             if let Some(plan) = &plan {
-                for slot in &plan.callees {
-                    if let Some(q) = global_proto(globals, *slot) {
-                        todo.push(q);
-                    }
-                }
+                todo.extend(plan.targets.values().cloned());
             }
             plans.insert(key, plan);
             order.push(p);
@@ -1031,17 +1062,10 @@ impl Jit {
                 let Some(Some(plan)) = plans.get(&key) else {
                     continue;
                 };
-                let blocked = plan
-                    .callees
-                    .iter()
-                    .any(|slot| match global_proto(globals, *slot) {
-                        Some(q) => {
-                            let k = Rc::as_ptr(&q) as usize;
-                            !self.compiled.contains_key(&k)
-                                && !matches!(plans.get(&k), Some(Some(_)))
-                        }
-                        None => true,
-                    });
+                let blocked = plan.targets.values().any(|q| {
+                    let k = Rc::as_ptr(q) as usize;
+                    !self.compiled.contains_key(&k) && !matches!(plans.get(&k), Some(Some(_)))
+                });
                 if blocked {
                     plans.insert(key, None);
                     changed = true;
@@ -1165,11 +1189,14 @@ impl Jit {
         ctx.func.name = UserFuncName::user(0, id.as_u32());
         // Called functions, known in this function.
         let mut callee_refs = FxHashMap::default();
-        for slot in &plan.callees {
-            let q = global_proto(globals, *slot).ok_or(())?;
-            let cid = self.compiled.get(&(Rc::as_ptr(&q) as usize)).ok_or(())?.id;
+        for q in plan.targets.values() {
+            let key = Rc::as_ptr(q) as usize;
+            if callee_refs.contains_key(&key) {
+                continue;
+            }
+            let cid = self.compiled.get(&key).ok_or(())?.id;
             let r = self.module.declare_func_in_func(cid, &mut ctx.func);
-            callee_refs.insert(*slot, (r, q));
+            callee_refs.insert(key, (r, q.clone()));
         }
         let trace_ref = self
             .module
@@ -1722,10 +1749,14 @@ impl Jit {
                         build!(bx, *d, None, items, (*start..*start + *n).collect());
                     }
                     Call { dst, f, site } => {
-                        let Some(JTy::Callee(slot)) = tyof!(*f) else {
+                        let Some(JTy::Callee(_)) = tyof!(*f) else {
                             return Err(());
                         };
-                        let (fref, q) = callee_refs[&slot].clone();
+                        let target = plan
+                            .targets
+                            .get(&(ins as *const Instr as usize))
+                            .ok_or(())?;
+                        let (fref, q) = callee_refs[&(Rc::as_ptr(target) as usize)].clone();
                         let (cparams, cret) = native_sig(&q).ok_or(())?;
                         let site = &p.calls[*site as usize];
                         let mut args = vec![ctxv];
