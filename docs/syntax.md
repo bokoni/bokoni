@@ -537,7 +537,66 @@ pets.map(|p| p.describe())                 # ["rex says woof", "bit says woof (1
 - A subclass instance is accepted wherever the parent is expected (`a: Animal`,
   `[Animal]`, `rescue e: Animal`); the reverse is a type error.
 - The parent must be declared before, in the same script or a previous one. No multiple
-  inheritance; interfaces / traits may come later.
+  inheritance: share behavior with traits.
+
+### Traits
+
+A `trait` describes behavior shared by classes that are not related: methods to provide
+(`abstract def`, a signature without body) and methods provided (with a body, which
+can call the others through `self`). A class takes them with `include`, as many as it
+needs:
+
+```ruby
+trait Greet
+  abstract def name(): str
+  def greet(): str = "Hello #{self.name()}"
+end
+
+class User
+  include Greet
+  def init(@name: str)
+  end
+  def name(): str = @name
+end
+
+class Robot
+  include Greet
+  def name(): str = "R2"
+  def greet(): str = "beep"                 # redefines the trait's
+end
+
+def welcome(x: Greet): str = x.greet()      # a trait is a type
+welcome(User("ann"))                        # "Hello ann"
+```
+
+- Precedence: the class's own methods, then the included traits' (in order), then the
+  parent's.
+- A class that does not define a required method is an error (before running):
+  `` `User` must define `name` (required by `Greet`) ``. A method provided by another
+  trait or by the parent counts.
+- A trait has no fields and is not instantiated; it is nominal: only the classes that
+  `include` it are of its type (`x: Greet`, `[Greet]`, `rescue e: Retryable`).
+- `include` only in a class; a trait does not include another one (yet).
+
+### Abstract classes
+
+```ruby
+abstract class Shape
+  abstract def area(): float
+  def describe(): str = "area #{self.area()}"
+end
+
+class Square < Shape
+  def init(@side: float)
+  end
+  def area(): float = @side * @side
+end
+
+Shape()                                     # error: an abstract class
+```
+
+An `abstract class` cannot be instantiated and may declare `abstract def`s; its
+subclasses must define them, unless they are abstract too.
 
 ## Comments
 
@@ -738,7 +797,7 @@ Point(x: 1).to_s()            # "Point(x=1, y=0)"
 ## Reserved words
 
 `let def end if elsif else unless then case when while for in do break next return
-begin rescue ensure raise super type class enum annotation macro true false nil and or not`
+begin rescue ensure raise super trait abstract include type class enum annotation macro true false nil and or not`
 
 ## Open questions
 

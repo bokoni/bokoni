@@ -28,10 +28,26 @@ pub struct TypeInfo {
     /// Parent class (`class B < A`); its fields come first in `fields`, and its methods
     /// are in `methods` unless redefined.
     pub parent: Option<Rc<TypeInfo>>,
+    /// Traits included, by the class or its ancestors.
+    pub traits: Vec<Rc<TypeInfo>>,
+    /// Methods still to be defined (`abstract def`). Empty for a class that can be
+    /// instantiated.
+    pub required: Vec<Required>,
+    /// `abstract class` (or `trait`): cannot be instantiated.
+    pub is_abstract: bool,
     pub fields: Vec<FieldInfo>,
     pub methods: FxHashMap<Symbol, Rc<Proto>>,
     pub script: Rc<Script>,
     pub annotations: crate::ir::Annotations,
+}
+
+/// A method to be defined by a class: declared `abstract` by a trait or a class.
+#[derive(Clone)]
+pub struct Required {
+    pub name: Symbol,
+    /// Trait or class that requires it.
+    pub by: Rc<str>,
+    pub decl: Rc<crate::ast::FnDecl>,
 }
 
 #[derive(Clone)]
@@ -48,8 +64,11 @@ impl TypeInfo {
         self.fields.iter().position(|f| f.name == name)
     }
 
-    /// Is it `other`, or a class that inherits from it?
+    /// Is it `other`, a class that inherits from it, or one that includes it (trait)?
     pub fn is_a(self: &Rc<Self>, other: &Rc<TypeInfo>) -> bool {
+        if other.kind == TypeDeclKind::Trait {
+            return self.traits.iter().any(|t| Rc::ptr_eq(t, other));
+        }
         let mut t = self;
         loop {
             if Rc::ptr_eq(t, other) {
@@ -134,6 +153,17 @@ impl Runtime {
         block: Option<&Closure>,
         span: Span,
     ) -> R {
+        if info.is_abstract {
+            let what = if info.kind == TypeDeclKind::Trait {
+                "a trait"
+            } else {
+                "an abstract class"
+            };
+            return type_err(
+                format!("`{}` is {what}: it cannot be instantiated", info.name),
+                span,
+            );
+        }
         if info.kind == TypeDeclKind::Class {
             return self.instantiate_class(info, args, block, span);
         }

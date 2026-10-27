@@ -772,6 +772,7 @@ impl Runtime {
             && site.shapes.iter().all(Option::is_none)
             && let Value::Type(info) = &reg!(f)
             && info.kind != crate::ast::TypeDeclKind::Class
+            && !info.is_abstract
             && info.fields.len() == site.npos as usize + site.named.len()
         {
             let start = site.start as usize;
@@ -1163,7 +1164,20 @@ impl Runtime {
                     },
                     None => None,
                 };
-                let info = TypeInfo::new(t, parent, &proto.script, &self.interner);
+                let mut traits = Vec::with_capacity(t.traits.len());
+                for &s in &t.traits {
+                    match &self.globals.at(s).value {
+                        Some(Value::Type(info)) if info.kind == TypeDeclKind::Trait => {
+                            traits.push(info.clone());
+                        }
+                        _ => {
+                            let n = self.name(self.globals.at(s).name).to_string();
+                            return type_err(format!("`{n}` is not a trait"), span);
+                        }
+                    }
+                }
+                let info = TypeInfo::new(t, parent, traits, &proto.script, &self.interner)
+                    .map_err(|m| Error::type_error(m, span))?;
                 self.globals
                     .set_slot(*slot, Value::Type(Rc::new(info)), false);
             }
@@ -1861,12 +1875,15 @@ fn float_op(op: BinOp, x: f64, y: f64) -> Value {
 }
 
 impl TypeInfo {
+    /// Error: a method required by a trait or an abstract parent is not defined.
     pub(crate) fn new(
         t: &TypeDeclIr,
         parent: Option<Rc<TypeInfo>>,
+        traits: Vec<Rc<TypeInfo>>,
         script: &Rc<Script>,
         i: &Interner,
-    ) -> Self {
+    ) -> Result<Self, String> {
+        let name: Rc<str> = i.resolve(t.name).into();
         let own = t.fields.iter().map(|f| crate::objects::FieldInfo {
             name: f.name,
             ty: f.ty.clone(),
@@ -1878,16 +1895,51 @@ impl TypeInfo {
             None => (Vec::new(), FxHashMap::default()),
         };
         fields.extend(own);
+        // Precedence: own methods, then the traits' (in order), then the parent's.
+        let mut required: Vec<crate::objects::Required> =
+            parent.as_ref().map_or(Vec::new(), |p| p.required.clone());
+        let mut all_traits: Vec<Rc<TypeInfo>> =
+            parent.as_ref().map_or(Vec::new(), |p| p.traits.clone());
+        for tr in &traits {
+            methods.extend(tr.methods.iter().map(|(n, m)| (*n, m.clone())));
+            required.extend(tr.required.iter().cloned());
+            if !all_traits.iter().any(|x| Rc::ptr_eq(x, tr)) {
+                all_traits.push(tr.clone());
+            }
+        }
         methods.extend(t.methods.iter().cloned());
-        TypeInfo {
-            name: i.resolve(t.name).into(),
+        required.extend(t.abstracts.iter().map(|d| crate::objects::Required {
+            name: d.name,
+            by: name.clone(),
+            decl: d.clone(),
+        }));
+        required.retain(|r| !methods.contains_key(&r.name));
+        let mut seen = Vec::new();
+        required.retain(|r| {
+            let new = !seen.contains(&r.name);
+            seen.push(r.name);
+            new
+        });
+        let is_abstract = t.is_abstract || t.kind == crate::ast::TypeDeclKind::Trait;
+        if !is_abstract && let Some(r) = required.first() {
+            return Err(format!(
+                "`{name}` must define `{}` (required by `{}`)",
+                i.resolve(r.name),
+                r.by
+            ));
+        }
+        Ok(TypeInfo {
+            name,
             kind: t.kind,
             parent,
+            traits: all_traits,
+            required,
+            is_abstract,
             fields,
             methods,
             annotations: t.annotations.clone(),
             script: script.clone(),
-        }
+        })
     }
 }
 

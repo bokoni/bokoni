@@ -348,6 +348,8 @@ pub enum TypeDeclKind {
     Type,
     Class,
     Annotation,
+    /// Behavior shared by classes (`include`): required and default methods.
+    Trait,
 }
 
 /// `type`, `class` or `annotation`.
@@ -358,6 +360,8 @@ pub struct TypeDecl {
     pub name_span: Span,
     /// `class B < A`: the parent class.
     pub parent: Option<(Symbol, Span)>,
+    /// `abstract class`: cannot be instantiated, may have `abstract def`s.
+    pub is_abstract: bool,
     pub members: Vec<Member>,
     pub annotations: Vec<AnnotationUse>,
     pub span: Span,
@@ -367,6 +371,10 @@ pub struct TypeDecl {
 pub enum Member {
     Field(Field),
     Method(FnDecl),
+    /// `abstract def name(params): ret`: to be defined by the class (no body).
+    Abstract(FnDecl),
+    /// `include Trait`
+    Include(Symbol, Span),
     /// Any other statement in the body (macro call, nested type…).
     Stmt(Stmt),
 }

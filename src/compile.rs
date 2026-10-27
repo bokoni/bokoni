@@ -59,6 +59,7 @@ pub fn compile(
         fns: Vec::new(),
         errors: Vec::new(),
         classes: FxHashMap::default(),
+        traits: FxHashSet::default(),
     };
     let main = c.main(&program.body);
     if c.errors.is_empty() {
@@ -207,6 +208,7 @@ impl Resolver<'_> {
                             Some(f.span.start),
                         ),
                         Member::Stmt(s) => self.stmt(s),
+                        Member::Abstract(_) | Member::Include(..) => {}
                     }
                 }
             }
@@ -527,6 +529,8 @@ struct Compiler<'a> {
     errors: Vec<Error>,
     /// Fields (parents' included) of the classes compiled so far.
     classes: FxHashMap<Symbol, Rc<[Symbol]>>,
+    /// Traits compiled so far.
+    traits: FxHashSet<Symbol>,
 }
 
 type Op = (Reg, RegTy);
@@ -1800,8 +1804,29 @@ impl Compiler<'_> {
             });
         }
         let mut methods = Vec::new();
+        let mut abstracts = Vec::new();
+        let mut traits = Vec::new();
         for m in &t.members {
             match m {
+                Member::Abstract(f) => abstracts.push(Rc::new(f.clone())),
+                Member::Include(name, span) => {
+                    let slot = self.globals.slot(*name);
+                    let known = self.traits.contains(name)
+                        || matches!(&self.globals.at(slot).value,
+                            Some(Value::Type(info)) if info.kind == TypeDeclKind::Trait);
+                    if known {
+                        traits.push(slot);
+                    } else {
+                        self.errors.push(Error::type_error(
+                            format!(
+                                "`{}` is not a trait declared before `{}`",
+                                self.i.resolve(*name),
+                                self.i.resolve(t.name)
+                            ),
+                            *span,
+                        ));
+                    }
+                }
                 Member::Method(f) => {
                     let saved = self.f().this.replace(names.clone());
                     let saved_sup = std::mem::replace(
@@ -1832,10 +1857,16 @@ impl Compiler<'_> {
             }
         }
         let annotations = self.annotations_ir(&t.annotations);
+        if t.kind == TypeDeclKind::Trait {
+            self.traits.insert(t.name);
+        }
         let decl = TypeDeclIr {
             name: t.name,
             kind: t.kind,
             parent: parent.map(|(slot, f)| (slot, f.len() as u32)),
+            traits,
+            abstracts,
+            is_abstract: t.is_abstract,
             fields: fir,
             methods,
             annotations,

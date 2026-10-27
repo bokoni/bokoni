@@ -210,6 +210,12 @@ struct TypeDef {
     kind: TypeDeclKind,
     /// Parent class (its fields and methods are included in `fields` / `methods`).
     parent: Option<TypeId>,
+    /// Traits included (by the class or its ancestors).
+    traits: Vec<TypeId>,
+    /// `abstract def`s not defined yet (signature in `methods`): (name, who requires it).
+    required: Vec<(Symbol, Rc<str>)>,
+    /// `abstract class` or `trait`: cannot be instantiated.
+    is_abstract: bool,
     fields: Vec<FieldDef>,
     methods: FxHashMap<Symbol, Rc<FnSig>>,
     deprecated: Option<Dep>,
@@ -638,12 +644,16 @@ impl Checker<'_> {
             name,
             kind: info.kind,
             parent: None,
+            traits: Vec::new(),
+            required: info.required.iter().map(|r| (r.name, r.by.clone())).collect(),
+            is_abstract: info.is_abstract,
             fields: Vec::new(),
             methods: FxHashMap::default(),
             deprecated,
         });
         self.imported.insert(key, Ty::TypeValue(id));
         self.types[id].parent = info.parent.as_ref().map(|p| self.import_type(p));
+        self.types[id].traits = info.traits.iter().map(|t| self.import_type(t)).collect();
         self.quiet += 1;
         let fields = info
             .fields
@@ -656,11 +666,16 @@ impl Checker<'_> {
                 deprecated: self.ir_deprecation(&f.annotations),
             })
             .collect();
-        let methods = info
+        let mut methods: FxHashMap<Symbol, Rc<FnSig>> = info
             .methods
             .iter()
             .map(|(n, m)| (*n, self.proto_signature(m)))
             .collect();
+        for r in &info.required {
+            let d = &r.decl;
+            let sig = self.signature(d.params.as_deref().unwrap_or(&[]), d.ret.as_ref(), false);
+            methods.insert(r.name, sig);
+        }
         self.quiet -= 1;
         self.types[id].fields = fields;
         self.types[id].methods = methods;
@@ -815,6 +830,9 @@ impl Checker<'_> {
 
     /// Is `a` the class `b` or one of its descendants?
     fn descends(&self, mut a: TypeId, b: TypeId) -> bool {
+        if self.types.get(b).is_some_and(|t| t.kind == TypeDeclKind::Trait) {
+            return self.types.get(a).is_some_and(|t| t.traits.contains(&b)) || a == b;
+        }
         loop {
             if a == b {
                 return true;
@@ -887,6 +905,9 @@ impl Checker<'_> {
                         name: t.name,
                         kind: t.kind,
                         parent: None,
+                        traits: Vec::new(),
+                        required: Vec::new(),
+                        is_abstract: t.is_abstract || t.kind == TypeDeclKind::Trait,
                         fields: Vec::new(),
                         methods: FxHashMap::default(),
                         deprecated,
@@ -946,7 +967,52 @@ impl Checker<'_> {
                 Some(pid) => (self.types[pid].fields.clone(), self.types[pid].methods.clone()),
                 None => (Vec::new(), FxHashMap::default()),
             };
+            let (mut required, mut traits) = match parent {
+                Some(pid) => (self.types[pid].required.clone(), self.types[pid].traits.clone()),
+                None => (Vec::new(), Vec::new()),
+            };
             self.types[id].parent = parent;
+            // Methods with code (not only required), the parent's first.
+            let mut defined: Vec<Symbol> = methods
+                .keys()
+                .filter(|n| !required.iter().any(|(r, _)| r == *n))
+                .copied()
+                .collect();
+            // Traits first: the class's own methods take precedence.
+            for m in &t.members {
+                let Member::Include(n, span) = m else { continue };
+                let found = match self.lookup(*n) {
+                    Some((v, _)) => Some(v.ty.clone()),
+                    None => self.global_ty(*n).map(|(t, _)| t),
+                };
+                match found {
+                    Some(Ty::TypeValue(tid))
+                        if self.types[tid].kind == TypeDeclKind::Trait && !ids[k..].contains(&tid) =>
+                    {
+                        let tr = &self.types[tid];
+                        for (name, sig) in &tr.methods {
+                            if tr.required.iter().any(|(r, _)| r == name) {
+                                methods.entry(*name).or_insert_with(|| sig.clone());
+                            } else {
+                                methods.insert(*name, sig.clone());
+                                defined.push(*name);
+                            }
+                        }
+                        required.extend(tr.required.iter().cloned());
+                        if !traits.contains(&tid) {
+                            traits.push(tid);
+                        }
+                    }
+                    _ => {
+                        let msg = format!(
+                            "`{}` is not a trait declared before `{}`",
+                            self.name(*n),
+                            self.name(t.name)
+                        );
+                        self.error(msg, *span);
+                    }
+                }
+            }
             for m in &t.members {
                 match m {
                     Member::Field(f) => {
@@ -983,8 +1049,18 @@ impl Checker<'_> {
                         self.mark_fn(&sig, dep);
                         self.mark_params_ast(&sig, f.params.as_deref());
                         methods.insert(f.name, sig);
+                        defined.push(f.name);
                     }
-                    Member::Stmt(_) => {}
+                    Member::Abstract(f) => {
+                        let sig = self.signature(
+                            f.params.as_deref().unwrap_or(&[]),
+                            f.ret.as_ref(),
+                            false,
+                        );
+                        methods.entry(f.name).or_insert(sig);
+                        required.push((f.name, self.i.resolve(t.name).into()));
+                    }
+                    Member::Stmt(_) | Member::Include(..) => {}
                 }
             }
             // `init(@field)` also declares fields.
@@ -1007,8 +1083,27 @@ impl Checker<'_> {
                     }
                 }
             }
+            required.retain(|(n, _)| !defined.contains(n));
+            let mut seen = Vec::new();
+            required.retain(|(n, _)| {
+                let new = !seen.contains(n);
+                seen.push(*n);
+                new
+            });
+            if !self.types[id].is_abstract
+                && let Some((m, by)) = required.first()
+            {
+                let msg = format!(
+                    "`{}` must define `{}` (required by `{by}`)",
+                    self.name(t.name),
+                    self.name(*m)
+                );
+                self.error(msg, t.name_span);
+            }
             self.types[id].fields = fields;
             self.types[id].methods = methods;
+            self.types[id].required = required;
+            self.types[id].traits = traits;
         }
         for s in &b.stmts {
             if let StmtKind::Enum(e) = &s.kind {
@@ -1321,6 +1416,13 @@ impl Checker<'_> {
                     s.span,
                 ),
                 Member::Field(f) => self.annotations(&f.annotations),
+                Member::Abstract(f) => {
+                    self.annotations(&f.annotations);
+                    for p in f.params.iter().flatten() {
+                        self.annotations(&p.annotations);
+                    }
+                }
+                Member::Include(..) => {}
             }
         }
         self.annotations(&t.annotations);
@@ -2078,6 +2180,19 @@ impl Checker<'_> {
             }
             Ty::TypeValue(id) => {
                 let id = *id;
+                if self.types[id].is_abstract {
+                    let what = if self.types[id].kind == TypeDeclKind::Trait {
+                        "a trait"
+                    } else {
+                        "an abstract class"
+                    };
+                    let msg = format!(
+                        "`{}` is {what}: it cannot be instantiated",
+                        self.name(self.types[id].name)
+                    );
+                    self.error(msg, span);
+                    return Ty::Any;
+                }
                 if self.types[id].kind == TypeDeclKind::Class {
                     let init = self
                         .i

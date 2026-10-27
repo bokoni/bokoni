@@ -258,6 +258,11 @@ pub struct TypeDeclIr {
     /// `class B < A`: global slot of `A`, and its number of fields when `B` was compiled
     /// (they come first in `B`'s objects, its methods refer to them by index).
     pub parent: Option<(u32, u32)>,
+    /// `include`d traits: their global slots.
+    pub traits: Vec<u32>,
+    /// `abstract def`s (no code; the declaration gives the signature to the checker).
+    pub abstracts: Vec<Rc<crate::ast::FnDecl>>,
+    pub is_abstract: bool,
     /// Own fields (after the parent's).
     pub fields: Vec<FieldIr>,
     pub methods: Vec<(Symbol, Rc<Proto>)>,

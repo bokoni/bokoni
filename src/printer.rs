@@ -101,10 +101,14 @@ impl Printer<'_> {
             StmtKind::Type(t) => {
                 self.annotations(&t.annotations);
                 self.out.push('(');
+                if t.is_abstract {
+                    self.out.push_str("abstract ");
+                }
                 self.out.push_str(match t.kind {
                     TypeDeclKind::Type => "type",
                     TypeDeclKind::Class => "class",
                     TypeDeclKind::Annotation => "annotation",
+                    TypeDeclKind::Trait => "trait",
                 });
                 self.out.push(' ');
                 self.name(t.name);
@@ -130,6 +134,16 @@ impl Printer<'_> {
                             self.out.push(')');
                         }
                         Member::Method(f) => self.def(f),
+                        Member::Abstract(f) => {
+                            self.out.push_str("(abstract ");
+                            self.def(f);
+                            self.out.push(')');
+                        }
+                        Member::Include(n, _) => {
+                            self.out.push_str("(include ");
+                            self.name(*n);
+                            self.out.push(')');
+                        }
                         Member::Stmt(s) => self.stmt(s),
                     }
                 }

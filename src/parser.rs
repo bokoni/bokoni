@@ -164,6 +164,7 @@ impl Tracker {
             | T::Case
             | T::For
             | T::Begin
+            | T::Trait
             | T::Do => true,
             T::If | T::Unless | T::While => !self.prev.is_some_and(|p| {
                 matches!(
@@ -220,6 +221,8 @@ impl Tracker {
                     *self.stack.last_mut().unwrap() = Frame::Endless { brackets };
                 }
             }
+            // `abstract def`: a signature, without body nor `end`.
+            T::Def if self.prev.is_some_and(|p| p.kind == T::Abstract) => {}
             T::Def => self.stack.push(Frame::DefSig {
                 name_end: None,
                 brackets: self.brackets,
@@ -338,6 +341,9 @@ fn is_keyword(kind: TokenKind) -> bool {
             | T::Ensure
             | T::Raise
             | T::Super
+            | T::Trait
+            | T::Abstract
+            | T::Include
             | T::Type
             | T::Class
             | T::Enum
@@ -701,7 +707,10 @@ impl Parser<'_, '_> {
         let start = self.tok().span;
         let kind = match self.peek() {
             T::Def => StmtKind::Def(Box::new(self.def(annotations)?)),
-            T::Type | T::Class | T::Annotation => {
+            T::Type | T::Class | T::Annotation | T::Trait => {
+                StmtKind::Type(Box::new(self.type_decl(annotations)?))
+            }
+            T::Abstract if self.peek2() == T::Class => {
                 StmtKind::Type(Box::new(self.type_decl(annotations)?))
             }
             T::Enum => StmtKind::Enum(Box::new(self.enum_decl(annotations)?)),
@@ -846,6 +855,34 @@ impl Parser<'_, '_> {
 
     fn def(&mut self, annotations: Vec<AnnotationUse>) -> Result<FnDecl> {
         let start = self.bump().span;
+        let (name, name_span, params, ret) = self.signature()?;
+        let body = if self.eat(T::Eq) {
+            let e = self.expr()?;
+            expr_block(e, self.span(e))
+        } else {
+            if !matches!(self.peek(), T::Newline | T::Semi) {
+                return self.error_here(format!(
+                    "expected a line end or `=` after the signature of `{}`, found {}",
+                    self.interner.resolve(name),
+                    self.found()
+                ));
+            }
+            self.body_end("def", start)?
+        };
+        Ok(FnDecl {
+            name,
+            name_span,
+            params,
+            ret,
+            body,
+            annotations,
+            span: self.span_from(start),
+        })
+    }
+
+    /// After `def`: name, parameters and return type.
+    #[allow(clippy::type_complexity)]
+    fn signature(&mut self) -> Result<(Symbol, Span, Option<Vec<Param>>, Option<TypeExpr>)> {
         let name_tok = self.tok();
         if name_tok.kind != T::Ident && !is_keyword(name_tok.kind) {
             return self.error_here(format!(
@@ -871,28 +908,7 @@ impl Parser<'_, '_> {
         } else {
             None
         };
-        let body = if self.eat(T::Eq) {
-            let e = self.expr()?;
-            expr_block(e, self.span(e))
-        } else {
-            if !matches!(self.peek(), T::Newline | T::Semi) {
-                return self.error_here(format!(
-                    "expected a line end or `=` after the signature of `{}`, found {}",
-                    self.interner.resolve(name),
-                    self.found()
-                ));
-            }
-            self.body_end("def", start)?
-        };
-        Ok(FnDecl {
-            name,
-            name_span,
-            params,
-            ret,
-            body,
-            annotations,
-            span: self.span_from(start),
-        })
+        Ok((name, name_span, params, ret))
     }
 
     /// A `?` attached to the end of `span` (`to_i?`, `xs[i]?`) is consumed and added
@@ -965,10 +981,13 @@ impl Parser<'_, '_> {
     }
 
     fn type_decl(&mut self, annotations: Vec<AnnotationUse>) -> Result<TypeDecl> {
+        let start = self.tok().span;
+        let is_abstract = self.eat(T::Abstract);
         let kw = self.bump();
         let (kind, opener) = match kw.kind {
             T::Type => (TypeDeclKind::Type, "type"),
             T::Class => (TypeDeclKind::Class, "class"),
+            T::Trait => (TypeDeclKind::Trait, "trait"),
             _ => (TypeDeclKind::Annotation, "annotation"),
         };
         let (name, name_span) = self.ident(&format!("after `{opener}`"))?;
@@ -990,6 +1009,23 @@ impl Parser<'_, '_> {
                 break;
             }
             if let Some(m) = self.recovering(&[T::End], "the member", |p| p.type_member(&members))? {
+                let misplaced = match &m {
+                    Member::Abstract(f) if kind != TypeDeclKind::Trait && !is_abstract => Some((
+                        "`abstract def` is only allowed in a `trait` or an `abstract class`",
+                        f.span,
+                    )),
+                    Member::Include(_, span) if kind != TypeDeclKind::Class => {
+                        Some(("`include` is only allowed in a `class`", *span))
+                    }
+                    Member::Field(f) if kind == TypeDeclKind::Trait => Some((
+                        "a `trait` has no fields: it only describes methods",
+                        f.span,
+                    )),
+                    _ => None,
+                };
+                if let Some((msg, span)) = misplaced {
+                    self.report(Error::syntax(msg, span))?;
+                }
                 members.push(m);
             }
         }
@@ -999,9 +1035,10 @@ impl Parser<'_, '_> {
             name,
             name_span,
             parent,
+            is_abstract,
             members,
             annotations,
-            span: self.span_from(kw.span),
+            span: self.span_from(start),
         })
     }
 
@@ -1011,6 +1048,35 @@ impl Parser<'_, '_> {
         let start = self.tok().span;
         Ok(match (self.peek(), self.peek2()) {
             (T::Def, _) => Member::Method(self.def(annotations)?),
+            (T::Abstract, T::Def) => {
+                self.bump();
+                let def_start = self.bump().span;
+                let (name, name_span, params, ret) = self.signature()?;
+                if !matches!(self.peek(), T::Newline | T::Semi | T::End) {
+                    return self.error_here(format!(
+                        "expected a line end after `abstract def {}` (no body), found {}",
+                        self.interner.resolve(name),
+                        self.found()
+                    ));
+                }
+                Member::Abstract(FnDecl {
+                    name,
+                    name_span,
+                    params,
+                    ret,
+                    body: Block {
+                        stmts: Vec::new(),
+                        span: Span::new(def_start.start, def_start.start),
+                    },
+                    annotations,
+                    span: self.span_from(start),
+                })
+            }
+            (T::Include, _) => {
+                self.bump();
+                let (name, span) = self.ident("after `include`")?;
+                Member::Include(name, span)
+            }
             (T::Ident, T::Colon | T::Eq) => {
                 let (name, _) = self.ident("")?;
                 let ty = if self.eat(T::Colon) {

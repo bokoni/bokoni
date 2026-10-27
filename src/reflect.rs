@@ -106,6 +106,7 @@ pub enum DeclKind {
     Type,
     Class,
     Annotation,
+    Trait,
 }
 
 /// A declared `type`, `class` or `annotation`.
@@ -115,6 +116,10 @@ pub struct TypeDesc {
     pub kind: DeclKind,
     /// Parent class (`class B < A`).
     pub parent: Option<String>,
+    /// Traits included (by the class or its parents).
+    pub traits: Vec<String>,
+    /// `abstract class`.
+    pub is_abstract: bool,
     /// Fields, the parent's first.
     pub fields: Vec<FieldDesc>,
     /// Methods, in declaration order (inherited ones included).
@@ -291,7 +296,10 @@ impl Runtime {
                 crate::ast::TypeDeclKind::Type => DeclKind::Type,
                 crate::ast::TypeDeclKind::Class => DeclKind::Class,
                 crate::ast::TypeDeclKind::Annotation => DeclKind::Annotation,
+                crate::ast::TypeDeclKind::Trait => DeclKind::Trait,
             },
+            traits: info.traits.iter().map(|t| t.name.to_string()).collect(),
+            is_abstract: info.is_abstract,
             parent: info.parent.as_ref().map(|p| p.name.to_string()),
             fields,
             methods: self.methods_desc(&info.methods)?,

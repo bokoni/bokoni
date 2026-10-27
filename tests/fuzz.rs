@@ -210,6 +210,9 @@ const VOCAB: &[&str] = &[
     ".to_i?()",
     "super(",
     "class C < ",
+    "include T\n",
+    "abstract def f()\n",
+    "trait T\n",
 ];
 
 /// Valid programs used as a base for mutations. No `while`: a mutation easily turns it
@@ -240,6 +243,7 @@ const CORPUS: &[&str] = &[
     "type F\n  message: str\n  code: int\nend\ndef c(n)\n  raise F(message: \"m\", code: n) if n > 2\n  n\nrescue e: Error\n  -1\nend\nlet t = 0\nfor i in 0..4\n  t += begin\n    c(i)\n  rescue f: F\n    f.code * 10\n  end\nend\nt",
     "def s(xs)\n  let out = []\n  for x in xs\n    begin\n      next if x == 0\n      out << 10 / x\n    ensure\n      out << \"e\"\n    end\n  end\n  out\nend\ns([1, 0, 2])",
     "class A\n  def init(@n: int)\n  end\n  def f(): int = @n\nend\nclass B < A\n  def f(): int = super() * 2\nend\nclass E < Error\nend\nlet t = 0\nfor x in [A(1), B(2), A(3)]\n  t += x.f()\nend\n[t, begin\n  raise E(\"e\")\nrescue e: Error\n  e.message\nend]",
+    "trait T\n  abstract def n(): int\n  def twice(): int = self.n() * 2\nend\nabstract class S\n  include T\nend\nclass K < S\n  def init(@v: int)\n  end\n  def n(): int = @v\nend\nlet ts: [T] = [K(1), K(4)]\nts.map(|t| t.twice()).sum()",
 ];
 
 /// Mutates a program: deletes, duplicates or swaps lines, inserts a token, deletes or

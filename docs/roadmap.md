@@ -208,24 +208,34 @@ Modeled on Crystal (see `syntax.md`, *Error handling*).
 - [x] Parent from a previous script; `TypeDesc::parent` in the Rust API
 - [x] A type or enum declared twice in a block is an error (the checker used to panic,
       found by the fuzzer)
-- [ ] Abstract classes and methods
-- [ ] Interfaces / traits (default methods? nominal or structural?)
+- [x] Abstract classes and methods, traits: see v0.9
+
+### v0.9 — Traits and abstract classes
+
+Decided: two separate notions, unlike Crystal's single `module` — `module` for
+namespaces, `trait` for shared behavior.
+
+- [x] `trait`: required methods (`abstract def`, no body) and provided methods;
+      `include` in a class, several allowed; precedence: own, traits, parent
+- [x] Nominal: a trait is a type (`x: Greet`, `[Greet]`, `rescue e: Retryable`),
+      checked statically and at run time
+- [x] A missing required method is reported before running (and when declaring the
+      class, without static checks); signatures of `abstract def`s kept at run time
+      for later scripts
+- [x] `abstract class`: not instantiable, may declare `abstract def`s
+- [x] `TypeDesc::traits`, `TypeDesc::is_abstract`, `DeclKind::Trait`
+- [ ] A trait that includes another one; generic traits (`Comparable(T)`)
 
 ### Next
 
 In suggested order:
 
-Decided: two separate notions, unlike Crystal's single `module` — `module` for
-namespaces, `trait` for shared behavior.
-
-1. **Traits** (nominal, as Crystal's mixins): required methods (`abstract def`) and
-   default methods, included in classes; a trait is also a type (`x: Greet`,
-   `rescue e: Retryable`). Abstract classes reuse `abstract`.
-2. **Modules / imports**: `module Http … end`, `Http::Request`, `Http.get(…)`, and
+1. **Modules / imports**: `module Http … end`, `Http::Request`, `Http.get(…)`, and
    loading of other files (through a callback of the host, for embedding).
-3. **Generics** (`[T]` in signatures): typed `map` / `filter` and user functions over
-   lists; lets the typed JIT compile more code.
-4. **Crystal-style macros** (v3 of `syntax.md`): hygiene and AST exposure still open;
+2. **Generics** (`[T]` in signatures): typed `map` / `filter` and user functions over
+   lists; lets the typed JIT compile more code; then generic traits
+   (`Comparable(T)`, `Enumerable(T)`).
+3. **Crystal-style macros** (v3 of `syntax.md`): hygiene and AST exposure still open;
    benefit from generics and modules.
 
 No design decision needed:
