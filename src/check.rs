@@ -1113,14 +1113,17 @@ impl Checker<'_> {
         self.annotations(&e.annotations);
     }
 
-    /// `@[Nom(args)]` : l'annotation doit être déclarée (ou intégrée : `Deprecated`, `Doc`).
+    /// `@[Nom(args)]` : l'annotation doit être déclarée (`Deprecated` et `Doc` le sont par
+    /// le prélude), ses arguments sont vérifiés comme une construction.
     fn annotations(&mut self, anns: &[AnnotationUse]) {
         for a in anns {
             let [name] = a.path.as_slice() else { continue };
-            if matches!(self.name(*name), "Deprecated" | "Doc") {
-                continue;
-            }
-            match self.lookup(*name).map(|(v, _)| v.ty.clone()) {
+            // Déclarée dans ce programme, ou avant (prélude, script précédent).
+            let found = match self.lookup(*name) {
+                Some((v, _)) => Some(v.ty.clone()),
+                None => self.global_ty(*name).map(|(t, _)| t),
+            };
+            match found {
                 Some(Ty::TypeValue(id)) if self.types[id].kind == TypeDeclKind::Annotation => {
                     self.construct_args(id, a.args, None, a.span);
                 }

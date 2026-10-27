@@ -28,6 +28,7 @@ pub struct TypeInfo {
     pub fields: Vec<FieldInfo>,
     pub methods: FxHashMap<Symbol, Rc<Proto>>,
     pub script: Rc<Script>,
+    pub annotations: crate::ir::Annotations,
 }
 
 pub struct FieldInfo {
@@ -35,6 +36,7 @@ pub struct FieldInfo {
     pub ty: Option<TypeRef>,
     /// Valeur par défaut, calculée par une petite fonction compilée.
     pub default: Option<Rc<Proto>>,
+    pub annotations: crate::ir::Annotations,
 }
 
 impl TypeInfo {
@@ -55,6 +57,9 @@ pub struct EnumInfo {
     pub variants: Vec<(Symbol, Value)>,
     pub methods: FxHashMap<Symbol, Rc<Proto>>,
     pub script: Rc<Script>,
+    pub annotations: crate::ir::Annotations,
+    /// Annotations de chaque variante.
+    pub variant_annotations: Vec<crate::ir::Annotations>,
 }
 
 /// Construction en cours d'un `type` (arguments, puis bloc, puis valeurs par défaut).

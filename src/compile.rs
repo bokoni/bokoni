@@ -16,8 +16,9 @@ use crate::diagnostic::{Error, Errors};
 use crate::globals::Globals;
 use crate::intern::{FxBuild, FxHashMap, Interner, Symbol};
 use crate::ir::{
-    Block as IrBlock, BlockId, CallSite, Capture, Decl, EnumDeclIr, Fallback, FieldIr, Instr,
-    ParamProto, Proto, ProtoKind, Reg, RegTy, RtType, Script, Shape, Term, TypeDeclIr, TypeRef,
+    AnnotationIr, Annotations, Block as IrBlock, BlockId, CallSite, Capture, Decl, EnumDeclIr,
+    Fallback, FieldIr, Instr, ParamProto, Proto, ProtoKind, Reg, RegTy, RtType, Script, Shape,
+    Term, TypeDeclIr, TypeRef,
 };
 use crate::span::Span;
 use crate::value::Value;
@@ -456,6 +457,7 @@ struct Fn_ {
     /// Index de la fonction bloc `do` englobante la plus proche (noms → champs).
     region: Option<usize>,
     decl: Option<Rc<FnDecl>>,
+    annotations: Annotations,
 }
 
 fn ty_index(t: RegTy) -> usize {
@@ -529,6 +531,7 @@ impl Compiler<'_> {
             ctx_fields,
             region,
             decl: None,
+            annotations: Rc::new([]),
         });
     }
 
@@ -585,6 +588,7 @@ impl Compiler<'_> {
             children: f.children,
             decls: f.decls,
             decl: f.decl,
+            annotations: f.annotations,
             jit: Default::default(),
             jit_dyn: Default::default(),
             calls_seen: Default::default(),
@@ -1412,8 +1416,17 @@ impl Compiler<'_> {
         method: bool,
         self_key: Option<u32>,
     ) -> Rc<Proto> {
+        let annotations = match &decl {
+            Some(d) => self.annotations_ir(&d.annotations),
+            None => Rc::new([]),
+        };
+        let param_annotations: Vec<Annotations> = params
+            .iter()
+            .map(|p| self.annotations_ir(&p.annotations))
+            .collect();
         self.begin(kind, name);
         self.f().decl = decl;
+        self.f().annotations = annotations;
         self.push_scope(false);
         let span = body.span;
         if method {
@@ -1444,7 +1457,7 @@ impl Compiler<'_> {
         }
         // Paramètres : registres consécutifs.
         let mut regs = Vec::new();
-        for p in params {
+        for (p, annotations) in params.iter().zip(param_annotations) {
             let prim = p.ty.as_ref().and_then(|t| prim_of(t, self.i));
             let r = self.var_reg(prim.unwrap_or(RegTy::Value));
             regs.push((r, prim));
@@ -1471,6 +1484,7 @@ impl Compiler<'_> {
                 has_default: p.default.is_some(),
                 field,
                 span: p.span,
+                annotations,
             });
         }
         // Variables des paramètres (registre, ou cellule si capturé).
@@ -1572,13 +1586,58 @@ impl Compiler<'_> {
         self.function(kind, name, &l.params, &l.body, None, None, false)
     }
 
+    // ─── Annotations ─────────────────────────────────────────────────────────
+
+    /// Compile `@[Nom(args)]` : une fonction sans paramètre qui construit l'annotation.
+    /// Elle est compilée à part, sans fonction englobante : ses noms désignent des
+    /// globales (les arguments d'une annotation sont des constantes, pas des variables
+    /// locales).
+    fn annotations_ir(&mut self, uses: &[AnnotationUse]) -> Annotations {
+        if uses.is_empty() {
+            return Rc::new([]);
+        }
+        let saved = std::mem::take(&mut self.fns);
+        let mut out = Vec::with_capacity(uses.len());
+        for u in uses {
+            let [name] = u.path.as_slice() else {
+                self.errors.push(Error::syntax(
+                    "nom d'annotation attendu : `@[Nom]` ou `@[Nom(…)]`",
+                    u.span,
+                ));
+                continue;
+            };
+            let label = format!("@[{}]", self.i.resolve(*name));
+            self.begin(ProtoKind::Annotation, label.into());
+            self.push_scope(false);
+            let f = self.read_var(*name, u.span);
+            let site = self.call_site(u.args, None);
+            let dst = self.tmp(RegTy::Value);
+            self.emit(Instr::Call { dst, f: f.0, site }, u.span);
+            self.pop_scope();
+            let make = self.finish((dst, RegTy::Value), None, u.span);
+            out.push(AnnotationIr {
+                name: *name,
+                make,
+                span: u.span,
+            });
+        }
+        self.fns = saved;
+        out.into()
+    }
+
     // ─── Déclarations de types ───────────────────────────────────────────────
 
-    fn type_fields(&self, t: &TypeDecl) -> Vec<(Symbol, Option<TypeExpr>, Option<ExprId>)> {
-        let mut fields: Vec<(Symbol, Option<TypeExpr>, Option<ExprId>)> = Vec::new();
+    /// Champs : (nom, type, défaut, annotations).
+    #[allow(clippy::type_complexity)]
+    fn type_fields(
+        &self,
+        t: &TypeDecl,
+    ) -> Vec<(Symbol, Option<TypeExpr>, Option<ExprId>, Vec<AnnotationUse>)> {
+        let mut fields: Vec<(Symbol, Option<TypeExpr>, Option<ExprId>, Vec<AnnotationUse>)> =
+            Vec::new();
         for m in &t.members {
             if let Member::Field(f) = m {
-                fields.push((f.name, f.ty.clone(), f.default));
+                fields.push((f.name, f.ty.clone(), f.default, f.annotations.clone()));
             }
         }
         let init = self.i.get("init");
@@ -1587,8 +1646,8 @@ impl Compiler<'_> {
                 && Some(f.name) == init
             {
                 for p in f.params.iter().flatten().filter(|p| p.is_field) {
-                    if !fields.iter().any(|(n, _, _)| *n == p.name) {
-                        fields.push((p.name, p.ty.clone(), None));
+                    if !fields.iter().any(|(n, ..)| *n == p.name) {
+                        fields.push((p.name, p.ty.clone(), None, p.annotations.clone()));
                     }
                 }
             }
@@ -1598,9 +1657,10 @@ impl Compiler<'_> {
 
     fn type_decl(&mut self, t: &TypeDecl) {
         let fields = self.type_fields(t);
-        let names: Rc<[Symbol]> = fields.iter().map(|(n, _, _)| *n).collect();
+        let names: Rc<[Symbol]> = fields.iter().map(|(n, ..)| *n).collect();
         let mut fir = Vec::new();
-        for (name, ty, default) in &fields {
+        for (name, ty, default, anns) in &fields {
+            let annotations = self.annotations_ir(anns);
             let ty = ty.as_ref().map(|t| self.type_ref(t));
             let default = default.map(|d| {
                 let span = self.ast.span(d);
@@ -1618,6 +1678,7 @@ impl Compiler<'_> {
                 name: *name,
                 ty,
                 default,
+                annotations,
             });
         }
         let mut methods = Vec::new();
@@ -1647,11 +1708,13 @@ impl Compiler<'_> {
                 Member::Field(_) => {}
             }
         }
+        let annotations = self.annotations_ir(&t.annotations);
         let decl = TypeDeclIr {
             name: t.name,
             kind: t.kind,
             fields: fir,
             methods,
+            annotations,
         };
         let slot = self.globals.slot(t.name);
         let f = self.f();
@@ -1694,6 +1757,12 @@ impl Compiler<'_> {
             self.f().this = saved;
             methods.push((m.name, p));
         }
+        let annotations = self.annotations_ir(&e.annotations);
+        let variant_annotations = e
+            .variants
+            .iter()
+            .map(|v| self.annotations_ir(&v.annotations))
+            .collect();
         let decl = EnumDeclIr {
             name: e.name,
             variants: e.variants.iter().map(|v| v.name).collect(),
@@ -1701,6 +1770,8 @@ impl Compiler<'_> {
             repr,
             repr_is_str,
             methods,
+            annotations,
+            variant_annotations,
         };
         let slot = self.globals.slot(e.name);
         let f = self.f();

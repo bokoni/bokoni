@@ -24,10 +24,14 @@ pub mod objects;
 pub mod ops;
 pub mod parser;
 pub mod printer;
+pub mod reflect;
 pub mod span;
 pub mod value;
 pub mod vm;
 
 pub use diagnostic::{Error, ErrorKind, Errors};
 pub use engine::{Engine, FromValue, IntoValue};
+pub use reflect::{
+    Annotation, DeclKind, EnumDesc, FieldDesc, FnDesc, ParamDesc, TypeDesc, VariantDesc,
+};
 pub use value::Value;

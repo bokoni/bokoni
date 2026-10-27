@@ -83,7 +83,20 @@ pub struct Proto {
     pub has_loop: bool,
     /// Aucun paramètre annoté : les arguments se rangent sans vérification.
     pub plain_params: bool,
+    /// Annotations de la fonction (`@[…]` avant `def`).
+    pub annotations: Annotations,
 }
+
+/// Annotation appliquée à une déclaration (`@[Nom(args)]`).
+pub struct AnnotationIr {
+    pub name: Symbol,
+    /// Construit l'objet annotation : fonction sans paramètre, évaluée à la lecture.
+    pub make: Rc<Proto>,
+    pub span: Span,
+}
+
+/// Annotations d'une déclaration, dans l'ordre d'écriture.
+pub type Annotations = Rc<[AnnotationIr]>;
 
 /// Fenêtre d'exécution passée au code natif de base (positions fixes).
 #[repr(C)]
@@ -132,6 +145,8 @@ pub enum ProtoKind {
     Method,
     /// Valeur par défaut d'un champ de `type` (`CtxField` lit les autres champs).
     FieldDefault,
+    /// Construction d'une annotation (`@[Nom(args)]`), évaluée à la lecture.
+    Annotation,
 }
 
 pub struct ParamProto {
@@ -142,6 +157,7 @@ pub struct ParamProto {
     /// `init(@champ)` : index du champ de `self` à initialiser.
     pub field: Option<u32>,
     pub span: Span,
+    pub annotations: Annotations,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,6 +238,7 @@ pub struct TypeDeclIr {
     pub kind: TypeDeclKind,
     pub fields: Vec<FieldIr>,
     pub methods: Vec<(Symbol, Rc<Proto>)>,
+    pub annotations: Annotations,
 }
 
 pub struct FieldIr {
@@ -229,6 +246,7 @@ pub struct FieldIr {
     pub ty: Option<TypeRef>,
     /// Valeur par défaut, calculée par une petite fonction.
     pub default: Option<Rc<Proto>>,
+    pub annotations: Annotations,
 }
 
 pub struct EnumDeclIr {
@@ -239,6 +257,9 @@ pub struct EnumDeclIr {
     pub repr: Option<TypeRef>,
     pub repr_is_str: bool,
     pub methods: Vec<(Symbol, Rc<Proto>)>,
+    pub annotations: Annotations,
+    /// Annotations de chaque variante.
+    pub variant_annotations: Vec<Annotations>,
 }
 
 /// Résolution d'un nom dans un bloc `do` hors construction (ou absent du type construit).

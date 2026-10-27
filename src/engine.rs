@@ -48,12 +48,19 @@ impl Drop for Engine {
     }
 }
 
+/// Déclarations intégrées : les annotations `Deprecated` et `Doc`.
+const PRELUDE: &str = "annotation Deprecated\n  message: str? = nil\nend\n\
+                       annotation Doc\n  text: str\nend\n";
+
 impl Engine {
     pub fn new() -> Self {
-        Engine {
+        let mut e = Engine {
             rt: Runtime::new(),
             static_checks: true,
-        }
+        };
+        e.eval_named(PRELUDE, "<prélude>")
+            .expect("le prélude se compile");
+        e
     }
 
     /// Redirige la sortie de `print` (par défaut : la sortie standard).
@@ -139,6 +146,48 @@ impl Engine {
     pub fn get_global(&self, name: &str) -> Option<Value> {
         let sym = self.rt.interner.get(name)?;
         self.rt.globals.get(sym)
+    }
+
+    // ─── Introspection ───────────────────────────────────────────────────────
+
+    fn not_found(name: &str, what: &str) -> Errors {
+        Error::new(
+            crate::ErrorKind::Runtime,
+            format!("`{name}` n'est pas {what}"),
+            None,
+        )
+        .into()
+    }
+
+    /// Description d'un `type`, d'une `class` ou d'une `annotation` : champs, méthodes,
+    /// annotations (leurs arguments sont évalués maintenant).
+    pub fn type_info(&mut self, name: &str) -> Result<crate::reflect::TypeDesc, Errors> {
+        match self.get_global(name) {
+            Some(Value::Type(info)) => Ok(self.rt.type_desc(&info)?),
+            _ => Err(Self::not_found(name, "un type déclaré")),
+        }
+    }
+
+    /// Description d'une fonction du script : paramètres, retour, annotations.
+    pub fn function_info(&mut self, name: &str) -> Result<crate::reflect::FnDesc, Errors> {
+        match self.get_global(name) {
+            Some(Value::Function(f)) => match &*f {
+                crate::value::Function::Script(c) => {
+                    let p = c.proto.clone();
+                    Ok(self.rt.fn_desc(name, &p)?)
+                }
+                _ => Err(Self::not_found(name, "une fonction du script")),
+            },
+            _ => Err(Self::not_found(name, "une fonction du script")),
+        }
+    }
+
+    /// Description d'un `enum` : variantes, méthodes, annotations.
+    pub fn enum_info(&mut self, name: &str) -> Result<crate::reflect::EnumDesc, Errors> {
+        match self.get_global(name) {
+            Some(Value::Enum(info)) => Ok(self.rt.enum_desc(&info)?),
+            _ => Err(Self::not_found(name, "un enum déclaré")),
+        }
     }
 
     /// Exécute du code. Ses `let` et `def` restent visibles pour les appels suivants.

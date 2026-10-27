@@ -1644,6 +1644,8 @@ impl Runtime {
             variants,
             methods: e.methods.iter().cloned().collect(),
             script: script.clone(),
+            annotations: e.annotations.clone(),
+            variant_annotations: e.variant_annotations.clone(),
         })
     }
 }
@@ -1718,9 +1720,11 @@ impl TypeInfo {
                     name: f.name,
                     ty: f.ty.clone(),
                     default: f.default.clone(),
+                    annotations: f.annotations.clone(),
                 })
                 .collect(),
             methods: t.methods.iter().cloned().collect(),
+            annotations: t.annotations.clone(),
             script: script.clone(),
         }
     }
