@@ -631,7 +631,6 @@ impl Proto {
     pub fn untyped(&self) -> bool {
         matches!(self.kind, ProtoKind::Function | ProtoKind::Lambda)
             && self.spec.is_none()
-            && self.captures.is_empty()
             && self.ncells == 0
             && !self.is_generic()
             && self.params.iter().any(|p| p.ty.is_none())
@@ -895,10 +894,7 @@ impl Proto {
             CtxField(d, f) => format!("r{d} = field under construction #{f}"),
             Guard(d, a, t) => format!("r{d} = guard {} r{a}", ty_name(*t)),
             Coerce { dst, src, ty, .. } => {
-                format!(
-                    "r{dst} = check r{src}: {}",
-                    self.types[*ty as usize].shown
-                )
+                format!("r{dst} = check r{src}: {}", self.types[*ty as usize].shown)
             }
             IsUndef(d, a) => format!("r{d} = not provided r{a}"),
             IBin(op, d, a, b) => format!("r{d} = r{a} {}i r{b}", op.as_str()),

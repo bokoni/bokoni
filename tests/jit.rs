@@ -1117,3 +1117,35 @@ fn loops_of_the_main_program() {
     e.eval("for i in 0...10\n  u -= i\nend").unwrap();
     assert_eq!(e.eval_as::<i64>("u").unwrap(), 4999949955);
 }
+
+#[test]
+fn closures_with_captured_variables() {
+    for src in [
+        // Two counters: same code, other captured variables.
+        "def counter(start: int)\n  let n = start\n  || n += 1\nend\nlet a = counter(0)\nlet b = counter(100)\nlet t = 0\nfor i in 0...1000\n  t += a()\n  t += b() if i % 2 == 0\nend\n[t, a(), b()]",
+        // A captured variable that changes type (resumed in the interpreter).
+        "def acc()\n  let s = 0\n  |x| s = s + x\nend\nlet f = acc()\nlet r = []\nfor i in 0...50\n  r << f(if i == 30 then 0.5 else 1 end)\nend\nr.last()",
+        "def acc()\n  let s = 0\n  |x| s = if x > 10 then \"big\" else s + x end\nend\nlet f = acc()\nlet r = nil\nfor i in 0...20\n  r = f(i)\nend\nr",
+        // Captured float, untyped parameter, called by a built-in.
+        "def make(k: float)\n  |x| x * k + 1.0\nend\nlet f = make(0.5)\nlet t = 0.0\nfor i in 0...1000\n  t += f(i * 1.0)\nend\n[t, [1.0, 2.0].map(f)]",
+        "def scale(xs: [int], m: int): int = xs.map(|x| x * m).sum()\nscale([1, 2, 3], 4)",
+        // Modified by the closure, seen by the function that declared it.
+        "def run(): int\n  let total = 0\n  let add = |x: int| total += x\n  for i in 0...100\n    add(i)\n  end\n  total\nend\nrun()",
+        // Errors in a closure: same message and call stack.
+        "def make(d: int)\n  |x: int| x / d\nend\nlet f = make(0)\nlet t = 0\nfor i in 0...10\n  t += f(i)\nend",
+        "def make(xs: [int])\n  |i: int| xs[i]\nend\nlet f = make([1, 2, 3])\nlet t = 0\nfor i in 0...10\n  t += f(i)\nend",
+        // Read before being initialized.
+        "def outer()\n  let f = |x| y + x\n  let r = f(1)\n  let y = 2\n  r\nend\nouter()",
+        // Nested closures.
+        "def adder(a: int)\n  |b: int| |c: int| a + b + c\nend\nlet t = 0\nfor i in 0...100\n  t += adder(1)(i)(2)\nend\nt",
+    ] {
+        same(src);
+    }
+    // The closure called in the loop is compiled.
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    e.eval("def counter()\n  let n = 0\n  || n += 1\nend\nlet c = counter()\nlet last = 0\nfor i in 0...1000\n  last = c()\nend")
+        .unwrap();
+    assert!(e.is_native("c"));
+    assert_eq!(e.eval_as::<i64>("c()").unwrap(), 1001);
+}

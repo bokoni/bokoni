@@ -46,6 +46,9 @@
 //!   its tag checked on every read, otherwise resumed in the interpreter), an object one
 //!   is of the class of its value at compile time (checked on every read). The loops of
 //!   the main program are outlined into functions (`outline.rs`) to be compiled.
+//! - A closure's captured variables (its cells) are passed by its caller in
+//!   `JitCtx::env`, read on entry; one of a simple type is read and written in place in
+//!   its cell. A function whose own variables are captured is not compiled.
 //!
 //! Internal calling convention: `fn(ctx, params…) -> (status, result)`, status 0 = success,
 //! 1 = error (described in `ctx`). Each function also has an entry point for Rust:
@@ -72,7 +75,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
 use std::rc::Rc;
 
-/// Context shared with native code. The first three fields are read and written by the
+/// Context shared with native code. The first four fields are read and written by the
 /// generated code (fixed offsets); the others are used by Rust code only.
 #[repr(C)]
 pub struct JitCtx {
@@ -80,6 +83,9 @@ pub struct JitCtx {
     pub max_depth: i64,
     /// Error that occurred: index into the error table.
     pub err: i64,
+    /// Variables captured by the function called (its closure's cells): set by its
+    /// caller, read by the function on entry.
+    pub env: *const crate::vm::Cell,
     /// Call stack of the error (indices into the call table), most recent first.
     pub traces: Vec<u32>,
     /// The runtime, for a resumption in the interpreter (`bk_resume`).
@@ -100,6 +106,7 @@ const PENDING: i64 = -2;
 const DEPTH_OFFSET: i32 = 0;
 const MAX_DEPTH_OFFSET: i32 = 8;
 const ERR_OFFSET: i32 = 16;
+const ENV_OFFSET: i32 = 24;
 
 #[derive(Clone, Copy)]
 enum ErrKind {
@@ -278,7 +285,13 @@ extern "C" fn bk_resume(
             (*ctx).err,
             std::mem::take(&mut (*ctx).traces),
         );
-        let r = (*rt).resume(p, &mut regs, site.block, site.instr, saved.0 as usize);
+        // Its captured variables: those it was called with (set by its native code).
+        let env: &[crate::vm::Cell] = if p.captures.is_empty() {
+            &[]
+        } else {
+            std::slice::from_raw_parts((*ctx).env, p.captures.len())
+        };
+        let r = (*rt).resume(p, &mut regs, site.block, site.instr, saved.0 as usize, env);
         (*ctx).depth = saved.0;
         (*ctx).max_depth = saved.1;
         (*ctx).err = saved.2;
@@ -511,6 +524,7 @@ fn inlinable(q: &Proto, p: &Proto) -> bool {
     };
     Rc::ptr_eq(&q.script, &p.script)
         && q.handlers.is_empty()
+        && q.captures.is_empty()
         && b.instrs.len() <= 16
         && matches!(b.term, Term::Return { .. })
         && native_sig(q).is_some_and(|(ps, r)| {
@@ -888,6 +902,89 @@ extern "C" fn bk_global_word(ctx: *mut JitCtx, slot: u32, tag: i32, out: *mut u6
     }
 }
 
+/// Offset of the value in a captured variable's cell (`Rc<RefCell<Value>>`), from the
+/// address its `Rc` holds: `None` if a cell cannot be read in place.
+fn cell_value_off() -> Option<i32> {
+    use crate::value::layout::TAG_INT;
+    let c: crate::vm::Cell = Rc::new(std::cell::RefCell::new(Value::Int(7)));
+    if std::mem::size_of::<crate::vm::Cell>() != std::mem::size_of::<usize>() {
+        return None;
+    }
+    // SAFETY: an `Rc` is one pointer (checked above); `as_ptr` is the cell's value.
+    let (raw, at) = unsafe {
+        (
+            *(&c as *const crate::vm::Cell as *const usize),
+            c.as_ptr() as usize,
+        )
+    };
+    let off = at.checked_sub(raw)?;
+    let tag = unsafe { *(at as *const u8) };
+    (off < 64 && tag == TAG_INT).then_some(off as i32)
+}
+
+/// Captured variable `u` (cells `env`) into the slot `out`: 0, or 1 if not initialized
+/// yet (resumed in the interpreter, which gives the error).
+extern "C" fn bk_up_get(env: *const crate::vm::Cell, u: u32, out: *mut Value) -> i32 {
+    // SAFETY: `env` holds the cells of the closure running; `out` is a slot of the frame.
+    unsafe {
+        let v = (*env.add(u as usize)).borrow().clone();
+        if matches!(v, Value::Uninit) {
+            return 1;
+        }
+        *out = v;
+        0
+    }
+}
+
+/// Payload of captured variable `u` into `out` if its value has tag `tag`: 0, otherwise 1.
+extern "C" fn bk_up_word(env: *const crate::vm::Cell, u: u32, tag: i32, out: *mut u64) -> i32 {
+    // SAFETY: as for `bk_up_get`.
+    unsafe {
+        let w = match (&*(*env.add(u as usize)).borrow(), tag as u8) {
+            (Value::Int(n), TAG_INT) => *n as u64,
+            (Value::Float(f), TAG_FLOAT) => f.to_bits(),
+            (Value::Bool(b), TAG_BOOL) => *b as u64,
+            _ => return 1,
+        };
+        *out = w;
+        0
+    }
+}
+
+/// Captured variable `u` = a native value.
+extern "C" fn bk_assign_up(
+    ctx: *mut JitCtx,
+    env: *const crate::vm::Cell,
+    u: u32,
+    w: u64,
+    kind: i32,
+) {
+    // SAFETY: as for `bk_up_get`; the word is a value written by native code.
+    unsafe {
+        let v = word_value((*ctx).rt, dkind_of_code(kind), w);
+        *(*env.add(u as usize)).borrow_mut() = v;
+    }
+}
+
+/// Before a direct call of the closure in global `slot`: its captured variables for the
+/// function called (`JitCtx::env`). 0, or 1 if the global no longer holds a closure of
+/// `proto` (resumed in the interpreter).
+extern "C" fn bk_global_env(ctx: *mut JitCtx, slot: u32, proto: *const Proto) -> i32 {
+    // SAFETY: `ctx.rt` is valid; the closure stays in the global during the call.
+    unsafe {
+        match &(*(*ctx).rt).globals.at(slot).value {
+            Some(Value::Function(f)) => match &**f {
+                Function::Script(c) if Rc::as_ptr(&c.proto) == proto => {
+                    (*ctx).env = c.upvals.as_ptr();
+                    0
+                }
+                _ => 1,
+            },
+            _ => 1,
+        }
+    }
+}
+
 /// 1 if `v` is an object of class `info` (exactly), otherwise 0.
 extern "C" fn bk_obj_is(v: *const Value, info: *const crate::objects::TypeInfo) -> i32 {
     // SAFETY: `v` is a slot of the native frame; `info` is kept alive by the JIT.
@@ -1215,6 +1312,8 @@ pub struct Jit {
     /// `Option<Value>` has the layout of a `Value` (`None` has a tag of a value that owns
     /// something): native code reads and writes globals of simple types in place.
     inline_globals: bool,
+    /// Offset of the value in a captured variable's cell, if it can be read in place.
+    cell_off: Option<i32>,
     /// Allocated once (`Box::into_raw`), freed by `drop`: native code and resumptions
     /// in the interpreter reach it by its address.
     ctx: *mut JitCtx,
@@ -1239,7 +1338,7 @@ pub struct Jit {
     str_fns: [FuncId; 4],
     /// `bk_call_boxed`, `bk_binary`, `bk_truthy`, `bk_global`, `bk_box_into`,
     /// `bk_new_object`, `bk_init_done`.
-    boxed_fns: [FuncId; 10],
+    boxed_fns: [FuncId; 14],
     /// Calls through the interpreter (addresses held by native code).
     #[allow(clippy::vec_box)]
     boxed_calls: Vec<Box<BoxedCall>>,
@@ -1347,7 +1446,7 @@ fn ret_jty(anns: &mut Vec<RtType>, q: &Proto) -> JTy {
 fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
     let method = p.kind == ProtoKind::Method;
     let function = matches!(p.kind, ProtoKind::Function | ProtoKind::Lambda);
-    if !(function || method) || !p.captures.is_empty() || p.ncells != 0 {
+    if !(function || method) || p.ncells != 0 {
         return None;
     }
     let mut params = Vec::new();
@@ -1582,6 +1681,8 @@ struct Analysis<'a> {
     /// `init` (the target) called directly.
     news: FxHashMap<usize, Rc<crate::objects::TypeInfo>>,
     global_objs: FxHashMap<usize, Rc<crate::objects::TypeInfo>>,
+    /// Values of the captured variables when compiled (empty: unknown).
+    env: Vec<Value>,
 }
 
 /// Function compiled and called directly; for a method, the type of `self` it is
@@ -1712,6 +1813,15 @@ impl Analysis<'_> {
                 _ => JTy::Boxed,
             },
             SetGlobal(_, a) if word(g(*a)?) => return Some(None),
+            // A captured variable: of the simple type of its value when compiled (checked
+            // on every read), or any.
+            GetUp(_, u) => match self.env.get(*u as usize) {
+                Some(Value::Int(_)) if !forced => JTy::Int,
+                Some(Value::Float(_)) if !forced => JTy::Float,
+                Some(Value::Bool(_)) if !forced => JTy::Bool,
+                _ => JTy::Boxed,
+            },
+            SetUp(_, a) if word(g(*a)?) => return Some(None),
             _ => return None,
         };
         self.boxed.insert(ins as *const Instr as usize);
@@ -2214,6 +2324,7 @@ fn analyze(
     this: Option<Rc<crate::objects::TypeInfo>>,
     globals: &Globals,
     len: crate::intern::Symbol,
+    env: Vec<Value>,
 ) -> Option<Plan> {
     // `rescue` / `ensure`: left to the interpreter.
     if !p.handlers.is_empty() {
@@ -2242,6 +2353,7 @@ fn analyze(
         boxed: Default::default(),
         news: FxHashMap::default(),
         global_objs: FxHashMap::default(),
+        env,
         this: this.clone(),
     };
     // Typed IR registers: their type does not change.
@@ -2394,7 +2506,8 @@ fn reads_writes(p: &Proto, ins: &Instr) -> Option<(Vec<Reg>, Option<Reg>)> {
             (vec![*a, *b], Some(*d))
         }
         IterNew { dst, src, .. } => (vec![*src], Some(*dst)),
-        SetGlobal(_, a) => (vec![*a], None),
+        SetGlobal(_, a) | SetUp(_, a) => (vec![*a], None),
+        GetUp(d, _) => (vec![], Some(*d)),
         List(d, start, n) => ((*start..*start + *n).collect(), Some(*d)),
         FieldAt(d, a, _) => (vec![*a], Some(*d)),
         SetFieldAt { obj, src, .. } => (vec![*obj, *src], None),
@@ -2486,6 +2599,10 @@ impl Jit {
         builder.symbol("bk_global", bk_global as *const u8);
         builder.symbol("bk_global_word", bk_global_word as *const u8);
         builder.symbol("bk_obj_is", bk_obj_is as *const u8);
+        builder.symbol("bk_up_get", bk_up_get as *const u8);
+        builder.symbol("bk_up_word", bk_up_word as *const u8);
+        builder.symbol("bk_assign_up", bk_assign_up as *const u8);
+        builder.symbol("bk_global_env", bk_global_env as *const u8);
         builder.symbol("bk_assign_global", bk_assign_global as *const u8);
         builder.symbol("bk_box_into", bk_box_into as *const u8);
         builder.symbol("bk_new_object", bk_new_object as *const u8);
@@ -2636,6 +2753,18 @@ impl Jit {
                 types::I32,
             ),
             ("bk_obj_is", &[ptr, ptr][..], types::I32),
+            ("bk_up_get", &[ptr, types::I32, ptr][..], types::I32),
+            (
+                "bk_up_word",
+                &[ptr, types::I32, types::I32, ptr][..],
+                types::I32,
+            ),
+            (
+                "bk_assign_up",
+                &[ptr, ptr, types::I32, types::I64, types::I32][..],
+                types::INVALID,
+            ),
+            ("bk_global_env", &[ptr, types::I32, ptr][..], types::I32),
             (
                 "bk_assign_global",
                 &[ptr, types::I32, types::I64, types::I32, types::I64][..],
@@ -2651,7 +2780,7 @@ impl Jit {
             }
             boxed_fns.push(module.declare_function(name, Linkage::Import, &sig).ok()?);
         }
-        let boxed_fns: [FuncId; 10] = boxed_fns.try_into().ok()?;
+        let boxed_fns: [FuncId; 14] = boxed_fns.try_into().ok()?;
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr));
         sig.params.push(AbiParam::new(ptr));
@@ -2681,10 +2810,12 @@ impl Jit {
         Some(Jit {
             module,
             inline_globals: inline_globals_ok(),
+            cell_off: cell_value_off(),
             ctx: Box::into_raw(Box::new(JitCtx {
                 depth: 0,
                 max_depth: 0,
                 err: -1,
+                env: std::ptr::null(),
                 traces: Vec::new(),
                 rt: std::ptr::null_mut(),
                 pending: None,
@@ -2725,6 +2856,7 @@ impl Jit {
         root: &Rc<Proto>,
         this: Option<Rc<crate::objects::TypeInfo>>,
         globals: &mut Globals,
+        env: &[crate::vm::Cell],
     ) {
         // 1. Functions reachable through direct calls, and their analysis.
         let mut order: Vec<Rc<Proto>> = Vec::new();
@@ -2752,7 +2884,14 @@ impl Jit {
                 order.push(p);
                 continue;
             }
-            let plan = analyze(&p, this, globals, self.len_sym);
+            // The captured variables of the function called: their types guessed from
+            // their values (checked on every read).
+            let env: Vec<Value> = if Rc::ptr_eq(&p, root) {
+                env.iter().map(|c| c.borrow().clone()).collect()
+            } else {
+                Vec::new()
+            };
+            let plan = analyze(&p, this, globals, self.len_sym, env);
             if let Some(plan) = &plan {
                 todo.extend(plan.targets.values().cloned());
             }
@@ -2911,6 +3050,10 @@ impl Jit {
             init_done_ref,
             global_word_ref,
             obj_is_ref,
+            up_get_ref,
+            up_word_ref,
+            set_up_ref,
+            global_env_ref,
             set_global_ref,
         ] = self
             .boxed_fns
@@ -2995,7 +3138,8 @@ impl Jit {
         let mut inlines: FxHashMap<usize, (Rc<Proto>, Plan)> = FxHashMap::default();
         for (k, t) in &plan.targets {
             if inlinable(&t.proto, p)
-                && let Some(qp) = analyze(&t.proto, t.this.clone(), globals, self.len_sym)
+                && let Some(qp) =
+                    analyze(&t.proto, t.this.clone(), globals, self.len_sym, Vec::new())
             {
                 inlines.insert(*k, (t.proto.clone(), qp));
             }
@@ -3011,8 +3155,9 @@ impl Jit {
                     Instr::Bin(BinOp::Push, ..)
                         | Instr::SetIndex(..)
                         | Instr::SetFieldAt { .. }
-                        // (Drops the global's old value.)
+                        // (Drops the old value.)
                         | Instr::SetGlobal(..)
+                        | Instr::SetUp(..)
                 )
         });
         let mut written = vec![false; nregs];
@@ -3137,6 +3282,14 @@ impl Jit {
             3,
         ));
         let resume_ref = self.module.declare_func_in_func(self.resume_fn, bx.func);
+        // Captured variables (cells of the closure called), set by the caller.
+        let has_env = !p.captures.is_empty();
+        let envv = if has_env {
+            bx.ins()
+                .load(types::I64, MemFlagsData::trusted(), ctxv, ENV_OFFSET)
+        } else {
+            bx.ins().iconst(types::I64, 0)
+        };
         let live = liveness(p);
         // Checks on entry (until the first block): see `DeoptSite::entry`.
         let mut in_entry = true;
@@ -3230,6 +3383,11 @@ impl Jit {
                     Some(o) => o,
                     None => $bx.ins().stack_addr(types::I64, dout, 0),
                 };
+                // The interpreter resumes with this function's captured variables.
+                if has_env {
+                    $bx.ins()
+                        .store(MemFlagsData::trusted(), envv, ctxv, ENV_OFFSET);
+                }
                 let call = $bx.ins().call(resume_ref, &[ctxv, sp, buf, outp]);
                 let status = $bx.inst_results(call)[0];
                 if nslots > 0 {
@@ -3844,6 +4002,89 @@ impl Jit {
                         };
                         bx.def_var(dvar!(*d), v);
                     }
+                    // A captured variable of a simple type (that of its value at compile
+                    // time): its payload if it still has that type, otherwise resumed in the
+                    // interpreter.
+                    GetUp(d, u) if matches!(dty, Some(JTy::Int | JTy::Float | JTy::Bool)) => {
+                        use crate::value::layout::{TAG_BOOL, TAG_FLOAT, TAG_INT};
+                        let (tag, ty) = match dty {
+                            Some(JTy::Int) => (TAG_INT, types::I64),
+                            Some(JTy::Float) => (TAG_FLOAT, types::F64),
+                            _ => (TAG_BOOL, types::I8),
+                        };
+                        let v = match self.cell_off {
+                            Some(off) => {
+                                let cell = bx.ins().load(
+                                    types::I64,
+                                    MemFlagsData::trusted(),
+                                    envv,
+                                    (*u * 8) as i32,
+                                );
+                                let t = bx.ins().load(types::I8, MemFlagsData::new(), cell, off);
+                                let bad = bx.ins().icmp_imm_s(IntCC::NotEqual, t, tag as i64);
+                                bail!(bx, bad);
+                                bx.ins().load(ty, MemFlagsData::new(), cell, off + PAYLOAD)
+                            }
+                            None => {
+                                let uu = bx.ins().iconst(types::I32, *u as i64);
+                                let t = bx.ins().iconst(types::I32, tag as i64);
+                                let out = bx.ins().stack_addr(types::I64, dout, 0);
+                                let call = bx.ins().call(up_word_ref, &[envv, uu, t, out]);
+                                let bad = bx.inst_results(call)[0];
+                                bail!(bx, bad);
+                                bx.ins().stack_load(types::I64, ty, dout, 0)
+                            }
+                        };
+                        bx.def_var(dvar!(*d), v);
+                    }
+                    GetUp(d, u) => {
+                        let out = own!(bx, *d);
+                        let uu = bx.ins().iconst(types::I32, *u as i64);
+                        let call = bx.ins().call(up_get_ref, &[envv, uu, out]);
+                        let bad = bx.inst_results(call)[0];
+                        bail!(bx, bad);
+                        bx.def_var(dvar!(*d), out);
+                    }
+                    // A simple value over a simple value: written in place (nothing to
+                    // drop); otherwise by a helper.
+                    SetUp(u, a) => {
+                        let (w, k) = boxed_word!(bx, *a);
+                        let tag = match tyof!(*a) {
+                            Some(JTy::Int) => Some(TAG_INT),
+                            Some(JTy::Float) => Some(TAG_FLOAT),
+                            Some(JTy::Bool) => Some(TAG_BOOL),
+                            _ => None,
+                        };
+                        let done = bx.create_block();
+                        if let (Some(off), Some(tag)) = (self.cell_off, tag) {
+                            let cell = bx.ins().load(
+                                types::I64,
+                                MemFlagsData::trusted(),
+                                envv,
+                                (*u * 8) as i32,
+                            );
+                            let old = bx.ins().load(types::I8, MemFlagsData::new(), cell, off);
+                            let simple = bx.ins().icmp_imm_u(
+                                IntCC::UnsignedLessThan,
+                                old,
+                                FIRST_HEAP_TAG as i64,
+                            );
+                            let fast = bx.create_block();
+                            let slow = bx.create_block();
+                            bx.ins().brif(simple, fast, &[], slow, &[]);
+                            bx.switch_to_block(fast);
+                            let t = bx.ins().iconst(types::I8, tag as i64);
+                            bx.ins().store(MemFlagsData::new(), t, cell, off);
+                            bx.ins().store(MemFlagsData::new(), w, cell, off + PAYLOAD);
+                            bx.ins().jump(done, &[]);
+                            bx.switch_to_block(slow);
+                        }
+                        let uu = bx.ins().iconst(types::I32, *u as i64);
+                        let k = bx.ins().iconst(types::I32, dkind_code(k));
+                        bx.ins().call(set_up_ref, &[ctxv, envv, uu, w, k]);
+                        bx.ins().jump(done, &[]);
+                        bx.switch_to_block(done);
+                    }
                     SetGlobal(slot, a) => {
                         let (w, k) = boxed_word!(bx, *a);
                         // A simple value over a simple value of a variable: written in place
@@ -4430,6 +4671,19 @@ impl Jit {
                             .ok_or(())?;
                         let (fref, q) = callee_refs[&target.key()].clone();
                         let (cparams, cret) = native_sig(&q).ok_or(())?;
+                        // A closure: its captured variables, from the global (which must
+                        // still hold it).
+                        if !q.captures.is_empty() {
+                            let Some(JTy::Callee(s)) = tyof!(*f) else {
+                                return Err(());
+                            };
+                            let declared = global_proto(globals, s).ok_or(())?;
+                            let sv = bx.ins().iconst(types::I32, s as i64);
+                            let pv = bx.ins().iconst(types::I64, Rc::as_ptr(&declared) as i64);
+                            let call = bx.ins().call(global_env_ref, &[ctxv, sv, pv]);
+                            let bad = bx.inst_results(call)[0];
+                            bail!(bx, bad);
+                        }
                         let site = &p.calls[*site as usize];
                         let mut args = vec![ctxv];
                         for (k, pt) in cparams.iter().enumerate() {
@@ -4787,6 +5041,7 @@ impl Jit {
         n: usize,
         ret: RegTy,
         args: impl IntoIterator<Item = &'a Value>,
+        env: &[crate::vm::Cell],
         depth: usize,
         max_depth: usize,
     ) -> Result<Value, Error> {
@@ -4824,6 +5079,7 @@ impl Jit {
             (*ctx).traces.clear();
             (*ctx).rt = rt;
             (*ctx).pending = None;
+            (*ctx).env = env.as_ptr();
             let mut out = 0u64;
             // Object or list returned: written directly into `result`.
             let mut result = Value::Nil;

@@ -361,6 +361,11 @@ namespaces, `trait` for shared behavior.
       every read); `global = v` the interpreter's assignment otherwise. A top-level loop
       summing into a global: 0.25 s → 0.03 s (same as in a function); a method called on a
       global object in a loop: ×2 to ×14
+- [x] Closures with captured variables compiled (not yet a function whose own
+      variables are captured): their cells passed by the caller (`JitCtx::env`), a
+      captured variable of a simple type read and written in place (type of its value
+      when compiled, checked on every read), the closure in a global called directly;
+      a counter closure called in a loop: 14.7 ms → 10.6 ms (300 k calls)
 
 ### Next
 

@@ -276,7 +276,7 @@ impl Runtime {
     /// caller's registers.
     pub(crate) fn invoke_regs(&mut self, c: &Closure, args: &[Value], span: Span) -> R {
         #[cfg(feature = "jit")]
-        if let Some(r) = self.native_fast(&c.proto, None, args, span) {
+        if let Some(r) = self.native_fast(&c.proto, None, args, span, &c.upvals) {
             return r;
         }
         #[cfg(feature = "jit")]
@@ -319,7 +319,7 @@ impl Runtime {
         let body = || {
             bind(self, &mut regs)?;
             #[cfg(feature = "jit")]
-            if let Some(r) = self.try_jit(proto, &regs) {
+            if let Some(r) = self.try_jit(proto, &regs, upvals) {
                 return r;
             }
             self.exec(proto, upvals, ctx, &mut regs)
@@ -819,7 +819,7 @@ impl Runtime {
                             false => method_spec(&m, this, args),
                         };
                         if let Some(m) = m
-                            && let Some(r) = self.native_fast(&m, Some(this), args, span)
+                            && let Some(r) = self.native_fast(&m, Some(this), args, span, &[])
                         {
                             reg!(*dst) = r?;
                             return Ok(());
@@ -1434,6 +1434,7 @@ impl Runtime {
         this: Option<&Value>,
         args: &[Value],
         span: Span,
+        upvals: &[Cell],
     ) -> Option<R> {
         if !self.jit_enabled {
             return None;
@@ -1480,6 +1481,7 @@ impl Runtime {
                 n,
                 ret,
                 this.into_iter().chain(args),
+                upvals,
                 depth,
                 max,
             )
@@ -1489,7 +1491,7 @@ impl Runtime {
 
     /// Runs `proto` natively if it is (or becomes) compiled; `None` otherwise.
     #[cfg(feature = "jit")]
-    fn try_jit(&mut self, proto: &Rc<Proto>, regs: &[Value]) -> Option<R> {
+    fn try_jit(&mut self, proto: &Rc<Proto>, regs: &[Value], upvals: &[Cell]) -> Option<R> {
         if !self.jit_enabled {
             return None;
         }
@@ -1547,7 +1549,7 @@ impl Runtime {
             }
             let jit = self.jit.as_mut()?;
             jit.len_sym = self.syms.len;
-            jit.compile(proto, this, &mut self.globals);
+            jit.compile(proto, this, &mut self.globals, upvals);
         }
         let (entry, n, ret) = match &*proto.jit.borrow() {
             JitState::Native(code) => (code.entry, code.params.len(), code.ret),
@@ -1561,7 +1563,7 @@ impl Runtime {
         let jit: *mut crate::jit::Jit = self.jit.as_mut()?;
         let (depth, max) = (self.depth, self.max_depth);
         // SAFETY: `jit` belongs to this runtime; neither is borrowed during the call.
-        Some(unsafe { crate::jit::Jit::call(jit, self, entry, n, ret, &args, depth, max) })
+        Some(unsafe { crate::jit::Jit::call(jit, self, entry, n, ret, &args, upvals, depth, max) })
     }
 
     /// Resumption in the interpreter of native code (see `jit::DeoptSite`): `proto` runs
@@ -1575,11 +1577,12 @@ impl Runtime {
         block: u32,
         instr: u32,
         depth: usize,
+        upvals: &[Cell],
     ) -> R {
         let saved = self.depth;
         self.depth = depth;
         let ctx = self.no_ctx.clone();
-        let r = self.exec_at(proto, &[], &ctx, regs, block as usize, instr as usize);
+        let r = self.exec_at(proto, upvals, &ctx, regs, block as usize, instr as usize);
         self.depth = saved;
         r.map_err(|e| attach_src(e, &proto.script))
     }
