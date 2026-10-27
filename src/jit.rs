@@ -2184,6 +2184,20 @@ impl Analysis<'_> {
                 Some(Value::Int(_)) if !forced => JTy::Int,
                 Some(Value::Float(_)) if !forced => JTy::Float,
                 Some(Value::Bool(_)) if !forced => JTy::Bool,
+                // A list of simple values or strings (those of its first element): its
+                // elements checked as they are read.
+                Some(Value::List(l)) if !forced => {
+                    match l.try_borrow().ok().and_then(|l| match l.first()? {
+                        Value::Int(_) => Some(RtType::Int),
+                        Value::Float(_) => Some(RtType::Float),
+                        Value::Bool(_) => Some(RtType::Bool),
+                        Value::Str(_) => Some(RtType::Str),
+                        _ => None,
+                    }) {
+                        Some(e) => JTy::List(intern_ann(&mut self.anns, &e)),
+                        None => JTy::Boxed,
+                    }
+                }
                 // An object: of the class of its value (its methods called directly).
                 Some(Value::Object(o)) if !forced => match self.global_obj(o) {
                     Some((t, info)) => {
@@ -4897,6 +4911,10 @@ impl Jit {
                             let is = bx.inst_results(call)[0];
                             let bad = bx.ins().icmp_imm_s(IntCC::Equal, is, 0);
                             bail!(bx, bad);
+                        }
+                        // Read as a list: checked too.
+                        if let Some(JTy::List(_)) = dty {
+                            view!(bx, out, span);
                         }
                         bx.def_var(dvar!(*d), out);
                     }

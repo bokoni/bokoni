@@ -1102,6 +1102,12 @@ fn loops_of_the_main_program() {
         // Objects: their methods called directly, the class checked on every read.
         "class A\n  def init(@n: int)\n  end\n  def add(k: int): int\n    @n += k\n    @n\n  end\nend\nclass B < A\n  def add(k: int): int = 0\nend\nlet a = A(0)\nlet t = 0\nfor i in 0...100\n  t += a.add(i)\n  a = B(1) if i == 60\nend\n[t, a.add(1)]",
         "class Acc(T)\n  def init(@sum: T)\n  end\n  def add(x: T): T\n    @sum = @sum + x\n    @sum\n  end\nend\nlet a = Acc(0.0)\nfor i in 0...100\n  a.add(i * 0.5)\nend\na.add(0.0)",
+        // Lists: of the type of their first element, each element checked as it is read;
+        // the global replaced, mutated, holding other values.
+        "let xs = [1, 2, 3]\ndef total(): int\n  let t = 0\n  for x in xs\n    t += x\n  end\n  t\nend\nlet r = []\nfor i in 0...30\n  r << total()\n  xs << i if i % 5 == 0\n  xs = [0.5, 1.5] if i == 20\nend\nr",
+        "let xs = [1, 2]\ndef total(): int\n  let t = 0\n  for x in xs\n    t += x\n  end\n  t\nend\nlet r = []\nfor i in 0...30\n  r << total()\n  xs << \"x\" if i == 12\nend\nr",
+        "let xs = [1, 2]\ndef first(): int = xs[0] + xs.len()\nlet r = []\nfor i in 0...30\n  r << first()\n  xs = nil if i == 25\nend\nr",
+        "let names = [\"a\", \"bc\"]\ndef width(): int\n  let w = 0\n  for n in names\n    w += n.len()\n  end\n  w\nend\nlet t = 0\nfor i in 0...50\n  t += width()\n  names << \"d\" if i % 10 == 0\nend\nt",
     ] {
         same(src);
     }
@@ -1246,4 +1252,19 @@ fn rescue_and_ensure_in_native_code() {
         .unwrap();
     assert_eq!(e.eval_as::<i64>("bad([1, 0, 2, 0])").unwrap(), 13);
     assert!(e.is_native("bad"));
+}
+
+#[test]
+fn global_lists_are_read_natively() {
+    // A global list of simple values: compiled as such (not as a value of any type).
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    e.set_jit_eager(true);
+    e.eval("let xs = [1, 2, 3]\ndef total(): int\n  let t = 0\n  for x in xs\n    t += x * 2\n  end\n  t\nend")
+        .unwrap();
+    assert_eq!(e.eval_as::<i64>("total()").unwrap(), 12);
+    assert!(e.is_native("total"));
+    // Another type of elements: resumed in the interpreter (which gives the error).
+    assert!(e.eval("xs = [0.5]\ntotal()").is_err());
+    assert_eq!(e.eval_as::<i64>("xs = [4, 1]\ntotal()").unwrap(), 10);
 }
