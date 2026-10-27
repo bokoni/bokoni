@@ -51,6 +51,23 @@ methods, lists and strings are compiled too; where an assumption of the native c
 not hold, the interpreter takes over at that point.
 Everything else is interpreted, with exactly the same result.
 
+Macros, as in Crystal, generate code at parse time:
+
+```ruby
+macro getters(*names)
+  {% for name in names %}
+    def {{name}} = @{{name}}
+  {% end %}
+end
+
+class User
+  def init(@name: str, @email: str)
+  end
+
+  getters(name, email)
+end
+```
+
 ## Using it from Rust
 
 ```rust

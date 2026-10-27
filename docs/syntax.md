@@ -866,7 +866,7 @@ end
 
 ### Reading
 
-In a macro (planned: version 3):
+In a macro (planned: reading annotations is not available to macros yet):
 
 ```ruby
 macro validate_fields
@@ -930,14 +930,17 @@ warning: `plus` is deprecated: use add
    |       ^^^^
 ```
 
-## Macros (planned: version 3)
+## Macros
 
 > Inspired by [Crystal](https://crystal-lang.org/reference/1.22/syntax_and_semantics/macros/index.html).
 
-A macro runs **at compile time**: it receives AST nodes (not values) and generates code that is inserted in its place.
+A macro runs **at parse time**: it receives the source code of its arguments (not their
+values) and generates code that is parsed in place of its call.
 
-- `{{ expr }}`: inserts a node / a value into the generated code.
-- `{% … %}`: logic run at compile time (`if`, `for`, `let`).
+- `{{ expr }}`: inserts a value into the generated code (an argument's source code, the
+  characters of a string, the items of a list separated by `, `).
+- `{% … %}`: logic run at expansion time: `{% for x in list %}`, `{% if c %}` /
+  `{% elsif c %}` / `{% else %}`, `{% let x = expr %}`, each closed by `{% end %}`.
 
 ```ruby
 macro getters(*names)
@@ -971,27 +974,46 @@ end
 Point(x: 1).to_s()            # "Point(x=1, y=0)"
 ```
 
+A call is expanded where it stands: as statements (in a block or at the top level), as
+members (in the body of a type), or as an expression (`let a = twice(x)`: the generated
+code is a `begin … end` whose value is the last expression).
+
+### Declaration
+
+- `macro name(a, b, *rest) … end`: `*rest` receives the remaining arguments as a list;
+  the parentheses can be left out when there are no parameters.
+- At the top level or in the body of a type; a macro is known from its declaration on,
+  in the rest of the script, in later scripts of the same engine and in the files that
+  `require` the file declaring it.
+- A call must have its parentheses (`derive_to_s()`), with positional arguments.
+
+### Expressions in `{{ }}` and `{% %}`
+
+- Names (parameters, `let`, loop variables), integers, `true`, `false`, `nil`, `[a, b]`,
+  strings with `#{expr}` (`\#` for a literal `#`), `==`, `!=`, `+` (integers, lists,
+  otherwise text), `and`, `or`, `not`.
+- Methods: `.id` (an identifier), `.stringify` (a string literal of the source),
+  `.map(|v| expr)`, `.join(sep)`, `.size`, `.first`, `.last`, `.empty?`, `.upper`,
+  `.lower`, `.capitalize`.
+
 ### Context available in a macro
 
 | Variable     | Content                                               |
 |--------------|-------------------------------------------------------|
-| `@type`      | the current type: `name`, `fields`, `methods`, `annotation(…)` |
-| `@def`       | the current method: `name`, `params`, `return_type`, `annotation(…)` |
+| `@type`      | in the body of a type, the type as declared before the call: `name`, `fields` (each with `name`, `type`; fields declared by `init(@x)` included), `methods` |
 | `name.id`    | a node converted to an identifier                     |
 | `node.stringify` | the source code of a node, as a `str`             |
+
+Planned: `@def` (the current method), `annotation(…)` on types and fields.
 
 ### Rules
 
 - The generated code must be valid on its own (no lone `when` outside a `case`).
-- Hygiene: variables declared with `let` in the generated code do not leak into the caller (automatic renaming).
-- Errors point both to the macro call and to the faulty generated line.
-- A macro is visible in the file / type where it is defined, and in its descendants.
-
-### Prerequisites from version 1
-
-- Complete AST with source positions (file, line, column) on every node.
-- AST that can be serialized and printed back as source code (`stringify`).
-- The parser accepts and keeps `@[…]` (done: annotations are read from Rust).
+- Hygiene: variables declared with `let` in the macro's own text are renamed
+  (`tmp` → `tmp__m1`): they do not clash with the caller's. What `{{ }}` inserts is not
+  renamed.
+- Errors in the generated code point to the faulty generated line and name the macro and
+  the line of its call; expansion stops at 32 nested levels (a recursive macro).
 
 ## Reserved words
 

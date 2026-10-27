@@ -20,6 +20,7 @@ pub mod ir;
 #[cfg(feature = "jit")]
 pub mod jit;
 pub mod lexer;
+pub mod macros;
 pub mod objects;
 pub mod ops;
 pub mod parser;

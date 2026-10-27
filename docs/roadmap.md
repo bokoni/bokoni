@@ -334,12 +334,22 @@ namespaces, `trait` for shared behavior.
       (value of an `if` without `else`) no longer prevents compilation; ×2.6 on a typed
       loop building strings
 
+### v0.16 — Macros
+
+- [x] `macro name(a, *rest) … end`, Crystal style (`syntax.md`): a template with
+      `{{ }}` and `{% for / if / let %}`, expanded at parse time; the generated code is
+      parsed after the script's source (its spans point into it, errors name the macro
+      and its call)
+- [x] Calls as statements, as type members (with `@type`: name, fields, methods) and
+      as expressions (a `begin … end`)
+- [x] Hygiene: the `let`s of the macro's own text renamed
+- [x] Macros kept by the engine: usable by later scripts and by the files that
+      `require` the one declaring them
+
 ### Next
 
-In suggested order:
-
-1. **Crystal-style macros** (v3 of `syntax.md`): hygiene and AST exposure still open;
-   benefit from generics and modules.
+- Macros: `@def`, annotations read by macros (`f.annotation(Validate)`), calls without
+  parentheses.
 
 No design decision needed:
 

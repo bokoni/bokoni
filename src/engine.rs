@@ -20,6 +20,7 @@
 //! assert_eq!(v, 49);
 //! ```
 
+use crate::ast::Program;
 use crate::diagnostic::{Error, Errors};
 use crate::intern::Interner;
 use crate::ir::{Proto, Script};
@@ -38,6 +39,8 @@ pub struct Engine {
     on_warning: Option<WarningHandler>,
     /// Provides the files of `require` (see [`Engine::set_loader`]).
     loader: Option<Loader>,
+    /// Macros declared by the scripts so far.
+    macros: crate::macros::Macros,
     /// Files already loaded (by their name), and those being loaded (cycles).
     loaded: Vec<String>,
     loading: Vec<String>,
@@ -83,6 +86,7 @@ impl Engine {
             loader: None,
             loaded: Vec::new(),
             loading: Vec::new(),
+            macros: Default::default(),
         };
         e.eval_named(PRELUDE, "<prelude>")
             .expect("the prelude compiles");
@@ -107,10 +111,7 @@ impl Engine {
     /// let v: i64 = engine.eval_as("require \"math\"\nMath.sq(7)").unwrap();
     /// assert_eq!(v, 49);
     /// ```
-    pub fn set_loader(
-        &mut self,
-        f: impl FnMut(&str, &str) -> Result<Source, String> + 'static,
-    ) {
+    pub fn set_loader(&mut self, f: impl FnMut(&str, &str) -> Result<Source, String> + 'static) {
         self.loader = Some(Box::new(f));
     }
 
@@ -210,10 +211,11 @@ impl Engine {
         else {
             return false;
         };
-        let native = |p: &crate::ir::Proto| matches!(*p.jit.borrow(), crate::ir::JitState::Native(_));
-        info.methods.get(&m).is_some_and(|p| {
-            native(p) || p.specs.borrow().iter().any(|(_, s)| native(s))
-        })
+        let native =
+            |p: &crate::ir::Proto| matches!(*p.jit.borrow(), crate::ir::JitState::Native(_));
+        info.methods
+            .get(&m)
+            .is_some_and(|p| native(p) || p.specs.borrow().iter().any(|(_, s)| native(s)))
     }
 
     /// Maximum call depth before the "infinite recursion?" error (default: 1000).
@@ -318,24 +320,34 @@ impl Engine {
         Ok(self.rt.run(&main)?)
     }
 
-    /// Parses, checks and compiles a script to IR.
-    fn compile(&mut self, src: &str, name: &str) -> Result<Rc<Proto>, Errors> {
+    /// Parses a script: the program and the script (its source followed by the code its
+    /// macro calls generated).
+    fn parse(&mut self, src: &str, name: &str) -> Result<(Program, Rc<Script>), Errors> {
+        let r = parser::parse_with(src, &mut self.rt.interner, &mut self.macros);
         let script = Rc::new(Script {
-            src: src.into(),
+            src: self.macros.full.as_str().into(),
             name: name.into(),
         });
-        let with_src = |mut errs: Errors| {
-            for e in &mut errs.0 {
-                e.src = Some((script.name.clone(), script.src.clone()));
+        match r {
+            Ok(p) => Ok((p, script)),
+            Err(mut errs) => {
+                for e in &mut errs.0 {
+                    e.src = Some((script.name.clone(), script.src.clone()));
+                }
+                Err(errs)
             }
-            errs
-        };
-        let program = parser::parse(src, &mut self.rt.interner).map_err(with_src)?;
+        }
+    }
+
+    /// Parses, checks and compiles a script to IR.
+    fn compile(&mut self, src: &str, name: &str) -> Result<Rc<Proto>, Errors> {
+        let (mut program, mut script) = self.parse(src, name)?;
         // The script itself counts as being loaded (a file that requires it: a cycle).
         let top = !self.loading.iter().any(|n| n == name);
         if top {
             self.loading.push(name.into());
         }
+        let macros = self.macros.defs.len();
         let r = self.require(&program, name);
         if top {
             self.loading.pop();
@@ -349,6 +361,16 @@ impl Engine {
             }
             errs
         })?;
+        // The required files declared macros: parsed again, so that it can use them.
+        if self.macros.defs.len() != macros {
+            (program, script) = self.parse(src, name)?;
+        }
+        let with_src = |mut errs: Errors| {
+            for e in &mut errs.0 {
+                e.src = Some((script.name.clone(), script.src.clone()));
+            }
+            errs
+        };
         crate::compile::intern_module_names(&program, &mut self.rt.interner, &mut self.rt.globals);
         let prims = if self.static_checks {
             let (errors, warnings, prims) =
