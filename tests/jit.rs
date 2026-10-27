@@ -526,9 +526,9 @@ end
     for (t, m) in [("Vec2", "norm2"), ("Vec2", "dot"), ("Counter", "add")] {
         assert!(e.is_native_method(t, m), "`{t}.{m}` should be compiled");
     }
-    // A native caller of a method that writes fields: interpreted (an abandon would
-    // redo the writes).
-    assert!(!e.is_native("bump"));
+    // A native caller of a method that writes fields: compiled too (a resumption in the
+    // interpreter redoes nothing).
+    assert!(e.is_native("bump"));
     // `total` and `scaled` call `norm2` directly; on a `Vec3` (which redefines it) the
     // native code is abandoned, and they stay interpreted from then on.
     let mut e = Engine::new();
@@ -681,4 +681,46 @@ end
     same(
         "class Acc(T)\n  def init(@s: T)\n  end\n  def get(): T = @s\nend\ndef run(a: Acc(int)): int = a.get() + 1\nrun(Acc(2))",
     );
+}
+
+#[test]
+fn native_code_calls_methods_that_write_fields() {
+    // Called in a typed loop; resumed in the middle (a subclass redefines `add`): the
+    // writes already done are not redone.
+    let src = "class Counter
+  def init(@n: int, @total: float)
+  end
+  def add(k: int): int
+    @n += k
+    @total = @total + k * 0.5
+    @n
+  end
+  def n(): int = @n
+  def total(): float = @total
+end
+class Loud < Counter
+  def add(k: int): int
+    @n += k * 10
+    @n
+  end
+end
+def run(cs: [Counter], k: int): int
+  let t = 0
+  for i in 0...k
+    for c in cs
+      t += c.add(i)
+    end
+  end
+  t
+end
+let a = Counter(0, 0.0)
+let b = Counter(5, 1.0)
+let r1 = run([a, b], 100)
+let l = Loud(0, 0.0)
+let r2 = run([a, l, b], 10)
+[r1, r2, a.n(), a.total(), b.n(), l.n()]";
+    assert_eq!(same(src), "[333800, 101030, 4995, 2497.5, 5000, 450]");
+    let mut e = Engine::new();
+    e.eval(src).unwrap();
+    assert!(e.is_native_method("Counter", "add"));
 }

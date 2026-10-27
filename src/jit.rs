@@ -19,9 +19,8 @@
 //! - A method is compiled for the class that declares it: `self` is a pointer, its
 //!   annotated `int` / `float` / `bool` fields (`@x`) are read and written in place. A
 //!   call `obj.m()` from native code is direct, checked against a redefinition by the
-//!   object's class (otherwise resumed in the interpreter). A method that writes fields
-//!   contains only arithmetic, branches and fields (types checked on entry), and native
-//!   code does not call it.
+//!   object's class (otherwise resumed in the interpreter). The type of a field is
+//!   checked on every access (a method called may change it).
 //! - A `forall` function (its annotations `T` are `any` at run time) is compiled as a copy
 //!   typed for the arguments of a call (`T = int`, see `Proto::specialize`): one copy per
 //!   type, called directly by native code, or by the interpreter when the arguments fit.
@@ -494,8 +493,6 @@ struct Compiled {
     id: FuncId,
     params: Vec<RegTy>,
     ret: RegTy,
-    /// Method that modifies fields of `self`: not called by native code.
-    writes: bool,
 }
 
 pub struct Jit {
@@ -794,8 +791,6 @@ struct Plan {
     targets: FxHashMap<usize, Target>,
     /// Method: the type of `self` (its fields).
     this: Option<Rc<crate::objects::TypeInfo>>,
-    /// Method that modifies fields of `self`.
-    writes: bool,
     /// Constructed types (`T(…)`).
     ctors: Vec<u32>,
     /// Types of objects and list elements (`JTy::Obj` / `List` / `Iter`).
@@ -854,42 +849,6 @@ fn field_jty(
         return prim(r).map(jty);
     }
     prim(&t.ty).map(jty)
-}
-
-/// A method that modifies fields of `self` may not abandon its native execution after
-/// a write (the interpreter would redo it): only arithmetic, branches and fields.
-fn writes_safely(p: &Proto) -> bool {
-    use Instr::*;
-    p.blocks.iter().all(|b| {
-        matches!(
-            b.term,
-            Term::Jump(_)
-                | Term::Branch { .. }
-                | Term::IfInt { .. }
-                | Term::IfIntK { .. }
-                | Term::Return { .. }
-        ) && b.instrs.iter().all(|i| {
-            matches!(
-                i,
-                Int(..)
-                    | Float(..)
-                    | Bool(..)
-                    | Nil(_)
-                    | Move(..)
-                    | Guard(..)
-                    | IBin(..)
-                    | IBinK(..)
-                    | FBin(..)
-                    | INeg(..)
-                    | FNeg(..)
-                    | IToF(..)
-                    | Not(..)
-                    | Bin(..)
-                    | FieldAt(..)
-                    | SetFieldAt { .. }
-            )
-        })
-    })
 }
 
 impl Analysis<'_> {
@@ -1200,14 +1159,6 @@ fn analyze(
     if method != this.is_some() {
         return None;
     }
-    let writes = p
-        .blocks
-        .iter()
-        .flat_map(|b| &b.instrs)
-        .any(|i| matches!(i, Instr::SetFieldAt { .. }));
-    if writes && !writes_safely(p) {
-        return None;
-    }
     let mut an = Analysis {
         p,
         globals,
@@ -1321,7 +1272,6 @@ fn analyze(
         anns: an.anns,
         targets: an.targets,
         this,
-        writes,
     })
 }
 
@@ -1593,15 +1543,9 @@ impl Jit {
                 let Some(Some(plan)) = plans.get(&key) else {
                     continue;
                 };
-                // A method that modifies `self` is not called by native code: an
-                // abandon after the call would redo its writes.
                 let blocked = plan.targets.values().any(|q| {
                     let k = q.key();
-                    match (self.compiled.get(&k), plans.get(&k)) {
-                        (Some(c), _) => c.writes,
-                        (None, Some(Some(qp))) => qp.writes,
-                        _ => true,
-                    }
+                    !self.compiled.contains_key(&k) && !matches!(plans.get(&k), Some(Some(_)))
                 });
                 if blocked {
                     plans.insert(key, None);
@@ -1616,8 +1560,7 @@ impl Jit {
         let mut new = Vec::new();
         for p in &order {
             let key = Rc::as_ptr(p) as usize;
-            if let Some(Some(plan)) = plans.get(&key) {
-                let writes = plan.writes;
+            if let Some(Some(_)) = plans.get(&key) {
                 let (params, ret) = native_sig(p).unwrap();
                 let sig = self.signature(&params, ret);
                 self.next += 1;
@@ -1629,15 +1572,7 @@ impl Jit {
                     Ok(id) => id,
                     Err(_) => return,
                 };
-                self.compiled.insert(
-                    key,
-                    Compiled {
-                        id,
-                        params,
-                        ret,
-                        writes,
-                    },
-                );
+                self.compiled.insert(key, Compiled { id, params, ret });
                 new.push(p.clone());
             }
         }
@@ -2065,10 +2000,9 @@ impl Jit {
                 param.then(|| plan.entry[0][r].get()).flatten()
             })
             .collect();
-        // `self`: its fields (address checked on entry, as well as the type of the fields
-        // used).
+        // `self`: its fields (address checked on entry; the type of a field on every
+        // access: a method called may change it, a field of type `T` may hold anything).
         let mut this_fp = None;
-        let mut this_checks = Vec::new();
         if let Some(info) = &plan.this {
             let obj = bx.block_params(entry)[1];
             if let Some(v) = vars.get(&(0, JTy::This)) {
@@ -2092,21 +2026,6 @@ impl Jit {
                 let null = bx.ins().icmp_imm_s(IntCC::Equal, fp, 0);
                 deopt!(bx, null, entry_types, 0, 0);
                 this_fp = Some(fp);
-                // Every field used (a field of type `T` may hold anything: its old value
-                // must also be simple to be overwritten).
-                let mut used = used;
-                used.sort();
-                used.dedup();
-                for idx in used {
-                    let off = idx as i32 * crate::value::layout::SIZE;
-                    let want = match field_jty(info, idx, p.spec.as_deref()).ok_or(())? {
-                        JTy::Int => crate::value::layout::TAG_INT,
-                        JTy::Float => crate::value::layout::TAG_FLOAT,
-                        _ => crate::value::layout::TAG_BOOL,
-                    };
-                    let tag = bx.ins().load(types::I8, MemFlagsData::trusted(), fp, off);
-                    this_checks.push(bx.ins().icmp_imm_s(IntCC::NotEqual, tag, want as i64));
-                }
             }
         }
         // Field address of each object of known type (checked once here).
@@ -2136,9 +2055,6 @@ impl Jit {
             let fp = bx.inst_results(call)[0];
             entry_checks.push(fp);
             fields_ptr.insert(prm.reg, fp);
-        }
-        for bad in this_checks {
-            deopt!(bx, bad, entry_types, 0, 0);
         }
         let start = bx.create_block();
         for fp in entry_checks {
@@ -2343,14 +2259,21 @@ impl Jit {
                     // `@x` of `self`: its type was checked on entry.
                     FieldAt(d, 0, idx) if tyof!(0) == Some(JTy::This) => {
                         let fp = this_fp.ok_or(())?;
-                        let off = *idx as i32 * crate::value::layout::SIZE
-                            + crate::value::layout::PAYLOAD;
-                        let cty = match dty {
-                            Some(JTy::Float) => types::F64,
-                            Some(JTy::Bool) => types::I8,
-                            _ => types::I64,
+                        let off = *idx as i32 * crate::value::layout::SIZE;
+                        let (cty, want) = match dty {
+                            Some(JTy::Float) => (types::F64, crate::value::layout::TAG_FLOAT),
+                            Some(JTy::Bool) => (types::I8, crate::value::layout::TAG_BOOL),
+                            _ => (types::I64, crate::value::layout::TAG_INT),
                         };
-                        let v = bx.ins().load(cty, MemFlagsData::trusted(), fp, off);
+                        let tag = bx.ins().load(types::I8, MemFlagsData::trusted(), fp, off);
+                        let bad = bx.ins().icmp_imm_s(IntCC::NotEqual, tag, want as i64);
+                        bail!(bx, bad);
+                        let v = bx.ins().load(
+                            cty,
+                            MemFlagsData::trusted(),
+                            fp,
+                            off + crate::value::layout::PAYLOAD,
+                        );
                         bx.def_var(dvar!(*d), v);
                     }
                     SetFieldAt {
@@ -2372,7 +2295,10 @@ impl Jit {
                             (JTy::Bool, _) => (crate::value::layout::TAG_BOOL, v),
                             _ => (crate::value::layout::TAG_INT, v),
                         };
-                        // The old value is of the same simple type: nothing to drop.
+                        // The old value must be of the same simple type: nothing to drop.
+                        let old = bx.ins().load(types::I8, MemFlagsData::trusted(), fp, off);
+                        let bad = bx.ins().icmp_imm_s(IntCC::NotEqual, old, tag as i64);
+                        bail!(bx, bad);
                         let t = bx.ins().iconst(types::I8, tag as i64);
                         bx.ins().store(MemFlagsData::trusted(), t, fp, off);
                         bx.ins().store(

@@ -298,7 +298,9 @@ namespaces, `trait` for shared behavior.
       resumes as the function written (`Spec::origin`); a result of another type than
       the native one is passed to the native caller, which resumes after the call
 - [ ] Lists modified in native code (`xs << x`, `xs[i] = v`, list fields)
-- [ ] Native calls to methods that write fields
+- [x] Native calls to methods that write fields (and no restriction on what such a
+      method contains): the type of a field is checked on every access, a method
+      called may change it; a typed loop calling `c.add(k)`: 0.11 s → 0.02 s
 - [ ] Inlining of small functions and getters
 - [ ] Strings in native code
 
