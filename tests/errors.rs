@@ -375,3 +375,51 @@ fn syntax_of_clauses() {
     // `then` on the same line.
     assert_eq!(run("begin raise \"x\" rescue e then 5 end"), "=> 5");
 }
+
+#[test]
+fn question_variants_return_nil() {
+    let src = "let xs = [1, 2, 3]
+[xs[1]?, xs[7]?, xs[-3]?, xs[-4]?, \"ab\"[1]?, \"ab\"[5]?, {\"a\" => 1}[\"z\"]?, (1, 2)[9]?]";
+    assert_eq!(run(src), "=> [2, nil, 1, nil, \"b\", nil, nil, nil]");
+    let src = "[\"42\".to_i?(), \" 7 \".to_i?(), \"x\".to_i?(), \"1.5\".to_f?(), \"no\".to_f?(),
+ 2.7.to_i?(), 1e300.to_i?(), 3.to_i?(), 3.to_f?()]";
+    assert_eq!(run(src), "=> [42, 7, nil, 1.5, nil, 2, nil, 3, 3.0]");
+    // The usual pattern: a default value.
+    assert_eq!(
+        run("let port: int = \"80x\".to_i?() or 8080\nport"),
+        "=> 8080"
+    );
+    // In a hot loop (compiled code), the same results.
+    let src = "def at(xs, i) = xs[i]? or -1
+let t = 0
+for i in 0..2000
+  t += at([1, 2, 3], i % 5)
+end
+t";
+    assert_eq!(run(src), "=> 1601");
+    // A wrong type is still an error.
+    let out = run("let xs = [1]\nxs[\"a\"]?");
+    assert!(
+        out.contains("an index must be an integer, got `str`"),
+        "{out}"
+    );
+    let out = run("[1].to_i?()");
+    assert!(out.contains("has no method `to_i?`"), "{out}");
+    // Not assignable.
+    let out = run("let xs = [1]\nxs[0]? = 2");
+    assert!(out.contains("cannot assign to this expression"), "{out}");
+}
+
+#[test]
+fn names_can_end_with_a_question_mark() {
+    let src = "def valid?(s: str): bool = s.to_i?() != nil
+class Box
+  def init(@v: int)
+  end
+  def empty?() = @v == 0
+end
+[valid?(\"12\"), valid?(\"a\"), Box(0).empty?(), Box(1).empty?()]";
+    assert_eq!(run(src), "=> [true, false, true, false]");
+    // `T?` in types is unchanged.
+    assert_eq!(run("def f(x: int?): str? = nil\nf(nil)"), "=> nil");
+}

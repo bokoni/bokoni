@@ -486,8 +486,9 @@ impl Printer<'_> {
                 self.expr(recv);
                 let _ = write!(self.out, " {idx})");
             }
-            ExprKind::Index(recv, idx) => {
-                self.out.push_str("(index ");
+            ExprKind::Index(recv, idx) | ExprKind::IndexOpt(recv, idx) => {
+                let opt = matches!(ast.kind(e), ExprKind::IndexOpt(..));
+                self.out.push_str(if opt { "(index? " } else { "(index " });
                 self.expr(recv);
                 self.out.push(' ');
                 self.expr(idx);

@@ -342,6 +342,29 @@ end                            # [25, nil, 50]
 - An uncaught error stops the script: `runtime error: ConfigError: missing app.yml`
   (the `message` field of the object, if it has one).
 
+### `?` variants: `nil` instead of an error
+
+For a failure that is expected (input to validate), a `?` variant returns `nil` instead
+of raising: cheaper than an exception, and the type (`int?`) says that the case must be
+handled.
+
+```ruby
+"8080".to_i?()                 # 8080
+"80x".to_i?()                  # nil   ("80x".to_i() raises an error)
+"1.5".to_f?()                  # 1.5
+1e300.to_i?()                  # nil   (too large for an `int`)
+xs[10]?                        # nil when out of bounds (also for a `str`, a tuple)
+
+let port = s.to_i?() or 80
+```
+
+A wrong type is still an error (`xs["a"]?`). The other built-in methods already return
+`nil` when there is nothing to return: `first()`, `last()`, `pop()`, `min()`, `max()`,
+`find()`, `h[key]`, `get(key)`.
+
+The name of a function or a method can end with `?` (`def empty?() = …`,
+`valid?(s)`), as in Ruby and Crystal.
+
 ## Enum
 
 ```ruby

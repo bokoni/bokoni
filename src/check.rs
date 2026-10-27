@@ -312,11 +312,13 @@ const STR_METHODS: &[&str] = &[
     "chars",
     "to_i",
     "to_f",
+    "to_i?",
+    "to_f?",
     "to_s",
     "inspect",
 ];
 const NUM_METHODS: &[&str] = &[
-    "abs", "to_f", "to_i", "floor", "ceil", "round", "sqrt", "to_s", "inspect",
+    "abs", "to_f", "to_i", "to_f?", "to_i?", "floor", "ceil", "round", "sqrt", "to_s", "inspect",
 ];
 const LIST_METHODS: &[&str] = &[
     "len", "is_empty", "push", "pop", "first", "last", "contains", "join", "reverse", "sort",
@@ -1509,6 +1511,22 @@ impl Checker<'_> {
                 let i = self.expr(idx, None);
                 self.index(&r, &i, span, ast.span(idx))
             }
+            ExprKind::IndexOpt(recv, idx) => {
+                let r = self.expr(recv, None);
+                let i = self.expr(idx, None);
+                match (&r, &i) {
+                    // Literal index out of a tuple: `nil`, not an error.
+                    (Ty::Tuple(ts), Ty::LitInt(n))
+                        if !(-(ts.len() as i64)..ts.len() as i64).contains(n) =>
+                    {
+                        Ty::Nil
+                    }
+                    _ => {
+                        let t = self.index(&r, &i, span, ast.span(idx));
+                        Ty::optional(t)
+                    }
+                }
+            }
             ExprKind::Lambda(id) => self.lambda(id, expected),
 
             ExprKind::If(c) => {
@@ -2550,6 +2568,9 @@ impl Checker<'_> {
             ("abs", Ty::Float) => Some((vec![], Ty::Float)),
             ("to_f" | "sqrt", _) if num => Some((vec![], Ty::Float)),
             ("to_i" | "floor" | "ceil" | "round", _) if num => Some((vec![], Ty::Int)),
+            ("to_f?", _) if num => Some((vec![], Ty::Float)),
+            ("to_i?", Ty::Float) => Some((vec![], Ty::optional(Ty::Int))),
+            ("to_i?", _) if num => Some((vec![], Ty::Int)),
             ("len", _)
                 if str_ty || matches!(r, Ty::List(_) | Ty::Range | Ty::Hash(..) | Ty::Tuple(_)) =>
             {
@@ -2577,6 +2598,8 @@ impl Checker<'_> {
             ("chars", _) if str_ty => Some((vec![], Ty::List(Box::new(Ty::Str)))),
             ("to_i", _) if str_ty => Some((vec![], Ty::Int)),
             ("to_f", _) if str_ty => Some((vec![], Ty::Float)),
+            ("to_i?", _) if str_ty => Some((vec![], Ty::optional(Ty::Int))),
+            ("to_f?", _) if str_ty => Some((vec![], Ty::optional(Ty::Float))),
 
             ("push", Ty::List(t)) => Some((vec![(**t).clone()], r.clone())),
             ("pop" | "first" | "last", Ty::List(t)) => Some((vec![], Ty::optional((**t).clone()))),

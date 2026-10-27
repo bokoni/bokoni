@@ -853,7 +853,7 @@ impl Parser<'_, '_> {
             ));
         }
         self.bump();
-        let mut name_span = name_tok.span;
+        let mut name_span = self.question_suffix(name_tok.span);
         // Setter: `def name=(value)`, the `=` attached to the name.
         if self.at(T::Eq) && self.tok().span.start == name_tok.span.end && self.peek2() == T::LParen
         {
@@ -892,6 +892,16 @@ impl Parser<'_, '_> {
             annotations,
             span: self.span_from(start),
         })
+    }
+
+    /// A `?` attached to the end of `span` (`to_i?`, `xs[i]?`) is consumed and added
+    /// to it.
+    fn question_suffix(&mut self, span: Span) -> Span {
+        if self.at(T::Question) && self.tok().span.start == span.end {
+            span.to(self.bump().span)
+        } else {
+            span
+        }
     }
 
     /// Parameters between `open` and `close`: `(a: int, b = 0)` or `|x, y|`.
@@ -1382,8 +1392,9 @@ impl Parser<'_, '_> {
                         e = self.mk(ExprKind::TupleIndex(e, idx), span);
                     } else if t.kind == T::Ident || is_keyword(t.kind) {
                         self.bump();
-                        let name = self.intern(t.span);
-                        e = self.mk(ExprKind::Field(e, name), span);
+                        let name_span = self.question_suffix(t.span);
+                        let name = self.intern(name_span);
+                        e = self.mk(ExprKind::Field(e, name), span.to(name_span));
                     } else {
                         return self.error_here(format!(
                             "expected a method or field name after `.`, found {}",
@@ -1411,9 +1422,16 @@ impl Parser<'_, '_> {
                     self.skip_newlines();
                     let index = self.expr()?;
                     self.skip_newlines();
-                    self.expect(T::RBracket, "to close the index")?;
+                    let close = self.expect(T::RBracket, "to close the index")?;
+                    // `xs[i]?`: `nil` rather than an error when out of bounds.
+                    let optional = self.question_suffix(close.span) != close.span;
                     let span = self.span_from(self.span(e));
-                    e = self.mk(ExprKind::Index(e, index), span);
+                    let kind = if optional {
+                        ExprKind::IndexOpt(e, index)
+                    } else {
+                        ExprKind::Index(e, index)
+                    };
+                    e = self.mk(kind, span);
                 }
                 T::Do if !self.no_do => {
                     let do_span = self.tok().span;
@@ -1575,7 +1593,15 @@ impl Parser<'_, '_> {
             }
             T::Ident => {
                 self.bump();
-                ExprKind::Ident(self.intern(t.span))
+                // `valid?(x)`: call of a function whose name ends with `?`.
+                let mut span = t.span;
+                if self.at(T::Question)
+                    && self.tok().span.start == span.end
+                    && self.peek2() == T::LParen
+                {
+                    span = span.to(self.bump().span);
+                }
+                ExprKind::Ident(self.intern(span))
             }
             T::IVar => {
                 self.bump();

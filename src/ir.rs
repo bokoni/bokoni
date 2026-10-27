@@ -376,6 +376,8 @@ pub enum Instr {
     /// Interpolation: texts of the registers, concatenated.
     Concat(Reg, Reg, u32),
     Index(Reg, Reg, Reg),
+    /// `r[i]?`: `nil` when out of bounds.
+    IndexOpt(Reg, Reg, Reg),
     SetIndex(Reg, Reg, Reg),
     Field(Reg, Reg, Symbol),
     /// Field whose type the checker knows (`int` / `float` / `bool`), into a
@@ -638,6 +640,7 @@ impl Proto {
             }
             Concat(d, a, n) => format!("r{d} = concat r{a}..+{n}"),
             Index(d, a, b) => format!("r{d} = r{a}[r{b}]"),
+            IndexOpt(d, a, b) => format!("r{d} = r{a}[r{b}]?"),
             SetIndex(a, b, v) => format!("r{a}[r{b}] = r{v}"),
             Field(d, a, f) => format!("r{d} = r{a}.{}", s(f)),
             FieldAs(d, a, f, t) => format!("r{d} = r{a}.{} : {}", s(f), t.name()),

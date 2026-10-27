@@ -303,7 +303,7 @@ impl Resolver<'_> {
                 a
             }
             ExprKind::Unary(_, x) => self.expr(x),
-            ExprKind::Binary(_, x, y) | ExprKind::Index(x, y) => {
+            ExprKind::Binary(_, x, y) | ExprKind::Index(x, y) | ExprKind::IndexOpt(x, y) => {
                 let a = self.expr(x);
                 self.expr(y) || a
             }
@@ -2106,10 +2106,15 @@ impl Compiler<'_> {
                 self.emit(Instr::TupleIndex(d, r.0, idx), span);
                 (d, RegTy::Value)
             }
-            ExprKind::Index(recv, idx) => {
+            ExprKind::Index(recv, idx) | ExprKind::IndexOpt(recv, idx) => {
                 let ops = self.operands(&[recv, idx]);
                 let d = self.tmp(RegTy::Value);
-                self.emit(Instr::Index(d, ops[0].0, ops[1].0), span);
+                let (r, i) = (ops[0].0, ops[1].0);
+                let ins = match ast.kind(e) {
+                    ExprKind::IndexOpt(..) => Instr::IndexOpt(d, r, i),
+                    _ => Instr::Index(d, r, i),
+                };
+                self.emit(ins, span);
                 (d, RegTy::Value)
             }
             ExprKind::Lambda(id) => {
@@ -2833,6 +2838,7 @@ fn dest_mut(ins: &mut Instr) -> Option<&mut Reg> {
         Bin(_, d, _, _) | Neg(d, _) | Not(d, _) => d,
         List(d, _, _) | Tuple(d, _, _) | Hash(d, _, _) | Record(d, _, _) | Concat(d, _, _) => d,
         Index(d, _, _)
+        | IndexOpt(d, _, _)
         | Field(d, _, _)
         | FieldAs(d, _, _, _)
         | FieldAt(d, _, _)
@@ -2913,7 +2919,7 @@ fn visit(ast: &Ast, e: ExprId, f: &mut dyn FnMut(ExprId)) {
         ExprKind::Unary(_, x) | ExprKind::Field(x, _) | ExprKind::TupleIndex(x, _) => {
             visit(ast, x, f)
         }
-        ExprKind::Binary(_, x, y) | ExprKind::Index(x, y) => {
+        ExprKind::Binary(_, x, y) | ExprKind::Index(x, y) | ExprKind::IndexOpt(x, y) => {
             visit(ast, x, f);
             visit(ast, y, f);
         }

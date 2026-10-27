@@ -54,6 +54,7 @@ methods! {
     Upper = "upper", Lower = "lower", Capitalize = "capitalize", Trim = "trim",
     Split = "split", StartsWith = "starts_with", EndsWith = "ends_with",
     Replace = "replace", Chars = "chars", ToI = "to_i", ToF = "to_f",
+    ToIOpt = "to_i?", ToFOpt = "to_f?",
     Abs = "abs", Floor = "floor", Ceil = "ceil", Round = "round", Sqrt = "sqrt",
     Call = "call", ToList = "to_list",
 }
@@ -97,11 +98,26 @@ impl Runtime {
     }
 
     pub(crate) fn index(&self, r: &Value, i: &Value, span: Span) -> R {
+        self.index_in(r, i, span, false)
+    }
+
+    /// `r[i]?`: `nil` when the index is out of bounds (a wrong type is still an error).
+    pub(crate) fn index_opt(&self, r: &Value, i: &Value, span: Span) -> R {
+        self.index_in(r, i, span, true)
+    }
+
+    fn index_in(&self, r: &Value, i: &Value, span: Span, opt: bool) -> R {
+        let pos = |len: usize| -> R<Option<usize>> {
+            match list_pos(i, len, span)? {
+                Some(p) => Ok(Some(p)),
+                None if opt => Ok(None),
+                None => list_index(i, len, span).map(Some),
+            }
+        };
         match r {
             Value::List(l) => {
                 let l = l.borrow();
-                let pos = list_index(i, l.len(), span)?;
-                Ok(l[pos].clone())
+                Ok(pos(l.len())?.map_or(Value::Nil, |p| l[p].clone()))
             }
             Value::Hash(h) => {
                 let key = self.hash_key(i, span)?;
@@ -109,13 +125,9 @@ impl Runtime {
             }
             Value::Str(s) => {
                 let chars: Vec<char> = s.chars().collect();
-                let pos = list_index(i, chars.len(), span)?;
-                Ok(Value::Str(chars[pos].to_string().into()))
+                Ok(pos(chars.len())?.map_or(Value::Nil, |p| Value::Str(chars[p].to_string().into())))
             }
-            Value::Tuple(t) => {
-                let pos = list_index(i, t.len(), span)?;
-                Ok(t[pos].clone())
-            }
+            Value::Tuple(t) => Ok(pos(t.len())?.map_or(Value::Nil, |p| t[p].clone())),
             _ => type_err(
                 format!("{} cannot be indexed with `[…]`", r.type_name()),
                 span,
@@ -357,9 +369,35 @@ impl Runtime {
                     }
                 })
             }
-            (M::ToI | M::Floor | M::Ceil | M::Round, Value::Int(_)) => {
+            (M::ToI | M::ToIOpt | M::Floor | M::Ceil | M::Round, Value::Int(_)) => {
                 n(0)?;
                 Ok(recv.clone())
+            }
+            // `?` variants: `nil` instead of an error.
+            (M::ToIOpt, Value::Float(f)) => {
+                n(0)?;
+                let r = f.trunc();
+                Ok(if r.is_finite() && r.abs() <= i64::MAX as f64 {
+                    Value::Int(r as i64)
+                } else {
+                    Value::Nil
+                })
+            }
+            (M::ToFOpt, Value::Int(i)) => {
+                n(0)?;
+                Ok(Value::Float(*i as f64))
+            }
+            (M::ToFOpt, Value::Float(_)) => {
+                n(0)?;
+                Ok(recv.clone())
+            }
+            (M::ToIOpt, Value::Str(s)) => {
+                n(0)?;
+                Ok(s.trim().parse::<i64>().map_or(Value::Nil, Value::Int))
+            }
+            (M::ToFOpt, Value::Str(s)) => {
+                n(0)?;
+                Ok(s.trim().parse::<f64>().map_or(Value::Nil, Value::Float))
             }
             (M::Sqrt, Value::Int(_) | Value::Float(_)) => {
                 n(0)?;
@@ -700,6 +738,15 @@ pub(crate) fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
 
 /// List index; negative counts from the end.
 pub(crate) fn list_index(i: &Value, len: usize, span: Span) -> R<usize> {
+    match (list_pos(i, len, span)?, i) {
+        (Some(p), _) => Ok(p),
+        (None, Value::Int(i)) => rt_err(format!("index {i} out of bounds (length {len})"), span),
+        (None, _) => unreachable!("list_pos checks the type"),
+    }
+}
+
+/// Position of index `i` (negative: from the end), `None` when out of bounds.
+fn list_pos(i: &Value, len: usize, span: Span) -> R<Option<usize>> {
     let Value::Int(i) = i else {
         return type_err(
             format!("an index must be an integer, got {}", i.type_name()),
@@ -707,10 +754,7 @@ pub(crate) fn list_index(i: &Value, len: usize, span: Span) -> R<usize> {
         );
     };
     let pos = if *i < 0 { len as i64 + i } else { *i };
-    if pos < 0 || pos >= len as i64 {
-        return rt_err(format!("index {i} out of bounds (length {len})"), span);
-    }
-    Ok(pos as usize)
+    Ok((pos >= 0 && pos < len as i64).then_some(pos as usize))
 }
 
 /// Maximum size, in bytes, of a list created in one go (`range.to_list()`) and of a

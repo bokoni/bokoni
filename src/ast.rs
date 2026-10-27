@@ -563,6 +563,8 @@ pub enum ExprKind {
     TupleIndex(ExprId, u32),
     /// `recv[index]`
     Index(ExprId, ExprId),
+    /// `recv[index]?`: `nil` when the index is out of bounds.
+    IndexOpt(ExprId, ExprId),
 
     Lambda(LambdaId),
 

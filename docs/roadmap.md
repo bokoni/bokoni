@@ -192,8 +192,9 @@ Modeled on Crystal (see `syntax.md`, *Error handling*).
 - [x] Static checks: type of the `rescue` variable, `raise` of a value that is neither a
       string nor an object
 - [ ] Inheritance, so that custom errors can be rescued as an `Error`
-- [ ] `?` variants of the built-in methods that return `nil` instead of raising
-      (`to_i?`, `[]?`), as in Crystal
+- [x] `?` variants that return `nil` instead of raising: `to_i?`, `to_f?`, `xs[i]?`
+      (the other built-in methods already return `nil`); names of functions and
+      methods may end with `?`
 
 ### Next
 

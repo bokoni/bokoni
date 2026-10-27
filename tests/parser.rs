@@ -131,6 +131,9 @@ fn control() {
         "(begin (call f 1) (rescue e : A | B 1) (rescue : Error 2) (rescue 3) (else 4) (ensure 5))"
     );
     assert_eq!(sexp("raise \"x\" if bad"), "(if bad (then (raise \"x\")))");
+    assert_eq!(sexp("xs[i]?"), "(index? xs i)");
+    assert_eq!(sexp("s.to_i?() or 0"), "(or (.to_i? s) 0)");
+    assert_eq!(sexp("def ok?(x) = x"), "(def ok? (x) x)");
     // `def` and `do` blocks with clauses: an implicit `begin`.
     assert_eq!(
         sexp("def g()\n  1\nrescue\n  2\nend"),

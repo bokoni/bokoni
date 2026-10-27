@@ -206,6 +206,8 @@ const VOCAB: &[&str] = &[
     "\nensure\n",
     "raise ",
     "e.message",
+    "]?",
+    ".to_i?()",
 ];
 
 /// Valid programs used as a base for mutations. No `while`: a mutation easily turns it

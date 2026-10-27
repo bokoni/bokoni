@@ -677,6 +677,10 @@ impl Runtime {
                 let (r, i) = (reg!(*a).clone(), reg!(*i).clone());
                 reg!(*d) = self.index(&r, &i, span)?;
             }
+            Instr::IndexOpt(d, a, i) => {
+                let (r, i) = (reg!(*a).clone(), reg!(*i).clone());
+                reg!(*d) = self.index_opt(&r, &i, span)?;
+            }
             Instr::Field(d, a, name) => {
                 let r = reg!(*a).clone();
                 reg!(*d) = self.field(&r, *name, span)?;
