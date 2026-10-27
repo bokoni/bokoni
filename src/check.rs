@@ -307,7 +307,14 @@ struct Scope {
     construct: Option<TypeId>,
     /// Function level of the scope (0: program).
     fn_level: usize,
+    /// Variables of enclosing scopes known here to be (`nil`) or not to be `nil`, by a
+    /// test (`if x != nil`, `x.nil?`, `if x`…): their type here.
+    refined: FxHashMap<Symbol, Ty>,
 }
+
+/// What a condition tells about a variable when it is true (or false): it is `nil`
+/// (`true`), or it is not (`false`).
+type Facts = Vec<(Symbol, bool)>;
 
 #[derive(Default)]
 struct FnCtx {
@@ -774,6 +781,7 @@ impl Checker<'_> {
     }
 
     fn declare(&mut self, name: Symbol, ty: Ty, kind: VarKind) {
+        self.scopes.last_mut().unwrap().refined.remove(&name);
         self.scopes.last_mut().unwrap().vars.insert(
             name,
             Var {
@@ -790,6 +798,115 @@ impl Checker<'_> {
             .iter()
             .rev()
             .find_map(|s| s.vars.get(&name).map(|v| (v, s.fn_level)))
+    }
+
+    /// Type of variable `name` here if a test refined it (in this function: a lambda may
+    /// run after the variable changed).
+    fn refined(&self, name: Symbol) -> Option<Ty> {
+        let level = self.fn_level();
+        for s in self.scopes.iter().rev() {
+            // (In the scope that declares it: refined after its declaration.)
+            if let Some(t) = s.refined.get(&name) {
+                return (s.fn_level == level).then(|| t.clone());
+            }
+            if s.vars.contains_key(&name) {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// What condition `e` tells about variables when it is `truth`.
+    fn facts(&self, e: ExprId, truth: bool) -> Facts {
+        let ast = self.ast;
+        let var = |e: ExprId| match ast.kind(e) {
+            ExprKind::Ident(n) => Some(n),
+            _ => None,
+        };
+        let is_nil = |e: ExprId| matches!(ast.kind(e), ExprKind::Nil);
+        match ast.kind(e) {
+            // `if x`: not `nil` when true.
+            ExprKind::Ident(n) if truth => vec![(n, false)],
+            ExprKind::Unary(UnaryOp::Not, x) => self.facts(x, !truth),
+            ExprKind::Binary(op @ (BinOp::Eq | BinOp::Ne), a, b) => {
+                let x = match (var(a), var(b)) {
+                    (Some(x), _) if is_nil(b) => x,
+                    (_, Some(x)) if is_nil(a) => x,
+                    _ => return vec![],
+                };
+                vec![(x, (op == BinOp::Eq) == truth)]
+            }
+            ExprKind::MethodCall {
+                recv, name, args, ..
+            } if self.name(name) == "nil?" && ast.get(args).is_empty() => {
+                var(recv).map(|x| vec![(x, truth)]).unwrap_or_default()
+            }
+            // Both true / both false.
+            ExprKind::Binary(BinOp::And, a, b) if truth => {
+                let mut f = self.facts(a, true);
+                f.extend(self.facts(b, true));
+                f
+            }
+            ExprKind::Binary(BinOp::Or, a, b) if !truth => {
+                let mut f = self.facts(a, false);
+                f.extend(self.facts(b, false));
+                f
+            }
+            _ => vec![],
+        }
+    }
+
+    /// Applies `facts` in the current scope: the variables' types without `nil`, or
+    /// `nil` (if their type allows it).
+    fn refine(&mut self, facts: Facts) {
+        for (name, nil) in facts {
+            let Some((v, _)) = self.lookup(name) else {
+                continue;
+            };
+            if v.kind != VarKind::Let {
+                continue;
+            }
+            let t = self.refined(name).unwrap_or_else(|| v.ty.clone());
+            let new = if nil {
+                if !(t.is_any() || t.members().contains(&Ty::Nil)) {
+                    continue;
+                }
+                Ty::Nil
+            } else {
+                let rest = t.members().iter().filter(|m| **m != Ty::Nil).cloned();
+                match union(rest.collect()) {
+                    Ty::Never => continue,
+                    t => t,
+                }
+            };
+            self.scopes.last_mut().unwrap().refined.insert(name, new);
+        }
+    }
+
+    /// Variable `name` assigned: what tests told about it no longer holds.
+    fn unrefine(&mut self, name: Symbol) {
+        for s in self.scopes.iter_mut().rev() {
+            s.refined.remove(&name);
+            if s.vars.contains_key(&name) {
+                break;
+            }
+        }
+    }
+
+    /// Entering a loop: its body may run after it assigned any variable.
+    fn unrefine_all(&mut self) {
+        for s in &mut self.scopes {
+            s.refined.clear();
+        }
+    }
+
+    /// Checks `b` in a scope where `facts` hold.
+    fn block_with(&mut self, b: &Block, facts: Facts) -> Ty {
+        self.push_scope();
+        self.refine(facts);
+        let t = self.block(b);
+        self.pop_scope();
+        t
     }
 
     fn known_names(&self) -> Vec<&str> {
@@ -1953,6 +2070,11 @@ impl Checker<'_> {
                         self.expect(l.value, &declared, "");
                         declared
                     }
+                    // (The variable of `a ?? b`, `a?.b`: its exact type, refined by the
+                    // test that follows.)
+                    None if matches!(&l.pattern, Pattern::Name(n, _) if self.name(*n).starts_with('#')) => {
+                        self.expr(l.value, None)
+                    }
                     None => self.expr(l.value, None).widen(),
                 };
                 self.bind_pattern(&l.pattern, ty);
@@ -2390,7 +2512,17 @@ impl Checker<'_> {
             }
             ExprKind::Binary(op, a, b) => {
                 let l = self.expr(a, None);
-                let r = self.expr(b, None);
+                // `x != nil and x > 0`: the right side where the left one decides.
+                let r = match op {
+                    BinOp::And | BinOp::Or => {
+                        self.push_scope();
+                        self.refine(self.facts(a, op == BinOp::And));
+                        let r = self.expr(b, None);
+                        self.pop_scope();
+                        r
+                    }
+                    _ => self.expr(b, None),
+                };
                 // `xs << x`: `x` as it is (a `T` for a list of `T`).
                 let l = self.view(l);
                 let r = if op == BinOp::Push { r } else { self.view(r) };
@@ -2506,11 +2638,18 @@ impl Checker<'_> {
             ExprKind::If(c) => {
                 let x = ast.if_(c);
                 self.expr(x.cond, None);
-                let t = self.block(&x.then);
+                let t = self.block_with(&x.then, self.facts(x.cond, true));
                 let f = match &x.else_ {
-                    Some(b) => self.block(b),
+                    Some(b) => self.block_with(b, self.facts(x.cond, false)),
                     None => Ty::Nil,
                 };
+                // A branch that does not finish (`return`, `raise`…): after the `if`, the
+                // condition is that of the other one (`return 0 if x.nil?`).
+                match (t == Ty::Never, f == Ty::Never) {
+                    (true, false) => self.refine(self.facts(x.cond, false)),
+                    (false, true) => self.refine(self.facts(x.cond, true)),
+                    _ => {}
+                }
                 union(vec![t, f])
             }
             ExprKind::Case(c) => {
@@ -2545,6 +2684,7 @@ impl Checker<'_> {
             }
             ExprKind::While(c) => {
                 let x = ast.while_(c);
+                self.unrefine_all();
                 self.expr(x.cond, None);
                 self.fns.last_mut().unwrap().loops += 1;
                 self.block(&x.body);
@@ -2554,6 +2694,7 @@ impl Checker<'_> {
             ExprKind::For(c) => {
                 let x = ast.for_(c);
                 let it = self.expr(x.iter, None);
+                self.unrefine_all();
                 let vars = self.for_vars(&it, x.vars.len(), ast.span(x.iter));
                 self.push_scope();
                 for ((n, vspan), t) in x.vars.iter().zip(vars) {
@@ -2690,6 +2831,7 @@ impl Checker<'_> {
                     return Ty::Any;
                 }
                 let ty = v.ty.clone();
+                let ty = self.refined(name).unwrap_or(ty);
                 if let Ty::Module(m) = ty {
                     let m = self.name(m).to_string();
                     self.error(format!("`{m}` is a module: use `{m}::Name` or `{m}.f(…)`"), span);
@@ -2905,6 +3047,14 @@ impl Checker<'_> {
     }
 
     fn assign(&mut self, target: ExprId, op: Option<BinOp>, value: ExprId) -> Ty {
+        let t = self.assign_inner(target, op, value);
+        if let ExprKind::Ident(name) = self.ast.kind(target) {
+            self.unrefine(name);
+        }
+        t
+    }
+
+    fn assign_inner(&mut self, target: ExprId, op: Option<BinOp>, value: ExprId) -> Ty {
         let ast = self.ast;
         let tspan = ast.span(target);
         // Type expected by the target.
@@ -3623,6 +3773,15 @@ impl Checker<'_> {
     ) -> Ty {
         let n = self.name(name).to_string();
         let r = &self.view(r.clone());
+        // `x.nil?`, on any value (unless its class declares one).
+        if n == "nil?"
+            && !matches!(r, Ty::Object(id, _) if self.types[*id].methods.contains_key(&name))
+        {
+            if !self.ast.get(args).is_empty() || block.is_some() {
+                self.error("`nil?` takes no arguments", span);
+            }
+            return Ty::Bool;
+        }
         // Declared methods, function fields, enums.
         match r {
             Ty::Any | Ty::Union(_) | Ty::Never => {

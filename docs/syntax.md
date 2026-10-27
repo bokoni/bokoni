@@ -45,6 +45,30 @@ A misspelled name gets a suggestion: `` `str` has no method `lenght` (did you me
 - a `str` may be passed where `"dev" | "prod"` is expected: the exact value is checked at
   run time.
 
+A test of `nil` refines a variable's type where its result is known, as in Crystal:
+
+```ruby
+def label(a: int?): str
+  if a.nil?
+    "none"                     # here `a` is `nil`
+  else
+    a.to_s()                   # here `a` is `int`
+  end
+end
+
+def size(s: str?): int
+  return 0 if s.nil?           # after: `s` is `str`
+  s.len()
+end
+```
+
+- Tests: `x.nil?` (on any value), `x == nil`, `x != nil`, `if x` (not `nil` when
+  true), `not`, `unless`, `and` / `or` (also for their right side:
+  `x != nil and x > 0`); a branch that ends with `return`, `raise`, `break` or `next`
+  refines the rest of the block.
+- For local variables and parameters, in the same function (not in a lambda); an
+  assignment or a loop ends it. `a ?? b` has the type of `a` without `nil` (or `b`'s).
+
 Whatever is not certain is checked at run time. From Rust, static checking can be
 disabled (`engine.set_static_checks(false)`).
 

@@ -366,3 +366,58 @@ let c = counter()
 c()
 "##);
 }
+
+#[test]
+fn nil_tests_refine_types() {
+    // In each branch, the variable's type without `nil`, or `nil`: errors found there.
+    for (src, msg) in [
+        (
+            "def f(a: int?): int\n  if a.nil?\n    a + 1\n  else\n    0\n  end\nend",
+            "`+` does not apply to `nil` and `int`",
+        ),
+        (
+            "def f(a: int?): str\n  if a != nil\n    a.upper()\n  else\n    \"\"\n  end\nend",
+            "`int` has no method `upper`",
+        ),
+        (
+            "def f(a: int?): bool = a != nil and a.upper()",
+            "`int` has no method `upper`",
+        ),
+        (
+            "def f(a: int?): bool = a == nil or a.upper()",
+            "`int` has no method `upper`",
+        ),
+        // After a branch that does not finish: the other condition.
+        (
+            "def f(a: str?): int\n  return 0 if a.nil?\n  a.nope()\nend",
+            "`str` has no method `nope`",
+        ),
+        (
+            "def f(a: int?): int\n  unless a\n    raise \"none\"\n  end\n  let s: str = a\n  0\nend",
+            "expected type `str`, got `int`",
+        ),
+        // `??` and `?.`: the type without `nil`, or optional.
+        (
+            "def f(a: int?): int\n  let n = a ?? 0\n  let s: str = n\n  0\nend",
+            "expected type `str`, got `int`",
+        ),
+    ] {
+        let errs = errors(src);
+        assert!(
+            has(&errs, msg),
+            "expected `{msg}` for:\n{src}\ngot {errs:?}"
+        );
+    }
+    // An assignment, a loop, a lambda: no longer refined (no false positive).
+    ok("def f(a: int?): int\n  return 0 if a.nil?\n  a = nil\n  a ?? 1\nend\nf(nil) + f(2)");
+    ok(
+        "def f(a: int?): int\n  if a == nil\n    let i = 0\n    while i < 2\n      i += 1\n      a = i\n    end\n    return a + 1\n  end\n  a\nend\nf(nil) + f(2)",
+    );
+    ok(
+        "def f(a: int?): int\n  if a == nil\n    a = 5\n    return a + 1\n  end\n  a\nend\nf(nil) + f(2)",
+    );
+    ok(
+        "def f(a: int?)\n  if a == nil\n    let g = || a + 1\n    a = 1\n    return g()\n  end\n  a\nend\nf(nil)",
+    );
+    ok("let a: int? = nil\nlet r = [a.nil?, 3.nil?, \"x\".nil?]\nr");
+}

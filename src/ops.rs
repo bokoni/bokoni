@@ -57,7 +57,7 @@ methods! {
     Replace = "replace", Chars = "chars", ToI = "to_i", ToF = "to_f",
     ToIOpt = "to_i?", ToFOpt = "to_f?",
     Abs = "abs", Floor = "floor", Ceil = "ceil", Round = "round", Sqrt = "sqrt",
-    Call = "call", ToList = "to_list",
+    Call = "call", ToList = "to_list", IsNil = "nil?",
 }
 
 impl Runtime {
@@ -326,6 +326,10 @@ impl Runtime {
                 Ok(Value::Str(recv.inspect(&self.interner).into()))
             }
             (M::Call, Value::Function(_)) => self.call_value(&recv, CallArgs::plain(args), span),
+            (M::IsNil, _) => {
+                n(0)?;
+                Ok(Value::Bool(matches!(recv, Value::Nil)))
+            }
 
             // ── Numbers
             (M::Abs, Value::Int(i)) => {
