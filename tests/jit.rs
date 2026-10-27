@@ -368,3 +368,21 @@ fn list_with_unexpected_values_falls_back() {
     let r = same(src);
     assert!(r.contains("type attendu `[int]`"), "{r}");
 }
+
+#[test]
+fn interpolation() {
+    let ty = "type P\n  x: int = 0\n  def to_s = \"P<#{self.x}|#{[self.x, 1.5]}>\"\nend\n\
+              type Q\n  def to_s = 1 / 0\nend\n";
+    assert_eq!(
+        same_eager(&format!(
+            "{ty}let w = \"mot\"\n\"#{{1}} #{{-2.5}} #{{0.1}} #{{nil}} #{{true}} #{{[1, w]}} #{{w}} #{{P(x: 3)}}\""
+        )),
+        "\"1 -2.5 0.1 nil true [1, \\\"mot\\\"] mot P<3|[3, 1.5]>\""
+    );
+    // Erreur pendant l'affichage, puis une interpolation normale : rien ne reste du
+    // texte commencé.
+    let mut e = Engine::new();
+    e.eval(ty).unwrap();
+    assert!(e.eval("\"a #{Q()} b\"").is_err());
+    assert_eq!(e.eval_as::<String>("\"x#{1}y\"").unwrap(), "x1y");
+}

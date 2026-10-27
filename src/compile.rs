@@ -546,6 +546,7 @@ impl Compiler<'_> {
         merge_blocks(&mut f.blocks);
         let reachable = compact(&mut f.blocks);
         f.blocks = reachable;
+        let plain_params = f.params.iter().all(|p| p.ty.is_none());
         // Boucle : un saut vers un bloc qui ne vient pas après.
         let has_loop = f.blocks.iter().enumerate().any(|(i, b)| {
             b.term.as_ref().is_some_and(|(t, _)| {
@@ -588,6 +589,7 @@ impl Compiler<'_> {
             jit_dyn: Default::default(),
             calls_seen: Default::default(),
             has_loop,
+            plain_params,
         })
     }
 

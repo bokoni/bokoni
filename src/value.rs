@@ -312,6 +312,18 @@ impl Value {
         }
     }
 
+    /// Ajoute l'affichage d'une valeur simple (`nil`, booléen, nombre) à `out` ; `false`
+    /// pour les autres valeurs.
+    pub fn write_scalar(&self, out: &mut String) -> bool {
+        match self {
+            Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) => {
+                self.write_inspect(out, None, 0);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Représentation en code source (REPL, contenu des listes) : chaînes entre guillemets.
     pub fn inspect(&self, i: &Interner) -> String {
         let mut out = String::new();

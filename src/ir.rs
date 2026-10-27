@@ -81,6 +81,8 @@ pub struct Proto {
     pub calls_seen: std::cell::Cell<u32>,
     /// La fonction contient une boucle (saut vers un bloc précédent).
     pub has_loop: bool,
+    /// Aucun paramètre annoté : les arguments se rangent sans vérification.
+    pub plain_params: bool,
 }
 
 /// Fenêtre d'exécution passée au code natif de base (positions fixes).

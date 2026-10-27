@@ -81,6 +81,8 @@ pub struct Runtime {
     pub jit_enabled: bool,
     /// Compilation de base dès le premier appel (tests).
     pub jit_eager: bool,
+    /// Tampon de l'interpolation de chaînes.
+    concat_buf: String,
     #[cfg(feature = "jit")]
     jit: Option<crate::jit::Jit>,
     /// Erreur levée pendant l'exécution de code natif de base, en attente de remontée.
@@ -129,6 +131,7 @@ impl Runtime {
             no_ctx: Rc::from([]),
             jit_enabled: cfg!(feature = "jit"),
             jit_eager: false,
+            concat_buf: String::new(),
             #[cfg(feature = "jit")]
             jit: None,
             #[cfg(feature = "jit")]
@@ -213,6 +216,10 @@ impl Runtime {
     /// Appel rapide : arguments positionnels, autant que de paramètres, lus directement
     /// dans les registres de l'appelant.
     pub(crate) fn invoke_regs(&mut self, c: &Closure, args: &[Value], span: Span) -> R {
+        #[cfg(feature = "jit")]
+        if let Some(r) = self.invoke_native(c, args, span) {
+            return r;
+        }
         let proto = &c.proto;
         self.invoke_with(proto, &c.upvals, &c.ctx, span, |rt, regs| {
             for (p, v) in proto.params.iter().zip(args) {
@@ -262,15 +269,19 @@ impl Runtime {
         regs.clear();
         self.frames.push(regs);
         self.depth -= 1;
-        r.map_err(|mut e| {
-            if proto.kind != ProtoKind::Main {
-                e = attach_src(e, &proto.script);
-                if e.trace.len() < 16 {
-                    e.trace.push((proto.name.to_string(), span));
-                }
+        r.map_err(|e| self.traced(e, proto, span))
+    }
+
+    /// Erreur sortant de `proto` : source et appel ajoutés à la pile.
+    #[cold]
+    fn traced(&self, mut e: Error, proto: &Proto, span: Span) -> Error {
+        if proto.kind != ProtoKind::Main {
+            e = attach_src(e, &proto.script);
+            if e.trace.len() < 16 {
+                e.trace.push((proto.name.to_string(), span));
             }
-            e
-        })
+        }
+        e
     }
 
     /// Range les arguments dans les registres des paramètres (avec vérification des
@@ -595,8 +606,22 @@ impl Runtime {
                 name,
                 site,
             } => {
+                let site = &proto.calls[*site as usize];
                 let r = reg!(*recv).clone();
-                let args = Self::call_args(proto, regs, &proto.calls[*site as usize]);
+                // Valeur sans méthode ni champ déclarés (chaîne, liste, nombre…) : méthode
+                // intégrée, directement.
+                if !matches!(
+                    r,
+                    Value::Object(_) | Value::Record(_) | Value::Variant(..) | Value::Enum(_)
+                ) && site.named.is_empty()
+                    && !site.block
+                {
+                    let start = site.start as usize;
+                    let args = regs[start..start + site.npos as usize].to_vec();
+                    reg!(*dst) = self.method(r, *name, args, span)?;
+                    return Ok(());
+                }
+                let args = Self::call_args(proto, regs, site);
                 reg!(*dst) = self.call_method_named(r, *name, args, span)?;
             }
 
@@ -854,15 +879,26 @@ impl Runtime {
                 };
             }
             Instr::Concat(d, s, n) => {
-                let mut out = String::new();
+                // Tampon réutilisé : une seule allocation, celle de la chaîne finale.
+                let mut out = std::mem::take(&mut self.concat_buf);
+                out.clear();
                 for k in 0..*n as usize {
-                    let v = regs[*s as usize + k].clone();
-                    match &v {
-                        Value::Str(x) => out.push_str(x),
-                        _ => out.push_str(&self.display(&v, span)?),
+                    let v = &regs[*s as usize + k];
+                    if let Value::Str(x) = v {
+                        out.push_str(x);
+                    } else if !v.write_scalar(&mut out) {
+                        let v = v.clone();
+                        match self.display(&v, span) {
+                            Ok(t) => out.push_str(&t),
+                            Err(e) => {
+                                self.concat_buf = out;
+                                return Err(e);
+                            }
+                        }
                     }
                 }
-                reg!(*d) = Value::Str(out.into());
+                reg!(*d) = Value::Str(Rc::from(out.as_str()));
+                self.concat_buf = out;
             }
             Instr::SetIndex(a, i, v) => {
                 let (r, i, v) = (reg!(*a).clone(), reg!(*i).clone(), reg!(*v).clone());
@@ -991,6 +1027,38 @@ impl Runtime {
             _ => unreachable!("instruction traitée dans la boucle principale"),
         }
         Ok(())
+    }
+
+    /// Appel direct d'une fonction déjà compilée en code de base, sans ce dont elle n'a
+    /// pas besoin : liaison générique (paramètres non annotés), essai du JIT typé,
+    /// cellules. `None` : chemin général (dont la vérification de la pile, un niveau
+    /// d'appel sur `STACK_CHECK`).
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn invoke_native(&mut self, c: &Closure, args: &[Value], span: Span) -> Option<R> {
+        let proto = &c.proto;
+        let entry = proto.jit_dyn.get();
+        if entry <= 1
+            || proto.ncells != 0
+            || !proto.plain_params
+            || self.depth >= self.max_depth
+            || (self.depth + 1).is_multiple_of(STACK_CHECK)
+            || (proto.kind == ProtoKind::Function
+                && !matches!(*proto.jit.borrow(), JitState::Rejected))
+        {
+            return None;
+        }
+        self.depth += 1;
+        let mut regs = self.frames.pop().unwrap_or_default();
+        fill_nil(&mut regs, proto.regs.len());
+        for (p, v) in proto.params.iter().zip(args) {
+            regs[p.reg as usize] = v.clone();
+        }
+        let r = self.run_native(entry, proto, &c.upvals, &c.ctx, &mut regs, &mut []);
+        regs.clear();
+        self.frames.push(regs);
+        self.depth -= 1;
+        Some(r.map_err(|e| self.traced(e, proto, span)))
     }
 
     /// Point d'entrée du code natif de base de `proto`, compilé au deuxième appel (ou au
