@@ -345,6 +345,7 @@ fn is_keyword(kind: TokenKind) -> bool {
             | T::Trait
             | T::Abstract
             | T::Include
+            | T::Forall
             | T::Private
             | T::Protected
             | T::Type
@@ -909,6 +910,7 @@ impl Parser<'_, '_> {
     fn def(&mut self, annotations: Vec<AnnotationUse>) -> Result<FnDecl> {
         let start = self.bump().span;
         let (name, name_span, params, ret) = self.signature()?;
+        let forall = self.forall()?;
         let body = if self.eat(T::Eq) {
             let e = self.expr()?;
             expr_block(e, self.span(e))
@@ -930,8 +932,72 @@ impl Parser<'_, '_> {
             body,
             annotations,
             vis: Visibility::Public,
+            forall,
             span: self.span_from(start),
         })
+    }
+
+    /// `forall T, U: Bound` after a signature (none: empty).
+    fn forall(&mut self) -> Result<Vec<TypeParam>> {
+        if !self.eat(T::Forall) {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        loop {
+            out.push(self.type_param("after `forall`")?);
+            if !self.eat(T::Comma) {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    fn type_param(&mut self, context: &str) -> Result<TypeParam> {
+        let (name, span) = self.ident(context)?;
+        let bound = if self.eat(T::Colon) {
+            Some(self.type_expr(true)?)
+        } else {
+            None
+        };
+        Ok(TypeParam {
+            name,
+            bound,
+            span: self.span_from(span),
+        })
+    }
+
+    /// `(T, U)` attached to the name before (`Box(T)`): type parameters of a declaration.
+    fn type_params(&mut self, name_span: Span) -> Result<Vec<TypeParam>> {
+        if !(self.at(T::LParen) && self.tok().span.start == name_span.end) {
+            return Ok(Vec::new());
+        }
+        self.bump();
+        let mut out = Vec::new();
+        while !self.at(T::RParen) {
+            out.push(self.type_param("(type parameter)")?);
+            if !self.eat(T::Comma) {
+                break;
+            }
+        }
+        self.expect(T::RParen, "to close the type parameters")?;
+        Ok(out)
+    }
+
+    /// `(int, str)` attached to the name before (`Box(int)`): type arguments.
+    fn type_args(&mut self, name_span: Span) -> Result<Vec<TypeExpr>> {
+        if !(self.at(T::LParen) && self.tok().span.start == name_span.end) {
+            return Ok(Vec::new());
+        }
+        self.bump();
+        let mut out = Vec::new();
+        while !self.at(T::RParen) {
+            out.push(self.type_expr(true)?);
+            if !self.eat(T::Comma) {
+                break;
+            }
+        }
+        self.expect(T::RParen, "to close the type arguments")?;
+        Ok(out)
     }
 
     /// After `def`: name, parameters and return type.
@@ -1057,6 +1123,11 @@ impl Parser<'_, '_> {
             _ => (TypeDeclKind::Annotation, "annotation"),
         };
         let (name, name_span) = self.ident(&format!("after `{opener}`"))?;
+        let params = self.type_params(name_span)?;
+        if !params.is_empty() && kind == TypeDeclKind::Annotation {
+            return self.error_at("an `annotation` cannot be generic", params[0].span);
+        }
+        let mut parent_args = Vec::new();
         let parent = if self.at(T::Lt) {
             if kind != TypeDeclKind::Class {
                 return self.error_here(format!(
@@ -1064,7 +1135,9 @@ impl Parser<'_, '_> {
                 ));
             }
             self.bump();
-            Some(self.qualified_name("after `<`")?)
+            let p = self.qualified_name("after `<`")?;
+            parent_args = self.type_args(p.1)?;
+            Some(p)
         } else {
             None
         };
@@ -1088,7 +1161,7 @@ impl Parser<'_, '_> {
                             f.name_span,
                         ))
                     }
-                    Member::Include(_, span) if kind != TypeDeclKind::Class => {
+                    Member::Include(_, _, span) if kind != TypeDeclKind::Class => {
                         Some(("`include` is only allowed in a `class`", *span))
                     }
                     Member::Field(f) if kind == TypeDeclKind::Trait => Some((
@@ -1108,7 +1181,9 @@ impl Parser<'_, '_> {
             kind,
             name,
             name_span,
+            params,
             parent,
+            parent_args,
             is_abstract,
             members,
             annotations,
@@ -1151,6 +1226,7 @@ impl Parser<'_, '_> {
                 self.bump();
                 let def_start = self.bump().span;
                 let (name, name_span, params, ret) = self.signature()?;
+                let forall = self.forall()?;
                 if !matches!(self.peek(), T::Newline | T::Semi | T::End) {
                     return self.error_here(format!(
                         "expected a line end after `abstract def {}` (no body), found {}",
@@ -1169,13 +1245,15 @@ impl Parser<'_, '_> {
                     },
                     annotations,
                     vis,
+                    forall,
                     span: self.span_from(start),
                 })
             }
             (T::Include, _) => {
                 self.bump();
                 let (name, span) = self.qualified_name("after `include`")?;
-                Member::Include(name, span)
+                let args = self.type_args(span)?;
+                Member::Include(name, args, self.span_from(span))
             }
             (T::Ident, T::Colon | T::Eq) => {
                 let (name, _) = self.ident("")?;
@@ -1326,11 +1404,19 @@ impl Parser<'_, '_> {
         let start = self.tok().span;
         let kind = match self.peek() {
             T::Ident => {
-                let mut path = vec![self.ident("")?.0];
+                let (first, mut end) = self.ident("")?;
+                let mut path = vec![first];
                 while self.eat(T::ColonColon) {
-                    path.push(self.ident("after `::`")?.0);
+                    let (seg, s) = self.ident("after `::`")?;
+                    path.push(seg);
+                    end = s;
                 }
-                TypeKind::Named(path)
+                let args = self.type_args(end)?;
+                if args.is_empty() {
+                    TypeKind::Named(path)
+                } else {
+                    TypeKind::Applied(path, args)
+                }
             }
             T::Nil => {
                 self.bump();

@@ -135,9 +135,15 @@ impl Printer<'_> {
                 });
                 self.out.push(' ');
                 self.name(t.name);
+                if !t.params.is_empty() {
+                    self.type_params(&t.params);
+                }
                 if let Some((p, _)) = t.parent {
                     self.out.push_str(" < ");
                     self.name(p);
+                    if !t.parent_args.is_empty() {
+                        self.type_list(&t.parent_args);
+                    }
                 }
                 for m in &t.members {
                     self.out.push(' ');
@@ -162,9 +168,12 @@ impl Printer<'_> {
                             self.def(f);
                             self.out.push(')');
                         }
-                        Member::Include(n, _) => {
+                        Member::Include(n, args, _) => {
                             self.out.push_str("(include ");
                             self.name(*n);
+                            if !args.is_empty() {
+                                self.type_list(args);
+                            }
                             self.out.push(')');
                         }
                         Member::Stmt(s) => self.stmt(s),
@@ -219,6 +228,10 @@ impl Printer<'_> {
         if let Some(r) = &f.ret {
             self.out.push_str(" : ");
             self.ty(r);
+        }
+        if !f.forall.is_empty() {
+            self.out.push_str(" forall");
+            self.type_params(&f.forall);
         }
         self.block(&f.body);
         self.out.push(')');
@@ -295,9 +308,41 @@ impl Printer<'_> {
         }
     }
 
+    /// `(A, B)`
+    fn type_list(&mut self, ts: &[TypeExpr]) {
+        self.out.push('(');
+        for (n, t) in ts.iter().enumerate() {
+            if n > 0 {
+                self.out.push_str(", ");
+            }
+            self.ty(t);
+        }
+        self.out.push(')');
+    }
+
+    /// `(T, U: Bound)`
+    fn type_params(&mut self, ps: &[TypeParam]) {
+        self.out.push('(');
+        for (n, p) in ps.iter().enumerate() {
+            if n > 0 {
+                self.out.push_str(", ");
+            }
+            self.name(p.name);
+            if let Some(b) = &p.bound {
+                self.out.push_str(": ");
+                self.ty(b);
+            }
+        }
+        self.out.push(')');
+    }
+
     fn ty(&mut self, t: &TypeExpr) {
         match &t.kind {
             TypeKind::Named(path) => self.path(path),
+            TypeKind::Applied(path, args) => {
+                self.path(path);
+                self.type_list(args);
+            }
             TypeKind::List(inner) => {
                 self.out.push('[');
                 self.ty(inner);

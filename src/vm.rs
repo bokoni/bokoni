@@ -1950,6 +1950,8 @@ impl TypeInfo {
             kind: t.kind,
             parent,
             traits: all_traits,
+            includes: traits,
+            generics: t.generics.clone(),
             required,
             is_abstract,
             fields,

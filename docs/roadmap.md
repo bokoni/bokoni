@@ -44,7 +44,7 @@ source ─► lexer ─► parser ─► AST ─► type checker ─► typed IR
 - [x] Declarations from previous scripts (REPL) are known to the checker
 - [x] `type`, `enum`, `class` at run time; `Server do … end` blocks
 - [x] Record literal → nominal type conversion
-- [ ] Generic types (`[T]` in signatures), inheritance / interfaces, modules
+- [x] Generic types (v0.12), inheritance (v0.8), traits (v0.9), modules (v0.10)
 
 ### v0.3 — Typed IR
 
@@ -253,15 +253,27 @@ namespaces, `trait` for shared behavior.
       modules), checked when compiling
 - [x] `FnDesc::visibility`
 
+### v0.12 — Generics
+
+- [x] `forall T, U` on functions and methods (Crystal's syntax); type arguments found
+      from the arguments, then from the expected type
+- [x] Generic `class`, `type` and `trait`: `class Box(T)`, `Box(int)` in annotations,
+      found from the values at construction
+- [x] Generic parents and traits: `class IntBox < Box(int)`, `include Comparable(T)`
+- [x] Bounds: `forall T: Comparable(T)`, `class Sorted(T: Comparable(T))`, checked at
+      calls and in annotations; a bounded `T` has the bound's methods
+- [x] Checked statically only, erased at run time (no cost); declarations of previous
+      scripts known with their parameters; `TypeDesc::params`
+- [x] Fix: calling a parameter of function type (`f: (int): int`) crashed the checker
+- [ ] Native code specialized by type argument (typed JIT for `forall` functions)
+
 ### Next
 
 In suggested order:
 
-1. **Generics** (`[T]` in signatures): typed `map` / `filter` and user functions over
-   lists; lets the typed JIT compile more code; then generic traits
-   (`Comparable(T)`, `Enumerable(T)`).
-2. **Crystal-style macros** (v3 of `syntax.md`): hygiene and AST exposure still open;
+1. **Crystal-style macros** (v3 of `syntax.md`): hygiene and AST exposure still open;
    benefit from generics and modules.
+2. Typed JIT for generic functions, specialized by type argument.
 
 No design decision needed:
 

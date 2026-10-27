@@ -115,6 +115,8 @@ pub enum DeclKind {
 pub struct TypeDesc {
     pub name: String,
     pub kind: DeclKind,
+    /// Type parameters (`class Box(T)`: `["T"]`).
+    pub params: Vec<String>,
     /// Parent class (`class B < A`).
     pub parent: Option<String>,
     /// Traits included (by the class or its parents).
@@ -296,6 +298,7 @@ impl Runtime {
         }
         Ok(TypeDesc {
             name: info.name.to_string(),
+            params: info.generics.iter().flat_map(|g| &g.params).map(|p| self.name(p.name).to_string()).collect(),
             kind: match info.kind {
                 crate::ast::TypeDeclKind::Type => DeclKind::Type,
                 crate::ast::TypeDeclKind::Class => DeclKind::Class,

@@ -219,6 +219,9 @@ const VOCAB: &[&str] = &[
     "private ",
     "protected ",
     "self.",
+    " forall T",
+    "(T)",
+    "(int)",
 ];
 
 /// Valid programs used as a base for mutations. No `while`: a mutation easily turns it
@@ -252,6 +255,7 @@ const CORPUS: &[&str] = &[
     "trait T\n  abstract def n(): int\n  def twice(): int = self.n() * 2\nend\nabstract class S\n  include T\nend\nclass K < S\n  def init(@v: int)\n  end\n  def n(): int = @v\nend\nlet ts: [T] = [K(1), K(4)]\nts.map(|t| t.twice()).sum()",
     "module M\n  let K = 3\n  class Box\n    def init(@v: int)\n    end\n    def v = @v\n  end\n  def mk(x: int): Box = Box(x * K)\n  module N\n    def twice(x: int): int = x * 2\n  end\nend\nlet b: M::Box = M.mk(2)\n[b.v, M::K, M::N.twice(b.v), typeof(b)]",
     "class P\n  def init(@v: int)\n  end\n  private def dbl(): int = @v * 2\n  protected def v = @v\n  def sum(o: P): int = self.dbl() + o.v\nend\nmodule Q\n  private def k(): int = 5\n  def run(): int = P(k()).sum(P(1))\nend\nQ.run()",
+    "class Bx(T)\n  def init(@v: T)\n  end\n  def get(): T = @v\n  def map(f: (T): U): Bx(U) forall U = Bx(f(@v))\nend\ndef first(xs: [T]): T? forall T = xs[0]?\nlet b: Bx(int) = Bx(2)\n[b.map(|x| x * 3).get(), first([4, 5]), first([])]",
 ];
 
 /// Mutates a program: deletes, duplicates or swaps lines, inserts a token, deletes or

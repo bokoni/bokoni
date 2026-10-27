@@ -634,6 +634,96 @@ As in Ruby and Crystal:
 - The checker reports a misuse before running; without static checks, the same error
   happens when running.
 
+## Generics
+
+Functions and types may take type parameters, as in Crystal. They are checked by the
+checker and erased at run time (a `T` is checked as `any`, a `Box(int)` as a `Box`).
+
+```ruby
+def first(xs: [T]): T? forall T = xs[0]?
+
+def map(xs: [T], f: (T): U): [U] forall T, U
+  let out: [U] = []
+  for x in xs
+    out << f(x)
+  end
+  out
+end
+
+first([1, 2])                      # int?
+map(["a", "bcd"], |s| s.len())     # [int]
+```
+
+- `forall T, U` after the signature declares the parameters of a function or a
+  method. At each call they are found from the arguments (then from the expected
+  type: `let xs: [int] = empty()`).
+- In the body, a `T` is any type, the same everywhere: `def f(x: T): T = 1` is an
+  error.
+
+### Generic types
+
+```ruby
+class Box(T)
+  def init(@value: T)
+  end
+  def get(): T = @value
+  def set(v: T) = @value = v
+  def map(f: (T): U): Box(U) forall U = Box(f(@value))
+end
+
+type Pair(A, B)
+  a: A
+  b: B
+end
+
+let b: Box(int) = Box(1)           # `T` found from `1`
+b.get() + 1                        # int
+b.set("x")                         # error: expected type `int`
+let p = Pair(a: 1, b: "z")         # Pair(int, str)
+
+class IntBox < Box(int)            # a generic parent, with its arguments
+end
+class Labeled(T) < Box(T)
+end
+```
+
+- A `class`, a `type` or a `trait` takes parameters after its name: `Box(T)`, with no
+  space. `Box(int)` in an annotation gives the arguments; `Box` alone is `Box(any)`.
+- At construction, the arguments are found from the values, then from the expected
+  type (`let s: Stack(int) = Stack()`).
+- A generic type is compatible with another one if its arguments are
+  (`Box(int)` is not a `Box(str)`; an `IntBox` is a `Box(int)`).
+
+### Generic traits and bounds
+
+```ruby
+trait Comparable(T)
+  abstract def cmp(o: T): int
+  def lt(o: T): bool = self.cmp(o) < 0
+end
+
+class Money
+  include Comparable(Money)
+  def init(@cents: int)
+  end
+  def cents = @cents
+  def cmp(o: Money): int = @cents - o.cents
+end
+
+def max(a: T, b: T): T forall T: Comparable(T)
+  if a.cmp(b) >= 0 then a else b end
+end
+
+max(Money(3), Money(5))           # Money
+max(1, 2)                         # error: `int` (for `T`) is not a `Comparable(int)`
+```
+
+- `T: Bound` (in `forall` or after a type's name: `class Sorted(T: Comparable(T))`)
+  restricts `T`: in the body, a `T` has the methods of its bound; at a call or in an
+  annotation, the type found must satisfy it.
+- Without a bound, a `T` can do anything in the body, checked at run time (gradual
+  typing).
+
 ## Modules
 
 A `module` groups declarations under a name: constants, functions, types, classes,
@@ -903,12 +993,12 @@ Point(x: 1).to_s()            # "Point(x=1, y=0)"
 ## Reserved words
 
 `let def end if elsif else unless then case when while for in do break next return
-module require private protected
+module require private protected forall
 begin rescue ensure raise super trait abstract include type class enum annotation macro true false nil and or not`
 
 ## Open questions
 
-- Inheritance / interfaces for `class` (and `type`?).
-- Modules / imports between files.
-- Methods on `type` (allowed, or reserved for `class`).
-- Generics (`[T]`, `fn<T>`).
+- Variance of generic types: compatible when their arguments are (covariant, like
+  lists), which is lenient for a `Box(T)` that can be modified.
+- Native compilation specialized by type argument (a `forall T` function is
+  compiled as untyped code today).

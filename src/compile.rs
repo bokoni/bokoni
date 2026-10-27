@@ -17,7 +17,7 @@ use crate::globals::Globals;
 use crate::intern::{FxBuild, FxHashMap, Interner, Symbol};
 use crate::ir::{
     Access, AnnotationIr, Annotations, Block as IrBlock, BlockId, CallSite, Capture, Decl,
-    EnumDeclIr, Fallback, FieldIr, Handler, Instr, ParamProto, Proto, ProtoKind, Reg, RegTy,
+    EnumDeclIr, Fallback, FieldIr, Generics, Handler, Instr, ParamProto, Proto, ProtoKind, Reg, RegTy,
     RtType, Script, Shape, Term, TypeDeclIr, TypeRef,
 };
 use crate::span::Span;
@@ -60,6 +60,7 @@ pub fn compile(
         errors: Vec::new(),
         classes: FxHashMap::default(),
         traits: FxHashSet::default(),
+        tparams: Vec::new(),
     };
     let main = c.main(&program.body);
     if c.errors.is_empty() {
@@ -593,6 +594,8 @@ struct Compiler<'a> {
     classes: FxHashMap<Symbol, Rc<[Symbol]>>,
     /// Traits compiled so far.
     traits: FxHashSet<Symbol>,
+    /// Type parameters in scope (`forall T`, `class Box(T)`): `any` at run time.
+    tparams: Vec<Symbol>,
 }
 
 type Op = (Reg, RegTy);
@@ -1375,8 +1378,12 @@ impl Compiler<'_> {
 
     fn rt_type(&mut self, t: &TypeExpr) -> RtType {
         match &t.kind {
-            TypeKind::Named(path) => {
+            // Generic: erased at run time (`Box(int)` is checked as a `Box`).
+            TypeKind::Named(path) | TypeKind::Applied(path, _) => {
                 if let [name] = path.as_slice() {
+                    if self.tparams.contains(name) {
+                        return RtType::Any;
+                    }
                     match self.i.resolve(*name) {
                         "any" => RtType::Any,
                         "int" => RtType::Int,
@@ -1734,6 +1741,28 @@ impl Compiler<'_> {
         method: bool,
         self_key: Option<u32>,
     ) -> Rc<Proto> {
+        // `forall T`: in scope for the signature and the body.
+        let mark = self.tparams.len();
+        if let Some(d) = &decl {
+            self.tparams.extend(d.forall.iter().map(|p| p.name));
+        }
+        let p = self.function_body(kind, name, params, body, ret, decl, method, self_key);
+        self.tparams.truncate(mark);
+        p
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn function_body(
+        &mut self,
+        kind: ProtoKind,
+        name: Rc<str>,
+        params: &[Param],
+        body: &Block,
+        ret: Option<&TypeExpr>,
+        decl: Option<Rc<FnDecl>>,
+        method: bool,
+        self_key: Option<u32>,
+    ) -> Rc<Proto> {
         let annotations = match &decl {
             Some(d) => self.annotations_ir(&d.annotations),
             None => Rc::new([]),
@@ -2008,6 +2037,8 @@ impl Compiler<'_> {
     }
 
     fn type_decl(&mut self, t: &TypeDecl) {
+        let tmark = self.tparams.len();
+        self.tparams.extend(t.params.iter().map(|p| p.name));
         let parent = self.parent_fields(t);
         let inherited: Rc<[Symbol]> = parent.as_ref().map_or(Rc::from([]), |(_, f)| f.clone());
         let mut fields = self.type_fields(t);
@@ -2063,10 +2094,11 @@ impl Compiler<'_> {
         let mut methods = Vec::new();
         let mut abstracts = Vec::new();
         let mut traits = Vec::new();
+        let mut trait_args = Vec::new();
         for m in &t.members {
             match m {
                 Member::Abstract(f) => abstracts.push(Rc::new(f.clone())),
-                Member::Include(name, span) => {
+                Member::Include(name, args, span) => {
                     let path = self.split_path(*name);
                     let slot = self.global_slot(&path, *span);
                     let known = self.traits.contains(&self.globals.at(slot).name)
@@ -2074,6 +2106,7 @@ impl Compiler<'_> {
                             Some(Value::Type(info)) if info.kind == TypeDeclKind::Trait);
                     if known {
                         traits.push(slot);
+                        trait_args.push(args.clone());
                     } else {
                         self.errors.push(Error::type_error(
                             format!(
@@ -2123,11 +2156,23 @@ impl Compiler<'_> {
         if t.kind == TypeDeclKind::Trait {
             self.traits.insert(qname);
         }
+        let generic = !t.params.is_empty()
+            || !t.parent_args.is_empty()
+            || trait_args.iter().any(|a: &Vec<TypeExpr>| !a.is_empty());
+        let generics = generic.then(|| {
+            Rc::new(Generics {
+                params: t.params.clone(),
+                parent_args: t.parent_args.clone(),
+                trait_args,
+            })
+        });
+        self.tparams.truncate(tmark);
         let decl = TypeDeclIr {
             name: qname,
             kind: t.kind,
             parent: parent.map(|(slot, f)| (slot, f.len() as u32)),
             traits,
+            generics,
             abstracts,
             is_abstract: t.is_abstract,
             fields: fir,

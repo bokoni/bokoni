@@ -378,6 +378,16 @@ pub struct FnDecl {
     pub annotations: Vec<AnnotationUse>,
     /// Method declared `private` or `protected`.
     pub vis: Visibility,
+    /// `forall T, U: Bound`: type parameters of a generic function.
+    pub forall: Vec<TypeParam>,
+    pub span: Span,
+}
+
+/// Type parameter: `T`, or `T: Bound` (its values are of type `Bound`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeParam {
+    pub name: Symbol,
+    pub bound: Option<TypeExpr>,
     pub span: Span,
 }
 
@@ -396,8 +406,12 @@ pub struct TypeDecl {
     pub kind: TypeDeclKind,
     pub name: Symbol,
     pub name_span: Span,
+    /// `class Box(T)`: its type parameters.
+    pub params: Vec<TypeParam>,
     /// `class B < A`: the parent class.
     pub parent: Option<(Symbol, Span)>,
+    /// `class B < A(int)`: the parent's type arguments.
+    pub parent_args: Vec<TypeExpr>,
     /// `abstract class`: cannot be instantiated, may have `abstract def`s.
     pub is_abstract: bool,
     pub members: Vec<Member>,
@@ -411,8 +425,8 @@ pub enum Member {
     Method(FnDecl),
     /// `abstract def name(params): ret`: to be defined by the class (no body).
     Abstract(FnDecl),
-    /// `include Trait`
-    Include(Symbol, Span),
+    /// `include Trait` or `include Trait(args)`
+    Include(Symbol, Vec<TypeExpr>, Span),
     /// Any other statement in the body (macro call, nested type…).
     Stmt(Stmt),
 }
@@ -456,6 +470,8 @@ pub struct TypeExpr {
 pub enum TypeKind {
     /// `int`, `Server`, `Protocol::Tcp`
     Named(Vec<Symbol>),
+    /// Generic type with its arguments: `Box(int)`, `Http::Cache(str, int)`
+    Applied(Vec<Symbol>, Vec<TypeExpr>),
     /// `[T]`
     List(Box<TypeExpr>),
     /// `{K => V}`

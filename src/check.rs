@@ -51,6 +51,9 @@ pub fn check(
         warnings: Vec::new(),
         deprecated_fns: FxHashMap::default(),
         deprecated_params: FxHashMap::default(),
+        tparams: Vec::new(),
+        tscope: Vec::new(),
+        vars: RefCell::new(Vec::new()),
     };
     c.block_stmts(&program.body);
     (c.errors, c.warnings, c.prims)
@@ -79,6 +82,12 @@ fn prim(t: &Ty) -> Option<RegTy> {
 
 type TypeId = usize;
 type EnumId = usize;
+/// Type parameter (index in `Checker::tparams`).
+type ParamId = usize;
+/// Arguments of a generic type (`Box(int)`); empty for a type that is not generic.
+type Targs = Rc<[Ty]>;
+/// Type parameters → their types (substitution).
+type Subst = FxHashMap<ParamId, Ty>;
 
 #[derive(Clone, Debug)]
 enum Ty {
@@ -100,8 +109,13 @@ enum Ty {
     Range,
     Union(Vec<Ty>),
     Fn(Rc<FnSig>),
-    /// Instance of a `type` / `class`.
-    Object(TypeId),
+    /// Instance of a `type` / `class`, with the type arguments of a generic one.
+    Object(TypeId, Targs),
+    /// Type parameter (`T` of `forall T` or `class Box(T)`): any type, the same one
+    /// everywhere in its declaration.
+    Param(ParamId),
+    /// Inference variable: type of a parameter at a call, found from the arguments.
+    Var(usize),
     /// The type itself (callable: construction).
     TypeValue(TypeId),
     Variant(EnumId),
@@ -130,8 +144,9 @@ impl PartialEq for Ty {
             (Tuple(a), Tuple(b)) => a == b,
             (Union(a), Union(b)) => a == b,
             (Fn(a), Fn(b)) => Rc::ptr_eq(a, b),
-            (Object(a), Object(b))
-            | (TypeValue(a), TypeValue(b))
+            (Object(a, x), Object(b, y)) => a == b && x == y,
+            (Param(a), Param(b)) | (Var(a), Var(b)) => a == b,
+            (TypeValue(a), TypeValue(b))
             | (Variant(a), Variant(b))
             | (EnumValue(a), EnumValue(b)) => a == b,
             (Module(a), Module(b)) => a == b,
@@ -200,6 +215,14 @@ struct FnSig {
     ret: RefCell<Ty>,
     /// Lambda: missing argument = nil, extra arguments ignored.
     lenient: bool,
+    /// `forall T`: type parameters, new inference variables at each call.
+    generics: Vec<ParamId>,
+}
+
+/// Type parameter: its name (messages) and its bound (`T: Comparable(T)`).
+struct TParam {
+    name: Symbol,
+    bound: Option<Ty>,
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +249,11 @@ struct TypeDef {
     methods: FxHashMap<Symbol, Rc<FnSig>>,
     /// `private` / `protected` methods: their visibility and the type that declares them.
     access: FxHashMap<Symbol, (Visibility, TypeId)>,
+    /// Type parameters (`class Box(T)`).
+    params: Vec<ParamId>,
+    /// Ancestors and traits, with their type arguments in terms of `params`
+    /// (`class IntBox < Box(int)`: `Box` → `[int]`).
+    supers: FxHashMap<TypeId, Targs>,
     deprecated: Option<Dep>,
 }
 
@@ -317,6 +345,12 @@ struct Checker<'a> {
     deprecated_fns: FxHashMap<usize, Dep>,
     /// `@[Deprecated]` parameters (key: address of the signature, parameter index).
     deprecated_params: FxHashMap<(usize, usize), Dep>,
+    /// Every type parameter declared.
+    tparams: Vec<TParam>,
+    /// Type parameters in scope, by name (innermost last).
+    tscope: Vec<(Symbol, ParamId)>,
+    /// Inference variables: their type once found.
+    vars: RefCell<Vec<Option<Ty>>>,
 }
 
 /// Construction block of an unknown type: free assignments, no cascading errors.
@@ -541,7 +575,19 @@ impl Checker<'_> {
                 ts.join(" | ")
             }
             Ty::Fn(_) => "function".into(),
-            Ty::Object(id) => self.name(self.types[*id].name).into(),
+            Ty::Object(id, args) => {
+                let name = self.name(self.types[*id].name);
+                if args.is_empty() {
+                    return name.into();
+                }
+                let args: Vec<String> = args.iter().map(|t| self.show(t)).collect();
+                format!("{name}({})", args.join(", "))
+            }
+            Ty::Param(p) => self.name(self.tparams[*p].name).into(),
+            Ty::Var(v) => match self.vars.borrow()[*v].clone() {
+                Some(t) => self.show(&t),
+                None => "_".into(),
+            },
             Ty::TypeValue(id) => format!("type {}", self.name(self.types[*id].name)),
             Ty::Variant(id) => self.name(self.enums[*id].name).into(),
             Ty::EnumValue(id) => format!("enum {}", self.name(self.enums[*id].name)),
@@ -772,11 +818,7 @@ impl Checker<'_> {
                 Function::Script(c) => match &c.proto.decl {
                     Some(d) => {
                         self.quiet += 1;
-                        let sig = self.signature(
-                            d.params.as_deref().unwrap_or(&[]),
-                            d.ret.as_ref(),
-                            false,
-                        );
+                        let sig = self.decl_sig(d);
                         self.quiet -= 1;
                         let dep = self.ir_deprecation(&c.proto.annotations);
                         self.mark_fn(&sig, dep);
@@ -811,31 +853,81 @@ impl Checker<'_> {
             fields: Vec::new(),
             methods: FxHashMap::default(),
             access: FxHashMap::default(),
+            params: Vec::new(),
+            supers: FxHashMap::default(),
             deprecated,
         });
         self.imported.insert(key, Ty::TypeValue(id));
-        self.types[id].parent = info.parent.as_ref().map(|p| self.import_type(p));
+        let parent = info.parent.as_ref().map(|p| self.import_type(p));
+        self.types[id].parent = parent;
         self.types[id].traits = info.traits.iter().map(|t| self.import_type(t)).collect();
+        let includes: Vec<TypeId> = info.includes.iter().map(|t| self.import_type(t)).collect();
         self.quiet += 1;
-        let fields = info
-            .fields
-            .iter()
-            .map(|f| FieldDef {
-                name: f.name,
-                ty: f.ty.as_ref().map_or(Ty::Any, |t| self.resolve(&t.expr)),
-                has_default: f.default.is_some(),
-                annotated: f.ty.is_some(),
-                deprecated: self.ir_deprecation(&f.annotations),
-            })
+        // Type parameters, and the arguments of the parent and the traits.
+        let mark = self.tscope.len();
+        let g = info.generics.clone().unwrap_or_default();
+        let params = self.begin_tparams(&g.params);
+        self.types[id].params = params;
+        let mut supers: FxHashMap<TypeId, Targs> = FxHashMap::default();
+        let mut inherited = Vec::new();
+        if let Some(pid) = parent {
+            let pargs = self.type_args(pid, &g.parent_args, Span::new(0, 0));
+            let pm = self.args_subst(pid, &pargs);
+            for (k, v) in &self.types[pid].supers {
+                supers.insert(*k, v.iter().map(|t| self.subst(t, &pm)).collect());
+            }
+            supers.insert(pid, pargs);
+            inherited = self.types[pid]
+                .fields
+                .iter()
+                .map(|f| FieldDef {
+                    ty: self.subst(&f.ty, &pm),
+                    ..f.clone()
+                })
+                .collect();
+        }
+        for (k, tid) in includes.into_iter().enumerate() {
+            let args = g.trait_args.get(k).map_or(&[][..], |a| &a[..]);
+            let targs = self.type_args(tid, args, Span::new(0, 0));
+            supers.insert(tid, targs);
+        }
+        self.types[id].supers = supers;
+        // The parent's fields come first.
+        let own = info.fields.iter().skip(inherited.len()).map(|f| FieldDef {
+            name: f.name,
+            ty: f.ty.as_ref().map_or(Ty::Any, |t| self.resolve(&t.expr)),
+            has_default: f.default.is_some(),
+            annotated: f.ty.is_some(),
+            deprecated: self.ir_deprecation(&f.annotations),
+        });
+        let fields = inherited
+            .into_iter()
+            .chain(own.collect::<Vec<_>>())
             .collect();
-        let mut methods: FxHashMap<Symbol, Rc<FnSig>> = info
-            .methods
-            .iter()
-            .map(|(n, m)| (*n, self.proto_signature(m)))
-            .collect();
+        // Inherited methods: the signature known for their owner, with its arguments.
+        let this = self.this_ty(id);
+        let mut methods: FxHashMap<Symbol, Rc<FnSig>> = FxHashMap::default();
+        for (n, m) in &info.methods {
+            let owner = crate::objects::method_owner(info, *n, m);
+            let sig = if Rc::ptr_eq(&owner, info) {
+                self.proto_signature(m)
+            } else {
+                let oid = self.import_type(&owner);
+                let Ty::Object(_, xs) = &this else {
+                    unreachable!()
+                };
+                let oargs = self.upcast(id, xs, oid).unwrap_or_default();
+                let om = self.args_subst(oid, &oargs);
+                match self.types[oid].methods.get(n).cloned() {
+                    Some(s) => self.subst_sig(&s, &om),
+                    None => self.proto_signature(m),
+                }
+            };
+            methods.insert(*n, sig);
+        }
         for r in &info.required {
             let d = &r.decl;
-            let sig = self.signature(d.params.as_deref().unwrap_or(&[]), d.ret.as_ref(), false);
+            let sig = self.decl_sig(d);
             methods.insert(r.name, sig);
         }
         let access = info
@@ -847,6 +939,7 @@ impl Checker<'_> {
                 (*n, (m.vis, self.import_type(&owner)))
             })
             .collect();
+        self.tscope.truncate(mark);
         self.quiet -= 1;
         self.types[id].fields = fields;
         self.types[id].methods = methods;
@@ -890,7 +983,7 @@ impl Checker<'_> {
     fn proto_signature(&mut self, p: &crate::ir::Proto) -> Rc<FnSig> {
         match &p.decl {
             Some(d) => {
-                let sig = self.signature(d.params.as_deref().unwrap_or(&[]), d.ret.as_ref(), false);
+                let sig = self.decl_sig(d);
                 let dep = self.ir_deprecation(&p.annotations);
                 self.mark_fn(&sig, dep);
                 self.mark_params_ir(&sig, p);
@@ -900,11 +993,351 @@ impl Checker<'_> {
                 params: Vec::new(),
                 ret: RefCell::new(Ty::Any),
                 lenient: true,
+                generics: Vec::new(),
             }),
         }
     }
 
     // ─── Type annotations ────────────────────────────────────────────────────
+
+    /// Type or enum named by a path written here (`Box`, `Http::Request`).
+    fn type_named(&mut self, path: &[Symbol]) -> Option<Ty> {
+        let found = if let [name] = path {
+            let mut found = self.lookup(*name).map(|(v, _)| v.ty.clone());
+            if found.is_none() {
+                for m in self.modules() {
+                    if self.qualified(m, *name).is_some() {
+                        found = self.member_ty(m, *name);
+                        if found.is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
+            if found.is_none() {
+                found = self.global_ty(*name).map(|g| g.0);
+            }
+            found
+        } else {
+            let (&last, prefix) = path.split_last()?;
+            let m = self.module_path(prefix)?;
+            self.member_ty(m, last)
+        };
+        found.filter(|t| matches!(t, Ty::TypeValue(_) | Ty::EnumValue(_)))
+    }
+
+    /// Arguments written for generic type `id` (after `<` or `include`): checked, `any`
+    /// when none are written.
+    fn type_args(&mut self, id: TypeId, args: &[TypeExpr], span: Span) -> Targs {
+        if args.is_empty() {
+            return self.raw_args(id);
+        }
+        let args = args.iter().map(|a| self.resolve(a)).collect();
+        match self.apply(id, args, span) {
+            Ty::Object(_, a) => a,
+            _ => self.raw_args(id),
+        }
+    }
+
+    /// `Box(int)`: number of arguments and bounds checked.
+    fn apply(&mut self, id: TypeId, args: Vec<Ty>, span: Span) -> Ty {
+        let n = self.types[id].params.len();
+        let name = self.name(self.types[id].name).to_string();
+        if n == 0 {
+            self.error(format!("`{name}` is not generic"), span);
+            return self.obj(id);
+        }
+        if args.len() != n {
+            let msg = format!(
+                "`{name}` takes {n} type argument{}, got {}",
+                if n == 1 { "" } else { "s" },
+                args.len()
+            );
+            self.error(msg, span);
+            return self.obj(id);
+        }
+        let m = self.args_subst(id, &args);
+        let params = self.types[id].params.clone();
+        self.check_bounds(&params, &m, span);
+        Ty::Object(id, args.into())
+    }
+
+    // ─── Generics ────────────────────────────────────────────────────────────
+
+    /// Instance of `id` without type arguments (`any` for those of a generic type).
+    fn obj(&self, id: TypeId) -> Ty {
+        Ty::Object(id, self.raw_args(id))
+    }
+
+    fn raw_args(&self, id: TypeId) -> Targs {
+        let n = self.types.get(id).map_or(0, |t| t.params.len());
+        vec![Ty::Any; n].into()
+    }
+
+    /// `self` in a method of `id`: its own parameters as arguments.
+    fn this_ty(&self, id: TypeId) -> Ty {
+        let args: Vec<Ty> = self.types[id]
+            .params
+            .iter()
+            .map(|p| Ty::Param(*p))
+            .collect();
+        Ty::Object(id, args.into())
+    }
+
+    /// Parameters of type `id` → `args` (`any` for the missing ones).
+    fn args_subst(&self, id: TypeId, args: &[Ty]) -> Subst {
+        let Some(t) = self.types.get(id) else {
+            return Subst::default();
+        };
+        t.params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (*p, args.get(i).cloned().unwrap_or(Ty::Any)))
+            .collect()
+    }
+
+    /// Arguments of ancestor (or trait) `b` for an object of type `a` with arguments
+    /// `args`; `None` if `a` does not descend from `b`.
+    fn upcast(&self, a: TypeId, args: &Targs, b: TypeId) -> Option<Targs> {
+        if a == b {
+            return Some(args.clone());
+        }
+        if let Some(sup) = self.types.get(a).and_then(|t| t.supers.get(&b)) {
+            let m = self.args_subst(a, args);
+            return Some(sup.iter().map(|t| self.subst(t, &m)).collect());
+        }
+        self.descends(a, b).then(|| self.raw_args(b))
+    }
+
+    /// Declares type parameters (`forall T, U: B`, `class Box(T)`) and brings them into
+    /// scope (the caller restores `tscope`); their bounds may refer to them.
+    fn begin_tparams(&mut self, ps: &[TypeParam]) -> Vec<ParamId> {
+        let ids: Vec<ParamId> = ps
+            .iter()
+            .map(|p| {
+                self.tparams.push(TParam {
+                    name: p.name,
+                    bound: None,
+                });
+                self.tparams.len() - 1
+            })
+            .collect();
+        self.enter_tparams(&ids);
+        self.resolve_bounds(ps, &ids);
+        ids
+    }
+
+    fn resolve_bounds(&mut self, ps: &[TypeParam], ids: &[ParamId]) {
+        for (p, &id) in ps.iter().zip(ids) {
+            if let Some(b) = &p.bound {
+                let t = self.resolve(b);
+                self.tparams[id].bound = Some(t);
+            }
+        }
+    }
+
+    /// Brings declared type parameters into scope; returns the mark to restore.
+    fn enter_tparams(&mut self, ids: &[ParamId]) -> usize {
+        let mark = self.tscope.len();
+        for &id in ids {
+            self.tscope.push((self.tparams[id].name, id));
+        }
+        mark
+    }
+
+    /// Signature of a declared function or method, with its `forall` parameters.
+    fn decl_sig(&mut self, f: &FnDecl) -> Rc<FnSig> {
+        let mark = self.tscope.len();
+        let generics = self.begin_tparams(&f.forall);
+        let sig = self.signature(f.params.as_deref().unwrap_or(&[]), f.ret.as_ref(), false);
+        self.tscope.truncate(mark);
+        if generics.is_empty() {
+            return sig;
+        }
+        let mut sig = Rc::try_unwrap(sig).unwrap_or_else(|_| unreachable!());
+        sig.generics = generics;
+        Rc::new(sig)
+    }
+
+    /// New inference variables for the parameters `ids` (a call of a generic function).
+    fn instantiate(&self, ids: &[ParamId], m: &mut Subst) {
+        let mut vars = self.vars.borrow_mut();
+        for &p in ids {
+            vars.push(None);
+            m.insert(p, Ty::Var(vars.len() - 1));
+        }
+    }
+
+    fn var_ty(&self, v: usize) -> Option<Ty> {
+        self.vars.borrow()[v].clone()
+    }
+
+    /// Variable `v` found to be `t` (unless `t` contains it).
+    fn bind(&self, v: usize, t: &Ty) {
+        if !self.occurs(v, t) {
+            self.vars.borrow_mut()[v] = Some(plain(t));
+        }
+    }
+
+    fn occurs(&self, v: usize, t: &Ty) -> bool {
+        self.any_ty(t, &|t| matches!(t, Ty::Var(u) if *u == v))
+    }
+
+    fn has_vars(&self, t: &Ty) -> bool {
+        self.any_ty(t, &|t| matches!(t, Ty::Var(_)))
+    }
+
+    /// Does `t`, or a type inside it, satisfy `f`?
+    fn any_ty(&self, t: &Ty, f: &dyn Fn(&Ty) -> bool) -> bool {
+        if f(t) {
+            return true;
+        }
+        match t {
+            Ty::List(x) => self.any_ty(x, f),
+            Ty::Hash(k, v) => self.any_ty(k, f) || self.any_ty(v, f),
+            Ty::Record(fs) => fs.iter().any(|(_, t)| self.any_ty(t, f)),
+            Ty::Tuple(ts) | Ty::Union(ts) => ts.iter().any(|t| self.any_ty(t, f)),
+            Ty::Object(_, args) => args.iter().any(|t| self.any_ty(t, f)),
+            Ty::Fn(sig) => {
+                sig.params.iter().any(|p| self.any_ty(&p.ty, f))
+                    || self.any_ty(&sig.ret.borrow(), f)
+            }
+            _ => false,
+        }
+    }
+
+    /// `t` with the type parameters of `m` replaced.
+    fn subst(&self, t: &Ty, m: &Subst) -> Ty {
+        if m.is_empty() {
+            return t.clone();
+        }
+        self.map_ty(t, &|t| match t {
+            Ty::Param(p) => m.get(p).cloned(),
+            _ => None,
+        })
+    }
+
+    fn subst_sig(&self, sig: &Rc<FnSig>, m: &Subst) -> Rc<FnSig> {
+        if m.is_empty() {
+            return sig.clone();
+        }
+        self.map_sig(sig, &|t| match t {
+            Ty::Param(p) => m.get(p).cloned(),
+            _ => None,
+        })
+    }
+
+    /// `t` with the inference variables replaced by their type (`any` if not found).
+    fn zonk(&self, t: &Ty) -> Ty {
+        if !self.has_vars(t) {
+            return t.clone();
+        }
+        self.map_ty(t, &|t| match t {
+            Ty::Var(v) => Some(self.var_ty(*v).map_or(Ty::Any, |t| self.zonk(&t))),
+            _ => None,
+        })
+    }
+
+    /// `t` with the inference variables found replaced (the others kept).
+    fn zonk_keep(&self, t: &Ty) -> Ty {
+        if !self.has_vars(t) {
+            return t.clone();
+        }
+        self.map_ty(t, &|t| match t {
+            Ty::Var(v) => self.var_ty(*v).map(|t| self.zonk_keep(&t)),
+            _ => None,
+        })
+    }
+
+    /// Rebuilds `t`, replacing the types for which `f` gives one.
+    fn map_ty(&self, t: &Ty, f: &dyn Fn(&Ty) -> Option<Ty>) -> Ty {
+        if let Some(r) = f(t) {
+            return r;
+        }
+        match t {
+            Ty::List(x) => Ty::List(Box::new(self.map_ty(x, f))),
+            Ty::Hash(k, v) => Ty::Hash(Box::new(self.map_ty(k, f)), Box::new(self.map_ty(v, f))),
+            Ty::Record(fs) => Ty::Record(fs.iter().map(|(n, t)| (*n, self.map_ty(t, f))).collect()),
+            Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| self.map_ty(t, f)).collect()),
+            Ty::Union(ts) => union(ts.iter().map(|t| self.map_ty(t, f)).collect()),
+            Ty::Object(id, args) if !args.is_empty() => {
+                Ty::Object(*id, args.iter().map(|t| self.map_ty(t, f)).collect())
+            }
+            Ty::Fn(sig) => Ty::Fn(self.map_sig(sig, f)),
+            t => t.clone(),
+        }
+    }
+
+    fn map_sig(&self, sig: &Rc<FnSig>, f: &dyn Fn(&Ty) -> Option<Ty>) -> Rc<FnSig> {
+        Rc::new(FnSig {
+            params: sig
+                .params
+                .iter()
+                .map(|p| ParamSig {
+                    name: p.name,
+                    ty: self.map_ty(&p.ty, f),
+                    has_default: p.has_default,
+                })
+                .collect(),
+            ret: RefCell::new(self.map_ty(&sig.ret.borrow(), f)),
+            lenient: sig.lenient,
+            generics: sig.generics.clone(),
+        })
+    }
+
+    /// What operations can do with a value of type `t`: a type parameter as its bound
+    /// (`any` without one), an inference variable as its type.
+    fn view(&self, t: Ty) -> Ty {
+        match t {
+            Ty::Param(p) => match &self.tparams[p].bound {
+                Some(b) => self.view(b.clone()),
+                None => Ty::Any,
+            },
+            Ty::Var(_) => self.zonk(&t),
+            Ty::Union(ts) if ts.iter().any(|t| matches!(t, Ty::Param(_) | Ty::Var(_))) => {
+                union(ts.into_iter().map(|t| self.view(t)).collect())
+            }
+            t => t,
+        }
+    }
+
+    /// The types found for the parameters `ids` satisfy their bounds.
+    fn check_bounds(&mut self, ids: &[ParamId], m: &Subst, span: Span) {
+        for &p in ids {
+            let Some(b) = self.tparams[p].bound.clone() else {
+                continue;
+            };
+            let t = self.zonk(&m.get(&p).cloned().unwrap_or(Ty::Any));
+            if t.is_any() {
+                continue;
+            }
+            let b = self.zonk(&self.subst(&b, m));
+            if !self.assignable(&t, &b) {
+                let msg = format!(
+                    "`{}` (for `{}`) is not a `{}`",
+                    self.show_v(&t),
+                    self.name(self.tparams[p].name),
+                    self.show(&b)
+                );
+                self.error(msg, span);
+            }
+        }
+    }
+
+    /// Function values: binds the inference variables of `to` (`(T): U`) from `from`.
+    fn unify_fn(&self, from: &FnSig, to: &FnSig) {
+        let to_ty = |p: &ParamSig| p.ty.clone();
+        if !to.params.iter().map(to_ty).any(|t| self.has_vars(&t))
+            && !self.has_vars(&to.ret.borrow())
+        {
+            return;
+        }
+        for (a, b) in from.params.iter().zip(&to.params) {
+            self.assignable(&b.ty, &a.ty);
+        }
+        let r = from.ret.borrow().clone();
+        self.assignable(&r, &to.ret.borrow());
+    }
 
     fn resolve(&mut self, t: &TypeExpr) -> Ty {
         match &t.kind {
@@ -919,33 +1352,14 @@ impl Checker<'_> {
                         "nil" => return Ty::Nil,
                         _ => {}
                     }
-                    let mut found = self.lookup(*name).map(|(v, _)| v.ty.clone());
-                    if found.is_none() {
-                        for m in self.modules() {
-                            if self.qualified(m, *name).is_some() {
-                                found = self.member_ty(m, *name);
-                                if found.is_some() {
-                                    break;
-                                }
-                            }
-                        }
+                    if let Some(&(_, p)) = self.tscope.iter().rev().find(|(n, _)| n == name) {
+                        return Ty::Param(p);
                     }
-                    if found.is_none() {
-                        found = self.global_ty(*name).map(|g| g.0);
-                    }
-                    match found {
-                        Some(Ty::TypeValue(id)) => return Ty::Object(id),
-                        Some(Ty::EnumValue(id)) => return Ty::Variant(id),
-                        _ => {}
-                    }
-                } else if let Some((&last, prefix)) = path.split_last()
-                    && let Some(m) = self.module_path(prefix)
-                {
-                    match self.member_ty(m, last) {
-                        Some(Ty::TypeValue(id)) => return Ty::Object(id),
-                        Some(Ty::EnumValue(id)) => return Ty::Variant(id),
-                        _ => {}
-                    }
+                }
+                match self.type_named(path) {
+                    Some(Ty::TypeValue(id)) => return self.obj(id),
+                    Some(Ty::EnumValue(id)) => return Ty::Variant(id),
+                    _ => {}
                 }
                 let shown: Vec<&str> = path.iter().map(|s| self.name(*s)).collect();
                 let shown = shown.join("::");
@@ -958,6 +1372,30 @@ impl Checker<'_> {
                 let hint = suggest(&shown, candidates.iter().map(|s| s.as_str()));
                 self.error(format!("unknown type `{shown}`{hint}"), t.span);
                 Ty::Any
+            }
+            TypeKind::Applied(path, args) => {
+                let args: Vec<Ty> = args.iter().map(|a| self.resolve(a)).collect();
+                let shown: Vec<&str> = path.iter().map(|s| self.name(*s)).collect();
+                let shown = shown.join("::");
+                match self.type_named(path) {
+                    Some(Ty::TypeValue(id)) => self.apply(id, args, t.span),
+                    Some(_) => {
+                        self.error(format!("`{shown}` is not generic"), t.span);
+                        Ty::Any
+                    }
+                    None if matches!(
+                        shown.as_str(),
+                        "any" | "int" | "float" | "str" | "bool" | "nil"
+                    ) =>
+                    {
+                        self.error(format!("`{shown}` is not generic"), t.span);
+                        Ty::Any
+                    }
+                    None => {
+                        self.error(format!("unknown type `{shown}`"), t.span);
+                        Ty::Any
+                    }
+                }
             }
             TypeKind::List(inner) => Ty::List(Box::new(self.resolve(inner))),
             TypeKind::Hash(k, v) => Ty::Hash(Box::new(self.resolve(k)), Box::new(self.resolve(v))),
@@ -984,6 +1422,7 @@ impl Checker<'_> {
                     params,
                     ret: RefCell::new(ret),
                     lenient: false,
+                    generics: Vec::new(),
                 }))
             }
         }
@@ -996,9 +1435,41 @@ impl Checker<'_> {
     fn assignable(&self, from: &Ty, to: &Ty) -> bool {
         use Ty::*;
         match (from, to) {
-            (Any, _) | (_, Any) | (Never, _) => true,
+            (Never, _) => true,
+            // Inference variable: found (bound) by the first value it meets.
+            (_, Var(v)) => {
+                match self.var_ty(*v) {
+                    Some(t) => return self.assignable(from, &t),
+                    None if !matches!(from, Var(_)) => self.bind(*v, from),
+                    None => {}
+                }
+                true
+            }
+            (Var(v), _) => {
+                match self.var_ty(*v) {
+                    Some(t) => return self.assignable(&t, to),
+                    None => self.bind(*v, to),
+                }
+                true
+            }
+            (Any, _) | (_, Any) => true,
             (Union(fs), _) => fs.iter().any(|f| self.assignable(f, to)),
-            (_, Union(ts)) => ts.iter().any(|t| self.assignable(from, t)),
+            // The other members first: `nil` for `T?` is not `T = nil`.
+            (_, Union(ts)) => {
+                ts.iter()
+                    .filter(|t| !self.has_vars(t))
+                    .any(|t| self.assignable(from, t))
+                    || ts
+                        .iter()
+                        .filter(|t| self.has_vars(t))
+                        .any(|t| self.assignable(from, t))
+            }
+            (Param(a), Param(b)) => a == b,
+            // `T: Comparable(T)` is a `Comparable(T)`.
+            (Param(a), _) => self.tparams[*a]
+                .bound
+                .as_ref()
+                .is_some_and(|b| self.assignable(b, to)),
             (LitStr(_), Str) | (LitInt(_), Int) | (LitInt(_), Float) | (Int, Float) => true,
             // An arbitrary `str` may be `"dev"`: checked at runtime.
             (Str, LitStr(_)) | (Int, LitInt(_)) => true,
@@ -1012,8 +1483,15 @@ impl Checker<'_> {
                     && b.iter()
                         .all(|(n, t)| a.iter().any(|(m, u)| m == n && self.assignable(u, t)))
             }
-            (Fn(_) | TypeValue(_), Fn(_)) => true,
-            (Object(a), Object(b)) => self.descends(*a, *b),
+            (Fn(a), Fn(b)) => {
+                self.unify_fn(a, b);
+                true
+            }
+            (TypeValue(_), Fn(_)) => true,
+            (Object(a, xs), Object(b, ys)) => match self.upcast(*a, xs, *b) {
+                Some(zs) => zs.iter().zip(ys.iter()).all(|(z, y)| self.assignable(z, y)),
+                None => false,
+            },
             _ => from == to,
         }
     }
@@ -1097,6 +1575,19 @@ impl Checker<'_> {
                     let id = self.types.len();
                     let deprecated = self.ast_deprecation(&t.annotations);
                     let qname = self.decl_name(t.name);
+                    // Type parameters: known now (other types may use `Box(int)`), their
+                    // bounds resolved with the fields.
+                    let params = t
+                        .params
+                        .iter()
+                        .map(|p| {
+                            self.tparams.push(TParam {
+                                name: p.name,
+                                bound: None,
+                            });
+                            self.tparams.len() - 1
+                        })
+                        .collect();
                     self.types.push(TypeDef {
                         name: qname,
                         kind: t.kind,
@@ -1108,6 +1599,8 @@ impl Checker<'_> {
                         fields: Vec::new(),
                         methods: FxHashMap::default(),
                         access: FxHashMap::default(),
+                        params,
+                        supers: FxHashMap::default(),
                         deprecated,
                     });
                     self.declare(t.name, Ty::TypeValue(id), VarKind::Type);
@@ -1155,6 +1648,9 @@ impl Checker<'_> {
         // 2. Fields and method signatures (a parent class's first: it must be declared
         // before).
         for (id, t) in pending_types {
+            let params = self.types[id].params.clone();
+            let mark = self.enter_tparams(&params);
+            self.resolve_bounds(&t.params, &params);
             let parent = t.parent.and_then(|(p, span)| {
                 let found = match self.lookup(p) {
                     Some((v, _)) => Some(v.ty.clone()),
@@ -1177,11 +1673,37 @@ impl Checker<'_> {
                     }
                 }
             });
+            // A generic parent: its fields and methods with its arguments (`< Box(int)`).
+            let mut supers: FxHashMap<TypeId, Targs> = FxHashMap::default();
             let (mut fields, mut methods) = match parent {
-                Some(pid) => (self.types[pid].fields.clone(), self.types[pid].methods.clone()),
+                Some(pid) => {
+                    let span = t.parent.unwrap().1;
+                    let pargs = self.type_args(pid, &t.parent_args, span);
+                    let pm = self.args_subst(pid, &pargs);
+                    let p = &self.types[pid];
+                    for (k, v) in &p.supers {
+                        supers.insert(*k, v.iter().map(|t| self.subst(t, &pm)).collect());
+                    }
+                    supers.insert(pid, pargs);
+                    let fields = p
+                        .fields
+                        .iter()
+                        .map(|f| FieldDef {
+                            ty: self.subst(&f.ty, &pm),
+                            ..f.clone()
+                        })
+                        .collect();
+                    let methods = p
+                        .methods
+                        .iter()
+                        .map(|(n, s)| (*n, self.subst_sig(s, &pm)))
+                        .collect();
+                    (fields, methods)
+                }
                 None => (Vec::new(), FxHashMap::default()),
             };
-            let mut access = parent.map_or(FxHashMap::default(), |pid| self.types[pid].access.clone());
+            let mut access =
+                parent.map_or(FxHashMap::default(), |pid| self.types[pid].access.clone());
             let (mut required, mut traits) = match parent {
                 Some(pid) => (self.types[pid].required.clone(), self.types[pid].traits.clone()),
                 None => (Vec::new(), Vec::new()),
@@ -1195,7 +1717,7 @@ impl Checker<'_> {
                 .collect();
             // Traits first: the class's own methods take precedence.
             for m in &t.members {
-                let Member::Include(n, span) = m else { continue };
+                let Member::Include(n, args, span) = m else { continue };
                 let found = match self.lookup(*n) {
                     Some((v, _)) => Some(v.ty.clone()),
                     None => self.global_ty(*n).map(|(t, _)| t),
@@ -1204,8 +1726,12 @@ impl Checker<'_> {
                     Some(Ty::TypeValue(tid))
                         if self.types[tid].kind == TypeDeclKind::Trait && self.types[tid].ready =>
                     {
+                        let targs = self.type_args(tid, args, *span);
+                        let tm = self.args_subst(tid, &targs);
+                        supers.insert(tid, targs);
                         let tr = &self.types[tid];
                         for (name, sig) in &tr.methods {
+                            let sig = &self.subst_sig(sig, &tm);
                             if tr.required.iter().any(|(r, _)| r == name) {
                                 if !methods.contains_key(name)
                                     && let Some(a) = tr.access.get(name)
@@ -1264,11 +1790,7 @@ impl Checker<'_> {
                         });
                     }
                     Member::Method(f) => {
-                        let sig = self.signature(
-                            f.params.as_deref().unwrap_or(&[]),
-                            f.ret.as_ref(),
-                            false,
-                        );
+                        let sig = self.decl_sig(f);
                         let dep = self.ast_deprecation(&f.annotations);
                         self.mark_fn(&sig, dep);
                         self.mark_params_ast(&sig, f.params.as_deref());
@@ -1281,11 +1803,7 @@ impl Checker<'_> {
                         defined.push(f.name);
                     }
                     Member::Abstract(f) => {
-                        let sig = self.signature(
-                            f.params.as_deref().unwrap_or(&[]),
-                            f.ret.as_ref(),
-                            false,
-                        );
+                        let sig = self.decl_sig(f);
                         if !methods.contains_key(&f.name) && f.vis != Visibility::Public {
                             access.insert(f.name, (f.vis, id));
                         }
@@ -1337,7 +1855,9 @@ impl Checker<'_> {
             self.types[id].access = access;
             self.types[id].required = required;
             self.types[id].traits = traits;
+            self.types[id].supers = supers;
             self.types[id].ready = true;
+            self.tscope.truncate(mark);
         }
         for s in &b.stmts {
             if let StmtKind::Enum(e) = &s.kind {
@@ -1356,11 +1876,7 @@ impl Checker<'_> {
                     .methods
                     .iter()
                     .map(|m| {
-                        let sig = self.signature(
-                            m.params.as_deref().unwrap_or(&[]),
-                            m.ret.as_ref(),
-                            false,
-                        );
+                        let sig = self.decl_sig(m);
                         let dep = self.ast_deprecation(&m.annotations);
                         self.mark_fn(&sig, dep);
                         self.mark_params_ast(&sig, m.params.as_deref());
@@ -1372,7 +1888,7 @@ impl Checker<'_> {
         // 3. Functions.
         for s in &b.stmts {
             if let StmtKind::Def(f) = &s.kind {
-                let sig = self.signature(f.params.as_deref().unwrap_or(&[]), f.ret.as_ref(), false);
+                let sig = self.decl_sig(f);
                 let dep = self.ast_deprecation(&f.annotations);
                 self.mark_fn(&sig, dep);
                 self.mark_params_ast(&sig, f.params.as_deref());
@@ -1423,6 +1939,7 @@ impl Checker<'_> {
             params,
             ret: RefCell::new(ret),
             lenient,
+            generics: Vec::new(),
         })
     }
 
@@ -1445,11 +1962,7 @@ impl Checker<'_> {
                 let sig = match self.lookup(f.name).map(|(v, _)| v.ty.clone()) {
                     Some(Ty::Fn(sig)) => sig,
                     _ => {
-                        let sig = self.signature(
-                            f.params.as_deref().unwrap_or(&[]),
-                            f.ret.as_ref(),
-                            false,
-                        );
+                        let sig = self.decl_sig(f);
                         let dep = self.ast_deprecation(&f.annotations);
                         self.mark_fn(&sig, dep);
                         self.mark_params_ast(&sig, f.params.as_deref());
@@ -1544,6 +2057,7 @@ impl Checker<'_> {
             self.annotations(&p.annotations);
         }
         let ret = f.ret.as_ref().map(|_| sig.ret.borrow().clone());
+        let mark = self.enter_tparams(&sig.generics);
         let t = self.body(
             f.params.as_deref().unwrap_or(&[]),
             sig,
@@ -1551,6 +2065,7 @@ impl Checker<'_> {
             ret.clone(),
             this,
         );
+        self.tscope.truncate(mark);
         if ret.is_none() {
             *sig.ret.borrow_mut() = t;
         }
@@ -1621,6 +2136,13 @@ impl Checker<'_> {
         let Some(&id) = self.decl_ids.get(&(t as *const TypeDecl as usize)) else {
             return;
         };
+        let params = self.types[id].params.clone();
+        let mark = self.enter_tparams(&params);
+        self.type_body(t, id);
+        self.tscope.truncate(mark);
+    }
+
+    fn type_body(&mut self, t: &TypeDecl, id: TypeId) {
         // Default values: they can see the other fields.
         self.push_scope();
         let fields: Vec<(Symbol, Ty)> = self.types[id]
@@ -1649,7 +2171,8 @@ impl Checker<'_> {
                 Member::Method(f) => {
                     let sig = self.types[id].methods.get(&f.name).cloned().unwrap();
                     let saved = self.method.replace((id, f.name));
-                    self.function(f, &sig, Some(Ty::Object(id)));
+                    let this = self.this_ty(id);
+                    self.function(f, &sig, Some(this));
                     self.method = saved;
                 }
                 Member::Stmt(s) => self.error(
@@ -1707,7 +2230,7 @@ impl Checker<'_> {
             };
             match found {
                 Some(Ty::TypeValue(id)) if self.types[id].kind == TypeDeclKind::Annotation => {
-                    self.construct_args(id, a.args, None, a.span);
+                    self.construct_args(id, &Subst::default(), a.args, None, a.span);
                 }
                 Some(_) => {
                     let msg = format!("`{}` is not an annotation", self.name(*name));
@@ -1821,9 +2344,10 @@ impl Checker<'_> {
             }
             ExprKind::Record(fields) => {
                 // Record literal expected as a `type`: it will be converted.
-                if let Some(id) = expected.and_then(|t| self.data_type_in(t)) {
-                    self.record_as_type(id, fields, span);
-                    return Ty::Object(id);
+                if let Some((id, args)) = expected.and_then(|t| self.data_type_in(t)) {
+                    let m = self.args_subst(id, &args);
+                    self.record_as_type(id, &m, fields, span);
+                    return Ty::Object(id, args);
                 }
                 let exp = match expected {
                     Some(Ty::Record(fs)) => Some(fs.clone()),
@@ -1845,6 +2369,7 @@ impl Checker<'_> {
 
             ExprKind::Unary(op, x) => {
                 let t = self.expr(x, None);
+                let t = self.view(t);
                 match op {
                     UnaryOp::Not => Ty::Bool,
                     UnaryOp::Neg => {
@@ -1866,6 +2391,9 @@ impl Checker<'_> {
             ExprKind::Binary(op, a, b) => {
                 let l = self.expr(a, None);
                 let r = self.expr(b, None);
+                // `xs << x`: `x` as it is (a `T` for a list of `T`).
+                let l = self.view(l);
+                let r = if op == BinOp::Push { r } else { self.view(r) };
                 self.binary(op, &l, &r, span)
             }
             ExprKind::Range { lo, hi, .. } => {
@@ -1886,7 +2414,7 @@ impl Checker<'_> {
                     ExprKind::Ident(n) => Some(format!("`{}`", self.name(n))),
                     _ => None,
                 };
-                self.call(&f, args, block, span, label.as_deref())
+                self.call(&f, args, block, span, label.as_deref(), expected)
             }
             ExprKind::MethodCall {
                 recv,
@@ -1897,10 +2425,11 @@ impl Checker<'_> {
                 if let Some(m) = self.module_of(recv) {
                     let f = self.member(m, name, span);
                     let label = format!("`{}.{}`", self.name(m), self.name(name));
-                    return self.call(&f, args, block, span, Some(&label));
+                    return self.call(&f, args, block, span, Some(&label), expected);
                 }
                 let r = self.expr(recv, None);
-                if let Ty::Object(id) = r {
+                let r = self.view(r);
+                if let Ty::Object(id, _) = r {
                     let this = matches!(ast.kind(recv), ExprKind::SelfRef);
                     self.check_access(id, name, this, span);
                 }
@@ -1912,7 +2441,8 @@ impl Checker<'_> {
             }
             ExprKind::Field(recv, name) => {
                 let r = self.expr(recv, None);
-                if let Ty::Object(id) = r {
+                let r = self.view(r);
+                if let Ty::Object(id, _) = r {
                     let def = &self.types[id];
                     if def.kind == TypeDeclKind::Type
                         && let Some(f) = def.fields.iter().find(|f| f.name == name)
@@ -1951,11 +2481,13 @@ impl Checker<'_> {
             ExprKind::Index(recv, idx) => {
                 let r = self.expr(recv, None);
                 let i = self.expr(idx, None);
+                let (r, i) = (self.view(r), self.view(i));
                 self.index(&r, &i, span, ast.span(idx))
             }
             ExprKind::IndexOpt(recv, idx) => {
                 let r = self.expr(recv, None);
                 let i = self.expr(idx, None);
+                let (r, i) = (self.view(r), self.view(i));
                 match (&r, &i) {
                     // Literal index out of a tuple: `nil`, not an error.
                     (Ty::Tuple(ts), Ty::LitInt(n))
@@ -2072,8 +2604,17 @@ impl Checker<'_> {
                 match self.types[parent].methods.get(&m).cloned() {
                     Some(sig) => {
                         let what = format!("`super` (`{}.{}`)", self.name(self.types[parent].name), self.name(m));
-                        self.check_args(&sig, args, None, span, &what);
-                        sig.ret.borrow().clone()
+                        // A generic parent (`< Box(T)`): its parameters as given.
+                        let cur = self.method.unwrap().0;
+                        let this = self.this_ty(cur);
+                        let pm = match &this {
+                            Ty::Object(_, xs) => {
+                                let pargs = self.upcast(cur, xs, parent).unwrap_or_default();
+                                self.args_subst(parent, &pargs)
+                            }
+                            _ => Subst::default(),
+                        };
+                        self.call_sig(&sig, pm, args, None, span, &what, None)
                     }
                     None => {
                         let msg = format!(
@@ -2091,7 +2632,7 @@ impl Checker<'_> {
                 let ok = |t: &Ty| {
                     matches!(
                         t,
-                        Ty::Any | Ty::Never | Ty::Str | Ty::LitStr(_) | Ty::Object(_)
+                        Ty::Any | Ty::Never | Ty::Str | Ty::LitStr(_) | Ty::Object(..)
                     )
                 };
                 let fits = match &t {
@@ -2203,7 +2744,7 @@ impl Checker<'_> {
 
     fn this_type(&self) -> Option<TypeId> {
         match self.fns.last()?.this {
-            Some(Ty::Object(id)) => Some(id),
+            Some(Ty::Object(id, _)) => Some(id),
             _ => None,
         }
     }
@@ -2216,7 +2757,7 @@ impl Checker<'_> {
             );
             return Ty::Any;
         };
-        let Ty::Object(id) = this else {
+        let Ty::Object(id, _) = this else {
             let msg = format!("`@{}`: `self` has no fields here", self.name(name));
             self.error(msg, span);
             return Ty::Any;
@@ -2438,7 +2979,8 @@ impl Checker<'_> {
             ExprKind::IVar(name) => Some(self.ivar(name, tspan)),
             ExprKind::Field(recv, name) => {
                 let r = self.expr(recv, None);
-                if let Ty::Object(id) = r
+                let r = self.view(r);
+                if let Ty::Object(id, _) = r
                     && let Some(setter) = self.i.get(&format!("{}=", self.name(name)))
                 {
                     let this = matches!(self.ast.kind(recv), ExprKind::SelfRef);
@@ -2485,12 +3027,14 @@ impl Checker<'_> {
         block: Option<LambdaId>,
         span: Span,
         method: Option<&str>,
+        expected: Option<&Ty>,
     ) -> Ty {
+        let f = &self.view(f.clone());
         match f {
             Ty::Fn(sig) => {
                 let sig = sig.clone();
-                self.check_args(&sig, args, block, span, method.unwrap_or("the function"));
-                sig.ret.borrow().clone()
+                let what = method.unwrap_or("the function");
+                self.call_sig(&sig, Subst::default(), args, block, span, what, expected)
             }
             Ty::TypeValue(id) => {
                 let id = *id;
@@ -2507,6 +3051,10 @@ impl Checker<'_> {
                     self.error(msg, span);
                     return Ty::Any;
                 }
+                // Generic: its arguments found from the expected type and the values.
+                let params = self.types[id].params.clone();
+                let mut m = Subst::default();
+                self.instantiate(&params, &mut m);
                 if self.types[id].kind == TypeDeclKind::Class {
                     let init = self
                         .i
@@ -2515,14 +3063,27 @@ impl Checker<'_> {
                     match init {
                         Some(sig) => {
                             let name = format!("`{}`", self.name(self.types[id].name));
-                            self.check_args(&sig, args, block, span, &name);
+                            self.call_sig(&sig, m.clone(), args, block, span, &name, None);
                         }
-                        None => self.construct_args(id, args, block, span),
+                        None => self.construct_args(id, &m, args, block, span),
                     }
                 } else {
-                    self.construct_args(id, args, block, span);
+                    self.construct_args(id, &m, args, block, span);
                 }
-                Ty::Object(id)
+                // Parameters not found from the values: from the expected type
+                // (`let s: Stack(int) = Stack()`).
+                if let Some(Ty::Object(eid, eargs)) = expected
+                    && *eid == id
+                {
+                    for (p, a) in params.iter().zip(eargs.iter()) {
+                        if self.has_vars(&self.zonk_keep(&m[p])) {
+                            self.assignable(&m[p], a);
+                        }
+                    }
+                }
+                self.check_bounds(&params, &m, span);
+                let args: Vec<Ty> = params.iter().map(|p| self.zonk(&m[p])).collect();
+                Ty::Object(id, args.into())
             }
             Ty::Any => {
                 // Possibly the construction of an unknown type: block checked leniently.
@@ -2564,9 +3125,53 @@ impl Checker<'_> {
         }
     }
 
+    /// Call of `sig`: `m` gives the type arguments of the receiver (`Box(int)`), and its
+    /// own `forall` parameters get new inference variables, found from the arguments (and
+    /// from the expected result). Returns the type of the result.
+    #[allow(clippy::too_many_arguments)]
+    fn call_sig(
+        &mut self,
+        sig: &Rc<FnSig>,
+        mut m: Subst,
+        args: Slice<Arg>,
+        block: Option<LambdaId>,
+        span: Span,
+        what: &str,
+        expected: Option<&Ty>,
+    ) -> Ty {
+        self.instantiate(&sig.generics, &mut m);
+        if m.is_empty() {
+            self.check_args(sig, &m, args, block, span, what);
+            return sig.ret.borrow().clone();
+        }
+        let ret = self.subst(&sig.ret.borrow(), &m);
+        self.check_args(sig, &m, args, block, span, what);
+        // Parameters the arguments say nothing about: from the expected result
+        // (`let xs: [int] = empty()`).
+        if let Some(e) = expected
+            && !e.is_any()
+            && self.has_vars(&self.zonk_keep(&ret))
+        {
+            self.assignable(&ret, e);
+        }
+        self.check_bounds(&sig.generics, &m, span);
+        self.zonk(&ret)
+    }
+
+    /// `` `name` `` in a message, or `argument 2` for a function type (`(int, str): T`),
+    /// whose parameters have no name.
+    fn param_label(&self, i: usize, p: &ParamSig) -> String {
+        if unnamed(p.name) {
+            format!("argument {}", i + 1)
+        } else {
+            format!("`{}`", self.name(p.name))
+        }
+    }
+
     fn check_args(
         &mut self,
         sig: &FnSig,
+        m: &Subst,
         args: Slice<Arg>,
         block: Option<LambdaId>,
         span: Span,
@@ -2599,7 +3204,7 @@ impl Checker<'_> {
                     Some(i) => Some((i, &sig.params[i])),
                     None => {
                         let names: Vec<&str> =
-                            sig.params.iter().map(|p| self.name(p.name)).collect();
+                            sig.params.iter().filter(|p| !unnamed(p.name)).map(|p| self.name(p.name)).collect();
                         let hint = suggest(self.name(n), names);
                         let msg = format!("{what} has no parameter `{}`{hint}", self.name(n));
                         self.error(msg, ast.span(a.value));
@@ -2610,17 +3215,18 @@ impl Checker<'_> {
             match param {
                 Some((i, p)) => {
                     if given[i] {
-                        let msg = format!("argument `{}` given twice", self.name(p.name));
+                        let msg = format!("argument {} given twice", self.param_label(i, p));
                         self.error(msg, ast.span(a.value));
                     }
                     let key = (sig as *const FnSig as usize, i);
                     if let Some(dep) = self.deprecated_params.get(&key).cloned() {
-                        let param = format!("parameter `{}` of {what}", self.name(p.name));
+                        let param = format!("parameter {} of {what}", self.param_label(i, p));
                         self.warn_deprecated(Some(&dep), &param, ast.span(a.value));
                     }
                     given[i] = true;
-                    let label = format!(" for `{}`", self.name(p.name));
-                    self.expect(a.value, &p.ty.clone(), &label);
+                    let label = format!(" for {}", self.param_label(i, p));
+                    let ty = self.subst(&p.ty, m);
+                    self.expect(a.value, &ty, &label);
                 }
                 None => {
                     self.expr(a.value, None);
@@ -2629,16 +3235,20 @@ impl Checker<'_> {
         }
         if let Some(b) = block {
             let i = pos_i;
-            let expected = sig.params.get(i).map(|p| p.ty.clone());
+            let expected = sig.params.get(i).map(|p| self.subst(&p.ty, m));
             if i < given.len() {
                 given[i] = true;
             }
-            self.lambda(b, expected.as_ref());
+            let t = self.lambda(b, expected.as_ref());
+            if let Some(e) = &expected {
+                // Binds the inference variables of `(T): U` from the block.
+                self.assignable(&t, e);
+            }
         }
         if !sig.lenient {
-            for (p, g) in sig.params.iter().zip(&given) {
+            for (i, (p, g)) in sig.params.iter().zip(&given).enumerate() {
                 if !g && !p.has_default {
-                    let msg = format!("missing argument `{}` for {what}", self.name(p.name));
+                    let msg = format!("missing argument {} for {what}", self.param_label(i, p));
                     self.error(msg, span);
                 }
             }
@@ -2649,6 +3259,7 @@ impl Checker<'_> {
     fn construct_args(
         &mut self,
         id: TypeId,
+        m: &Subst,
         args: Slice<Arg>,
         block: Option<LambdaId>,
         span: Span,
@@ -2696,7 +3307,7 @@ impl Checker<'_> {
                     given[i] = true;
                     let (fname, fty, dep) = {
                         let f = &self.types[id].fields[i];
-                        (f.name, f.ty.clone(), f.deprecated.clone())
+                        (f.name, self.subst(&f.ty, m), f.deprecated.clone())
                     };
                     let what = format!("`{tname}.{}`", self.name(fname));
                     self.warn_deprecated(dep.as_ref(), &what, ast.span(a.value));
@@ -2723,7 +3334,7 @@ impl Checker<'_> {
                 let fields: Vec<(Symbol, Ty)> = self.types[id]
                     .fields
                     .iter()
-                    .map(|f| (f.name, f.ty.clone()))
+                    .map(|f| (f.name, self.zonk(&self.subst(&f.ty, m))))
                     .collect();
                 for (n, t) in fields {
                     self.declare(n, t, VarKind::Field);
@@ -2752,15 +3363,23 @@ impl Checker<'_> {
     }
 
     /// A `type` (not a `class`) among the possible types of `t`.
-    fn data_type_in(&self, t: &Ty) -> Option<TypeId> {
+    fn data_type_in(&self, t: &Ty) -> Option<(TypeId, Targs)> {
         t.members().iter().find_map(|m| match m {
-            Ty::Object(id) if self.types[*id].kind != TypeDeclKind::Class => Some(*id),
+            Ty::Object(id, args) if self.types[*id].kind != TypeDeclKind::Class => {
+                Some((*id, args.clone()))
+            }
             _ => None,
         })
     }
 
     /// Record literal converted to `type` `id`: known fields, types, required ones.
-    fn record_as_type(&mut self, id: TypeId, fields: Slice<(Symbol, ExprId)>, span: Span) {
+    fn record_as_type(
+        &mut self,
+        id: TypeId,
+        m: &Subst,
+        fields: Slice<(Symbol, ExprId)>,
+        span: Span,
+    ) {
         let ast = self.ast;
         let tname = self.name(self.types[id].name).to_string();
         let mut given = Vec::new();
@@ -2769,7 +3388,7 @@ impl Checker<'_> {
                 .fields
                 .iter()
                 .find(|f| f.name == n)
-                .map(|f| f.ty.clone())
+                .map(|f| self.subst(&f.ty, m))
             {
                 Some(fty) => {
                     given.push(n);
@@ -2806,8 +3425,9 @@ impl Checker<'_> {
     /// Lambda, with the expected parameter types if known.
     fn lambda(&mut self, id: LambdaId, expected: Option<&Ty>) -> Ty {
         let l = self.ast.lambda(id);
+        // Inference variables not found yet: `any`.
         let exp_params: Vec<Ty> = match expected {
-            Some(Ty::Fn(sig)) => sig.params.iter().map(|p| p.ty.clone()).collect(),
+            Some(Ty::Fn(sig)) => sig.params.iter().map(|p| self.zonk(&p.ty)).collect(),
             _ => Vec::new(),
         };
         let params = l
@@ -2827,6 +3447,7 @@ impl Checker<'_> {
             params,
             ret: RefCell::new(Ty::Any),
             lenient: true,
+            generics: Vec::new(),
         };
         let this = self.fns.last().and_then(|f| f.this.clone());
         let ret = self.body(&l.params, &sig, &l.body, None, this);
@@ -2848,6 +3469,7 @@ impl Checker<'_> {
                 .collect(),
             ret: RefCell::new(Ty::Any),
             lenient: true,
+            generics: Vec::new(),
         }))
     }
 
@@ -2862,6 +3484,7 @@ impl Checker<'_> {
 
     fn field_ty(&mut self, r: &Ty, name: Symbol, span: Span) -> Ty {
         let n = self.name(name).to_string();
+        let r = &self.view(r.clone());
         match r {
             Ty::Any | Ty::Union(_) => Ty::Any,
             Ty::Record(fs) => match fs.iter().find(|(m, _)| *m == name) {
@@ -2873,15 +3496,16 @@ impl Checker<'_> {
                     Ty::Any
                 }
             },
-            Ty::Object(id) => {
+            Ty::Object(id, args) => {
                 let id = *id;
+                let m = self.args_subst(id, args);
                 let def = &self.types[id];
                 let field = def
                     .fields
                     .iter()
                     .find(|f| f.name == name)
-                    .map(|f| f.ty.clone());
-                let method = def.methods.get(&name).cloned();
+                    .map(|f| self.subst(&f.ty, &m));
+                let method = def.methods.get(&name).map(|s| self.subst_sig(s, &m));
                 let is_class = def.kind == TypeDeclKind::Class;
                 let inside = self.this_type() == Some(id);
                 let dep = def
@@ -2950,14 +3574,16 @@ impl Checker<'_> {
     /// Type expected by `recv.name = value`.
     fn field_target(&mut self, r: &Ty, name: Symbol, span: Span) -> Ty {
         let n = self.name(name).to_string();
-        if let Ty::Object(id) = r {
+        let r = &self.view(r.clone());
+        if let Ty::Object(id, args) = r {
+            let m = self.args_subst(*id, args);
             let def = &self.types[*id];
             let setter = self
                 .i
                 .get(&format!("{n}="))
                 .and_then(|s| def.methods.get(&s).cloned());
             if let Some(sig) = setter {
-                return sig.params.first().map_or(Ty::Any, |p| p.ty.clone());
+                return sig.params.first().map_or(Ty::Any, |p| self.subst(&p.ty, &m));
             }
             if def.kind == TypeDeclKind::Class
                 && self.this_type() != Some(*id)
@@ -2996,14 +3622,16 @@ impl Checker<'_> {
         span: Span,
     ) -> Ty {
         let n = self.name(name).to_string();
+        let r = &self.view(r.clone());
         // Declared methods, function fields, enums.
         match r {
             Ty::Any | Ty::Union(_) | Ty::Never => {
                 self.args_any(args, block);
                 return Ty::Any;
             }
-            Ty::Object(id) => {
+            Ty::Object(id, targs) => {
                 let id = *id;
+                let m = self.args_subst(id, targs);
                 if let Some(sig) = self.types[id].methods.get(&name).cloned() {
                     let what = format!("`{n}`");
                     let dep = self
@@ -3012,21 +3640,19 @@ impl Checker<'_> {
                         .cloned();
                     let full = format!("`{}.{n}`", self.name(self.types[id].name));
                     self.warn_deprecated(dep.as_ref(), &full, span);
-                    self.check_args(&sig, args, block, span, &what);
-                    let ret = sig.ret.borrow().clone();
-                    return ret;
+                    return self.call_sig(&sig, m, args, block, span, &what, None);
                 }
                 if self.types[id].kind != TypeDeclKind::Class
                     && let Some(f) = self.types[id].fields.iter().find(|f| f.name == name)
                 {
-                    let ft = f.ty.clone();
-                    return self.call(&ft, args, block, span, None);
+                    let ft = self.subst(&f.ty, &m);
+                    return self.call(&ft, args, block, span, None, None);
                 }
             }
             Ty::Record(fs) => {
                 if let Some((_, t)) = fs.iter().find(|(m, _)| *m == name) {
                     let t = t.clone();
-                    return self.call(&t, args, block, span, None);
+                    return self.call(&t, args, block, span, None, None);
                 }
             }
             Ty::Variant(id) => {
@@ -3038,9 +3664,7 @@ impl Checker<'_> {
                         .cloned();
                     let full = format!("`{}.{n}`", self.name(self.enums[*id].name));
                     self.warn_deprecated(dep.as_ref(), &full, span);
-                    self.check_args(&sig, args, block, span, &what);
-                    let ret = sig.ret.borrow().clone();
-                    return ret;
+                    return self.call_sig(&sig, Subst::default(), args, block, span, &what, None);
                 }
             }
             Ty::EnumValue(id) => {
@@ -3377,6 +4001,7 @@ impl Checker<'_> {
 
     /// Types of a `for` loop's variables, depending on what is iterated.
     fn for_vars(&mut self, it: &Ty, n: usize, span: Span) -> Vec<Ty> {
+        let it = &self.view(it.clone());
         let elem: Ty = match it {
             Ty::List(t) => (**t).clone(),
             Ty::Range => Ty::Int,
@@ -3494,6 +4119,11 @@ fn value_ty(v: &Value) -> Ty {
 }
 
 /// Literals replaced by their type (`"a"` → `str`), recursively.
+/// Parameter of a function type (`(int): str`): a placeholder name, not interned.
+fn unnamed(s: Symbol) -> bool {
+    s.0 > u32::MAX - 4096
+}
+
 fn plain(t: &Ty) -> Ty {
     match t {
         Ty::LitStr(_) => Ty::Str,

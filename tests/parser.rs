@@ -394,3 +394,21 @@ fn private_and_protected() {
     );
     assert!(err("class A\n  protected x: int\nend").contains("expected `def` after `protected`"));
 }
+
+#[test]
+fn generics() {
+    assert_eq!(
+        sexp("def first(xs: [T]): T? forall T, U: Comparable(U) = xs[0]?"),
+        "(def first ((xs : [T])) : T? forall(T, U: Comparable(U)) (index? xs 0))"
+    );
+    assert_eq!(
+        sexp("class Box(T: Show) < Base(T, int)\n  include Comparable(Box(T))\nend"),
+        "(class Box(T: Show) < Base(T, int) (include Comparable(Box(T))))"
+    );
+    assert_eq!(
+        sexp("let b: Http::Cache(str, [int]) = c"),
+        "(let b : Http::Cache(str, [int]) c)"
+    );
+    // `(` attached to the name only: `Box (int)` is not a type argument.
+    assert!(err("let b: Box (int) = c").contains("expected `=`"));
+}

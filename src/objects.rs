@@ -30,6 +30,10 @@ pub struct TypeInfo {
     pub parent: Option<Rc<TypeInfo>>,
     /// Traits included, by the class or its ancestors.
     pub traits: Vec<Rc<TypeInfo>>,
+    /// Traits included by the class itself (`include`), in order.
+    pub includes: Vec<Rc<TypeInfo>>,
+    /// Type parameters and arguments (erased at run time; for the checker).
+    pub generics: Option<Rc<crate::ir::Generics>>,
     /// Methods still to be defined (`abstract def`). Empty for a class that can be
     /// instantiated.
     pub required: Vec<Required>,

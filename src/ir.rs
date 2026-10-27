@@ -15,7 +15,7 @@
 //! - Global variables (top level of a script, Rust functions) are slots of an
 //!   array (`GetGlobal`) that persist from one script to the next (REPL).
 
-use crate::ast::{BinOp, FnDecl, TypeDeclKind, TypeExpr, Visibility};
+use crate::ast::{BinOp, FnDecl, TypeDeclKind, TypeExpr, TypeParam, Visibility};
 use crate::intern::{Interner, Symbol};
 use crate::span::Span;
 use crate::value::Value;
@@ -277,6 +277,16 @@ pub enum Decl {
     Enum(Rc<EnumDeclIr>),
 }
 
+/// Type parameters and arguments of a generic declaration (`class Box(T) < Base(T)`,
+/// `include Comparable(T)`): erased at run time, kept for the checker of later scripts.
+#[derive(Debug, Default)]
+pub struct Generics {
+    pub params: Vec<TypeParam>,
+    pub parent_args: Vec<TypeExpr>,
+    /// Arguments of each `include`d trait, in order.
+    pub trait_args: Vec<Vec<TypeExpr>>,
+}
+
 pub struct TypeDeclIr {
     pub name: Symbol,
     pub kind: TypeDeclKind,
@@ -285,6 +295,8 @@ pub struct TypeDeclIr {
     pub parent: Option<(u32, u32)>,
     /// `include`d traits: their global slots.
     pub traits: Vec<u32>,
+    /// Generic declaration (or inheriting from / including a generic one).
+    pub generics: Option<Rc<Generics>>,
     /// `abstract def`s (no code; the declaration gives the signature to the checker).
     pub abstracts: Vec<Rc<crate::ast::FnDecl>>,
     pub is_abstract: bool,
