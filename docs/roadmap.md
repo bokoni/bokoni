@@ -215,10 +215,16 @@ Modeled on Crystal (see `syntax.md`, *Error handling*).
 
 In suggested order:
 
-1. **Modules / imports** between files.
-2. **Generics** (`[T]` in signatures): typed `map` / `filter` and user functions over
+Decided: two separate notions, unlike Crystal's single `module` — `module` for
+namespaces, `trait` for shared behavior.
+
+1. **Traits** (nominal, as Crystal's mixins): required methods (`abstract def`) and
+   default methods, included in classes; a trait is also a type (`x: Greet`,
+   `rescue e: Retryable`). Abstract classes reuse `abstract`.
+2. **Modules / imports**: `module Http … end`, `Http::Request`, `Http.get(…)`, and
+   loading of other files (through a callback of the host, for embedding).
+3. **Generics** (`[T]` in signatures): typed `map` / `filter` and user functions over
    lists; lets the typed JIT compile more code.
-3. **Traits / interfaces** and abstract methods, on top of single inheritance.
 4. **Crystal-style macros** (v3 of `syntax.md`): hygiene and AST exposure still open;
    benefit from generics and modules.
 
