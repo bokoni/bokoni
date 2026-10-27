@@ -1191,6 +1191,8 @@ fn hashes_records_tuples_in_native_code() {
         "def bad(h: {int => int}, k: int): int = h[k] + 1\nbad({1 => 2}, 3)",
         "def bad(): int\n  let (a, b) = (1, 2, 3)\n  a\nend\nbad()",
         "def bad(x: int): int\n  let h = {}\n  h[[x]] = 1\n  0\nend\nbad(1)",
+        // `for` with a pattern.
+        "def f(ps: [(int, (int, int))]): int\n  let t = 0\n  for (i, (a, b)) in ps\n    t += i * a + b\n  end\n  t\nend\nf([(1, (2, 3)), (4, (5, 6))])",
         // A value of any type speculated to be a number: an `int`, a `float`, then not.
         "def sum(h): float\n  let t = 0.0\n  for k, v in h\n    t += v\n  end\n  t\nend\n[sum({1 => 2, 2 => 3.5}), sum({\"a\" => 1.5})]",
         "def f(n: int): int\n  let h = {0 => 1, 1 => 2, 2 => \"x\"}\n  let t = 0\n  for i in 0...n\n    t += h[i] * 2\n  end\n  t\nend\n[f(2), f(3)]",

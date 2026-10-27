@@ -273,6 +273,12 @@ for i in 0..10                # 0..10 inclusive, 0...10 exclusive
   break if i > 7
   print(i)
 end
+
+for (name, age) in [("ann", 31), ("bob", 27)]   # destructured, as with `let`
+  print("#{name}: #{age}")
+end
+# also `for name, age in …` (a hash: its keys and values), `for (i, (a, b)) in …`,
+# `for {x, y} in points`, `for [first, ...rest] in rows`
 ```
 
 End-of-line modifiers: `expr if cond`, `expr unless cond`.

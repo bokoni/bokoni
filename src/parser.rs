@@ -1223,7 +1223,7 @@ impl Parser<'_, '_> {
                 })
             }
             _ => self.error_here(format!(
-                "expected a variable name after `let`, found {}",
+                "expected a variable name or a pattern, found {}",
                 self.found()
             )),
         }
@@ -2733,13 +2733,48 @@ impl Parser<'_, '_> {
 
     fn for_expr(&mut self) -> Result<ExprId> {
         let start = self.bump().span;
-        let mut vars = vec![self.ident("after `for`")?];
+        // `for a, b in`, `for (a, b) in`, or patterns: `for (i, (a, b)) in`,
+        // `for {x, y} in`.
+        if !matches!(self.peek(), T::Ident | T::LParen | T::LBrace | T::LBracket) {
+            self.ident("after `for`")?;
+        }
+        let mut items = vec![self.pattern()?];
         while self.eat(T::Comma) {
-            vars.push(self.ident("after `,`")?);
+            items.push(self.pattern()?);
+        }
+        if let [Pattern::Tuple(inner, _)] = &mut items[..] {
+            items = std::mem::take(inner);
         }
         self.expect(T::In, "after the `for` variables")?;
         let iter = self.loop_head("for")?;
-        let body = self.block_end("for", start)?;
+        let mut body = self.block_end("for", start)?;
+        // A variable per item; an item that is a pattern: a hidden one, destructured
+        // first thing in the body.
+        let mut vars = Vec::new();
+        let mut lets = Vec::new();
+        for (k, item) in items.into_iter().enumerate() {
+            match item {
+                Pattern::Name(name, span) => vars.push((name, span)),
+                pattern => {
+                    let span = pattern.span();
+                    let hidden = self.interner.intern(&format!("#item{k}"));
+                    vars.push((hidden, span));
+                    let value = self.ast.push(ExprKind::Ident(hidden), span);
+                    lets.push(Stmt {
+                        kind: StmtKind::Let(Box::new(Let {
+                            pattern,
+                            ty: None,
+                            value,
+                        })),
+                        span,
+                        vis: Visibility::Public,
+                    });
+                }
+            }
+        }
+        if !lets.is_empty() {
+            body.stmts.splice(0..0, lets);
+        }
         let span = self.span_from(start);
         Ok(self
             .ast

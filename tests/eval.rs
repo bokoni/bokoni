@@ -224,6 +224,24 @@ fn hashes() {
         "=> \"x=1 y=2\""
     );
     assert!(err("{[1] => 2}").1.contains("hash key"));
+    // `for` with a pattern, as `let`: a tuple, nested, a record, a list.
+    assert_eq!(
+        run(
+            "let h = {\"x\" => 1}\nlet s = []\nfor (k, v) in h\n  s << \"#{k}=#{v}\"\nend\nfor (a, b) in [(1, 2), (3, 4)]\n  s << a * b\nend\ns"
+        ),
+        "=> [\"x=1\", 2, 12]"
+    );
+    assert_eq!(
+        run(
+            "let s = []\nfor (i, (a, b)) in [(0, (1, 2)), (1, (3, 4))]\n  s << i * 100 + a * 10 + b\nend\nfor i, {x, y} in [(5, {x: 1, y: 2})]\n  s << i + x + y\nend\nfor [a, ...r] in [[1, 2, 3]]\n  s << r\nend\ns"
+        ),
+        "=> [12, 134, 8, [2, 3]]"
+    );
+    assert!(
+        err("for (i, (a, b)) in [(0, 5)]\n  a\nend")
+            .1
+            .contains("expected a tuple or list, got int")
+    );
 }
 
 #[test]
