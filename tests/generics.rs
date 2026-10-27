@@ -304,12 +304,13 @@ end
     // Not for every value: strings stay interpreted, same result.
     assert_eq!(e.eval_as::<String>("max(\"a\", \"b\")").unwrap(), "b");
     // Arguments that do not fit the copy (`T = int` from the first one; without static
-    // checks, which refuse it): interpreted.
+    // checks, which refuse it): that call goes through the interpreter, its result is
+    // checked when returned.
     e.set_static_checks(false);
     assert_eq!(e.eval_as::<f64>("max(1, 2.5)").unwrap(), 2.5);
     e.eval("def mixed(x: int): float = max(x, 2.5)").unwrap();
     assert_eq!(e.eval_as::<f64>("mixed(3)").unwrap(), 3.0);
-    assert!(!e.is_native("mixed"));
+    assert_eq!(e.eval_as::<f64>("mixed(7)").unwrap(), 7.0);
     e.set_static_checks(true);
     // Recursion: the typed copy calls itself.
     e.eval("def total(xs: [T], i: int): int forall T = if i >= xs.len() then 0 else 1 + total(xs, i + 1) end")

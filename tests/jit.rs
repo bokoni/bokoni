@@ -125,10 +125,13 @@ fn redefinition_invalidates_native_code() {
     e.eval("def sq(x: int): int = x * x * x").unwrap();
     assert_eq!(e.eval_as::<i64>("f(3)").unwrap(), 28);
     assert!(e.is_native("f"));
-    // `sq` can no longer be compiled: `f` is interpreted, still correct.
+    // `sq` can no longer be compiled: `f` calls it through the interpreter (its result
+    // checked when `f` returns it), still correct.
     e.eval("def sq(x) = x").unwrap();
     assert_eq!(e.eval_as::<i64>("f(3)").unwrap(), 4);
-    assert!(!e.is_native("f"));
+    assert!(e.is_native("f"));
+    e.eval("def sq(x) = 0.5").unwrap();
+    assert!(e.eval("f(3)").unwrap_err().to_string().contains("int"));
 }
 
 #[test]
@@ -1141,6 +1144,24 @@ fn closures_with_captured_variables() {
     ] {
         same(src);
     }
+    // Functions whose variables are captured by their lambdas.
+    for src in [
+        // A new cell on each turn: each closure its own `j`.
+        "def make_all(): int\n  let fs = []\n  for i in 0...5\n    let j = i * 10\n    fs << || j\n  end\n  fs.map(|f| f()).sum()\nend\nmake_all()",
+        // Resumed in the interpreter after the closure was created: same cells.
+        "let g = 1\ndef run()\n  let total = 0\n  let add = |x| total += x\n  for i in 0...20\n    add(g)\n    g = 1.5 if i == 10\n  end\n  [total, add(0)]\nend\nrun()",
+        "def run(n: int): int\n  let seen = 0\n  let f = |x: int| seen = seen + 1\n  let t = 0\n  for i in 0...n\n    f(i)\n    t += [1, 2][i]\n  end\n  t + seen\nend\nrun(5)",
+        "def lazy(): int\n  let f = || y * 2\n  let y = 21\n  f()\nend\nlazy()",
+    ] {
+        same(src);
+    }
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    e.eval("def run(): int\n  let total = 0\n  let add = |x: int| total += x\n  for i in 0...100\n    add(i)\n  end\n  total\nend\ndef scale(xs: [int], m: int): int = xs.map(|x| x * m).sum()")
+        .unwrap();
+    assert_eq!(e.eval_as::<i64>("run() + scale([1, 2], 3)").unwrap(), 4959);
+    assert!(e.is_native("run"));
+    assert!(e.is_native("scale"));
     // The closure called in the loop is compiled.
     let mut e = Engine::new();
     e.set_output(|_| {});

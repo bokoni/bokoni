@@ -132,7 +132,7 @@ pub struct Runtime {
     /// Free register windows, reused from one call to the next (no per-call allocation
     /// in steady state).
     frames: Vec<Vec<Value>>,
-    no_ctx: Rc<[u32]>,
+    pub(crate) no_ctx: Rc<[u32]>,
     /// Native compilation of typed functions (created on first use).
     pub jit_enabled: bool,
     /// Baseline compilation from the first call (tests).
@@ -462,10 +462,11 @@ impl Runtime {
     // ─── Execution ───────────────────────────────────────────────────────────
 
     fn exec(&mut self, proto: &Proto, upvals: &[Cell], ctx: &Rc<[u32]>, regs: &mut [Value]) -> R {
-        self.exec_at(proto, upvals, ctx, regs, 0, 0)
+        self.exec_at(proto, upvals, ctx, regs, 0, 0, None)
     }
 
     /// Runs `proto` from instruction `k0` of block `b0` (resumption of native code).
+    #[allow(clippy::too_many_arguments)]
     fn exec_at(
         &mut self,
         proto: &Proto,
@@ -474,10 +475,14 @@ impl Runtime {
         regs: &mut [Value],
         b0: usize,
         k0: usize,
+        cells: Option<Vec<Cell>>,
     ) -> R {
-        let mut cells: Vec<Cell> = (0..proto.ncells)
-            .map(|_| Rc::new(RefCell::new(Value::Uninit)))
-            .collect();
+        // (Resumption of native code: its cells, shared with the lambdas it created.)
+        let mut cells: Vec<Cell> = cells.unwrap_or_else(|| {
+            (0..proto.ncells)
+                .map(|_| Rc::new(RefCell::new(Value::Uninit)))
+                .collect()
+        });
         #[cfg(feature = "jit")]
         if b0 == 0
             && k0 == 0
@@ -1570,6 +1575,7 @@ impl Runtime {
     /// from instruction `instr` of block `block`, with the registers rebuilt, at call
     /// depth `depth`.
     #[cfg(feature = "jit")]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn resume(
         &mut self,
         proto: &Rc<Proto>,
@@ -1578,11 +1584,21 @@ impl Runtime {
         instr: u32,
         depth: usize,
         upvals: &[Cell],
+        cells: Vec<Cell>,
     ) -> R {
         let saved = self.depth;
         self.depth = depth;
         let ctx = self.no_ctx.clone();
-        let r = self.exec_at(proto, upvals, &ctx, regs, block as usize, instr as usize);
+        let cells = (proto.ncells > 0).then_some(cells);
+        let r = self.exec_at(
+            proto,
+            upvals,
+            &ctx,
+            regs,
+            block as usize,
+            instr as usize,
+            cells,
+        );
         self.depth = saved;
         r.map_err(|e| attach_src(e, &proto.script))
     }

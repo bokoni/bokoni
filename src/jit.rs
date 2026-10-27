@@ -48,7 +48,9 @@
 //!   the main program are outlined into functions (`outline.rs`) to be compiled.
 //! - A closure's captured variables (its cells) are passed by its caller in
 //!   `JitCtx::env`, read on entry; one of a simple type is read and written in place in
-//!   its cell. A function whose own variables are captured is not compiled.
+//!   its cell. A function's own cells are in its native frame (created on entry, dropped
+//!   on exit, given to the interpreter on a resumption); its lambdas are built by a
+//!   helper (`bk_closure`).
 //!
 //! Internal calling convention: `fn(ctx, params…) -> (status, result)`, status 0 = success,
 //! 1 = error (described in `ctx`). Each function also has an entry point for Rust:
@@ -86,6 +88,8 @@ pub struct JitCtx {
     /// Variables captured by the function called (its closure's cells): set by its
     /// caller, read by the function on entry.
     pub env: *const crate::vm::Cell,
+    /// The function's own cells (variables captured by its lambdas), for a resumption.
+    pub cells: *const crate::vm::Cell,
     /// Call stack of the error (indices into the call table), most recent first.
     pub traces: Vec<u32>,
     /// The runtime, for a resumption in the interpreter (`bk_resume`).
@@ -107,6 +111,7 @@ const DEPTH_OFFSET: i32 = 0;
 const MAX_DEPTH_OFFSET: i32 = 8;
 const ERR_OFFSET: i32 = 16;
 const ENV_OFFSET: i32 = 24;
+const CELLS_OFFSET: i32 = 32;
 
 #[derive(Clone, Copy)]
 enum ErrKind {
@@ -291,7 +296,21 @@ extern "C" fn bk_resume(
         } else {
             std::slice::from_raw_parts((*ctx).env, p.captures.len())
         };
-        let r = (*rt).resume(p, &mut regs, site.block, site.instr, saved.0 as usize, env);
+        // Its cells: shared with the lambdas created before (set by its native code).
+        let cells: Vec<crate::vm::Cell> = if p.ncells == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts((*ctx).cells, p.ncells as usize).to_vec()
+        };
+        let r = (*rt).resume(
+            p,
+            &mut regs,
+            site.block,
+            site.instr,
+            saved.0 as usize,
+            env,
+            cells,
+        );
         (*ctx).depth = saved.0;
         (*ctx).max_depth = saved.1;
         (*ctx).err = saved.2;
@@ -902,6 +921,65 @@ extern "C" fn bk_global_word(ctx: *mut JitCtx, slot: u32, tag: i32, out: *mut u6
     }
 }
 
+/// `n` new cells (not initialized yet) at `cells`: those of a function on entry.
+extern "C" fn bk_cells_init(cells: *mut crate::vm::Cell, n: u64) {
+    // SAFETY: `cells` is a frame slot of `n` cells, not initialized.
+    unsafe {
+        for i in 0..n as usize {
+            cells
+                .add(i)
+                .write(Rc::new(std::cell::RefCell::new(Value::Uninit)));
+        }
+    }
+}
+
+/// Drops the `n` cells at `cells` (before every exit).
+extern "C" fn bk_cells_drop(cells: *mut crate::vm::Cell, n: u64) {
+    // SAFETY: `cells` holds `n` cells written by `bk_cells_init`.
+    unsafe {
+        for i in 0..n as usize {
+            std::ptr::drop_in_place(cells.add(i));
+        }
+    }
+}
+
+/// A new cell `c` (a variable declared again, in a loop).
+extern "C" fn bk_cell_new(cells: *mut crate::vm::Cell, c: u32) {
+    // SAFETY: as for `bk_cells_drop`.
+    unsafe {
+        *cells.add(c as usize) = Rc::new(std::cell::RefCell::new(Value::Uninit));
+    }
+}
+
+/// The closure of `child` into the slot `out`: its captured variables from the cells of
+/// the function (`cells`) and its own captured variables (`env`).
+extern "C" fn bk_closure(
+    ctx: *mut JitCtx,
+    child: *const Rc<Proto>,
+    cells: *const crate::vm::Cell,
+    env: *const crate::vm::Cell,
+    out: *mut Value,
+) {
+    // SAFETY: `child` is an element of the compiled function's `children`; `cells` and
+    // `env` hold the cells its captures refer to; `out` is a slot of the frame.
+    unsafe {
+        let child = (*child).clone();
+        let upvals: Box<[crate::vm::Cell]> = child
+            .captures
+            .iter()
+            .map(|c| match c {
+                crate::ir::Capture::Cell(c) => (*cells.add(*c as usize)).clone(),
+                crate::ir::Capture::Up(u) => (*env.add(*u as usize)).clone(),
+            })
+            .collect();
+        *out = Value::Function(Rc::new(Function::Script(crate::vm::Closure {
+            proto: child,
+            upvals,
+            ctx: (*(*ctx).rt).no_ctx.clone(),
+        })));
+    }
+}
+
 /// Offset of the value in a captured variable's cell (`Rc<RefCell<Value>>`), from the
 /// address its `Rc` holds: `None` if a cell cannot be read in place.
 fn cell_value_off() -> Option<i32> {
@@ -1338,7 +1416,7 @@ pub struct Jit {
     str_fns: [FuncId; 4],
     /// `bk_call_boxed`, `bk_binary`, `bk_truthy`, `bk_global`, `bk_box_into`,
     /// `bk_new_object`, `bk_init_done`.
-    boxed_fns: [FuncId; 14],
+    boxed_fns: [FuncId; 18],
     /// Calls through the interpreter (addresses held by native code).
     #[allow(clippy::vec_box)]
     boxed_calls: Vec<Box<BoxedCall>>,
@@ -1446,7 +1524,8 @@ fn ret_jty(anns: &mut Vec<RtType>, q: &Proto) -> JTy {
 fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
     let method = p.kind == ProtoKind::Method;
     let function = matches!(p.kind, ProtoKind::Function | ProtoKind::Lambda);
-    if !(function || method) || p.ncells != 0 {
+    // A function whose variables are captured: its lambdas get no `do` block context.
+    if !(function || method) || (p.ncells != 0 && uses_ctx(p)) {
         return None;
     }
     let mut params = Vec::new();
@@ -1466,6 +1545,16 @@ fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
         None => RegTy::Value,
     };
     Some((params, ret))
+}
+
+/// `p` or one of its nested functions reads the context of a `do` block.
+fn uses_ctx(p: &Proto) -> bool {
+    p.blocks.iter().flat_map(|b| &b.instrs).any(|i| {
+        matches!(
+            i,
+            Instr::GetNamed { .. } | Instr::SetNamed { .. } | Instr::CtxField(..)
+        )
+    }) || p.children.iter().any(|c| uses_ctx(c))
 }
 
 /// Annotation of parameter `i`.
@@ -1796,9 +1885,20 @@ impl Analysis<'_> {
             Not(_, a) if g(*a)? == JTy::Boxed => JTy::Bool,
             // A global: a function called (its value read when calling), or a value: of
             // the simple type of its current value (checked on every read), or any.
+            // (Watched: a redefinition invalidates this code, which may call it directly.)
             GetGlobal(_, slot) => match &self.globals.at(*slot).value {
-                Some(Value::Function(_)) => return Some(Some(JTy::Callee(*slot))),
-                Some(Value::Type(_)) => return Some(Some(JTy::Ctor(*slot))),
+                Some(Value::Function(_)) => {
+                    if !self.callees.contains(slot) {
+                        self.callees.push(*slot);
+                    }
+                    return Some(Some(JTy::Callee(*slot)));
+                }
+                Some(Value::Type(_)) => {
+                    if !self.ctors.contains(slot) {
+                        self.ctors.push(*slot);
+                    }
+                    return Some(Some(JTy::Ctor(*slot)));
+                }
                 Some(Value::Int(_)) if !forced => JTy::Int,
                 Some(Value::Float(_)) if !forced => JTy::Float,
                 Some(Value::Bool(_)) if !forced => JTy::Bool,
@@ -1821,7 +1921,11 @@ impl Analysis<'_> {
                 Some(Value::Bool(_)) if !forced => JTy::Bool,
                 _ => JTy::Boxed,
             },
-            SetUp(_, a) if word(g(*a)?) => return Some(None),
+            SetUp(_, a) | SetCell(_, a) if word(g(*a)?) => return Some(None),
+            // The function's own cells (variables captured by its lambdas): any value.
+            GetCell(..) => JTy::Boxed,
+            NewCell(_) => return Some(None),
+            Closure(..) => JTy::Boxed,
             _ => return None,
         };
         self.boxed.insert(ins as *const Instr as usize);
@@ -2417,6 +2521,8 @@ fn analyze(
                 Term::IfInt { a, b: y, .. } => g(*a) == Some(JTy::Int) && g(*y) == Some(JTy::Int),
                 Term::IfIntK { a, .. } => g(*a) == Some(JTy::Int),
                 Term::Return { reg, .. } => match ret {
+                    // Any value (read from a cell…) for a simple result: its tag checked.
+                    RegTy::Int | RegTy::Float | RegTy::Bool if g(*reg) == Some(JTy::Boxed) => true,
                     RegTy::Float => num(*reg),
                     // Not annotated: any value (boxed when returned).
                     _ if ret_jty == JTy::Boxed => matches!(
@@ -2506,8 +2612,9 @@ fn reads_writes(p: &Proto, ins: &Instr) -> Option<(Vec<Reg>, Option<Reg>)> {
             (vec![*a, *b], Some(*d))
         }
         IterNew { dst, src, .. } => (vec![*src], Some(*dst)),
-        SetGlobal(_, a) | SetUp(_, a) => (vec![*a], None),
-        GetUp(d, _) => (vec![], Some(*d)),
+        SetGlobal(_, a) | SetUp(_, a) | SetCell(_, a) => (vec![*a], None),
+        GetUp(d, _) | GetCell(d, _) | Closure(d, _) => (vec![], Some(*d)),
+        NewCell(_) => (vec![], None),
         List(d, start, n) => ((*start..*start + *n).collect(), Some(*d)),
         FieldAt(d, a, _) => (vec![*a], Some(*d)),
         SetFieldAt { obj, src, .. } => (vec![*obj, *src], None),
@@ -2603,6 +2710,10 @@ impl Jit {
         builder.symbol("bk_up_word", bk_up_word as *const u8);
         builder.symbol("bk_assign_up", bk_assign_up as *const u8);
         builder.symbol("bk_global_env", bk_global_env as *const u8);
+        builder.symbol("bk_cells_init", bk_cells_init as *const u8);
+        builder.symbol("bk_cells_drop", bk_cells_drop as *const u8);
+        builder.symbol("bk_cell_new", bk_cell_new as *const u8);
+        builder.symbol("bk_closure", bk_closure as *const u8);
         builder.symbol("bk_assign_global", bk_assign_global as *const u8);
         builder.symbol("bk_box_into", bk_box_into as *const u8);
         builder.symbol("bk_new_object", bk_new_object as *const u8);
@@ -2765,6 +2876,10 @@ impl Jit {
                 types::INVALID,
             ),
             ("bk_global_env", &[ptr, types::I32, ptr][..], types::I32),
+            ("bk_cells_init", &[ptr, types::I64][..], types::INVALID),
+            ("bk_cells_drop", &[ptr, types::I64][..], types::INVALID),
+            ("bk_cell_new", &[ptr, types::I32][..], types::INVALID),
+            ("bk_closure", &[ptr, ptr, ptr, ptr, ptr][..], types::INVALID),
             (
                 "bk_assign_global",
                 &[ptr, types::I32, types::I64, types::I32, types::I64][..],
@@ -2780,7 +2895,7 @@ impl Jit {
             }
             boxed_fns.push(module.declare_function(name, Linkage::Import, &sig).ok()?);
         }
-        let boxed_fns: [FuncId; 14] = boxed_fns.try_into().ok()?;
+        let boxed_fns: [FuncId; 18] = boxed_fns.try_into().ok()?;
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr));
         sig.params.push(AbiParam::new(ptr));
@@ -2816,6 +2931,7 @@ impl Jit {
                 max_depth: 0,
                 err: -1,
                 env: std::ptr::null(),
+                cells: std::ptr::null(),
                 traces: Vec::new(),
                 rt: std::ptr::null_mut(),
                 pending: None,
@@ -3054,6 +3170,10 @@ impl Jit {
             up_word_ref,
             set_up_ref,
             global_env_ref,
+            cells_init_ref,
+            cells_drop_ref,
+            cell_new_ref,
+            closure_ref,
             set_global_ref,
         ] = self
             .boxed_fns
@@ -3158,6 +3278,7 @@ impl Jit {
                         // (Drops the old value.)
                         | Instr::SetGlobal(..)
                         | Instr::SetUp(..)
+                        | Instr::SetCell(..)
                 )
         });
         let mut written = vec![false; nregs];
@@ -3290,6 +3411,18 @@ impl Jit {
         } else {
             bx.ins().iconst(types::I64, 0)
         };
+        // Its own cells (variables captured by its lambdas), created on entry.
+        let ncells = p.ncells as i64;
+        let cells_slot = bx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            (ncells.max(1) * 8) as u32,
+            3,
+        ));
+        let cellsv = bx.ins().stack_addr(types::I64, cells_slot, 0);
+        if ncells > 0 {
+            let n = bx.ins().iconst(types::I64, ncells);
+            bx.ins().call(cells_init_ref, &[cellsv, n]);
+        }
         let live = liveness(p);
         // Checks on entry (until the first block): see `DeoptSite::entry`.
         let mut in_entry = true;
@@ -3388,8 +3521,16 @@ impl Jit {
                     $bx.ins()
                         .store(MemFlagsData::trusted(), envv, ctxv, ENV_OFFSET);
                 }
+                if ncells > 0 {
+                    $bx.ins()
+                        .store(MemFlagsData::trusted(), cellsv, ctxv, CELLS_OFFSET);
+                }
                 let call = $bx.ins().call(resume_ref, &[ctxv, sp, buf, outp]);
                 let status = $bx.inst_results(call)[0];
+                if ncells > 0 {
+                    let n = $bx.ins().iconst(types::I64, ncells);
+                    $bx.ins().call(cells_drop_ref, &[cellsv, n]);
+                }
                 if nslots > 0 {
                     let base = $bx.ins().stack_addr(types::I64, vals, 0);
                     let n = $bx.ins().iconst(types::I64, nslots as i64);
@@ -3624,6 +3765,10 @@ impl Jit {
                     let base = $bx.ins().stack_addr(types::I64, vals, 0);
                     let n = $bx.ins().iconst(types::I64, nslots as i64);
                     $bx.ins().call(drop_ref, &[base, n]);
+                }
+                if ncells > 0 {
+                    let n = $bx.ins().iconst(types::I64, ncells);
+                    $bx.ins().call(cells_drop_ref, &[cellsv, n]);
                 }
             }};
         }
@@ -4036,6 +4181,31 @@ impl Jit {
                             }
                         };
                         bx.def_var(dvar!(*d), v);
+                    }
+                    NewCell(c) => {
+                        let cv = bx.ins().iconst(types::I32, *c as i64);
+                        bx.ins().call(cell_new_ref, &[cellsv, cv]);
+                    }
+                    GetCell(d, c) => {
+                        let out = own!(bx, *d);
+                        let cv = bx.ins().iconst(types::I32, *c as i64);
+                        let call = bx.ins().call(up_get_ref, &[cellsv, cv, out]);
+                        let bad = bx.inst_results(call)[0];
+                        bail!(bx, bad);
+                        bx.def_var(dvar!(*d), out);
+                    }
+                    SetCell(c, a) => {
+                        let (w, k) = boxed_word!(bx, *a);
+                        let cv = bx.ins().iconst(types::I32, *c as i64);
+                        let k = bx.ins().iconst(types::I32, dkind_code(k));
+                        bx.ins().call(set_up_ref, &[ctxv, cellsv, cv, w, k]);
+                    }
+                    Closure(d, i) => {
+                        let out = own!(bx, *d);
+                        let child = &p.children[*i as usize] as *const Rc<Proto>;
+                        let cp = bx.ins().iconst(types::I64, child as i64);
+                        bx.ins().call(closure_ref, &[ctxv, cp, cellsv, envv, out]);
+                        bx.def_var(dvar!(*d), out);
                     }
                     GetUp(d, u) => {
                         let out = own!(bx, *d);
@@ -4855,6 +5025,43 @@ impl Jit {
                     let c = bx.ins().icmp_imm_s(int_cc(*op), x, *k);
                     bx.ins()
                         .brif(c, blocks[*then as usize], &[], blocks[*else_ as usize], &[]);
+                }
+                // Any value for a simple result: its payload if it has that type, otherwise
+                // resumed in the interpreter at the `return` (which converts or fails).
+                Term::Return { reg, .. }
+                    if ret != RegTy::Value && tyof!(*reg) == Some(JTy::Boxed) =>
+                {
+                    use crate::value::layout::{TAG_BOOL, TAG_FLOAT, TAG_INT};
+                    let v = bx.use_var(uvar!(*reg));
+                    let tag = bx.ins().load(types::I8, MemFlagsData::trusted(), v, 0);
+                    let raw = bx
+                        .ins()
+                        .load(types::I64, MemFlagsData::trusted(), v, PAYLOAD);
+                    let r = match ret {
+                        RegTy::Int => {
+                            let bad = bx.ins().icmp_imm_s(IntCC::NotEqual, tag, TAG_INT as i64);
+                            bail!(bx, bad);
+                            raw
+                        }
+                        RegTy::Bool => {
+                            let bad = bx.ins().icmp_imm_s(IntCC::NotEqual, tag, TAG_BOOL as i64);
+                            bail!(bx, bad);
+                            bx.ins().ireduce(types::I8, raw)
+                        }
+                        _ => {
+                            let isf = bx.ins().icmp_imm_s(IntCC::Equal, tag, TAG_FLOAT as i64);
+                            let isi = bx.ins().icmp_imm_s(IntCC::Equal, tag, TAG_INT as i64);
+                            let ok = bx.ins().bor(isf, isi);
+                            let bad = bx.ins().icmp_imm_s(IntCC::Equal, ok, 0);
+                            bail!(bx, bad);
+                            let f = bx.ins().bitcast(types::F64, MemFlagsData::new(), raw);
+                            let i = bx.ins().fcvt_from_sint(types::F64, raw);
+                            bx.ins().select(isf, f, i)
+                        }
+                    };
+                    drop_slots!(bx);
+                    let ok = bx.ins().iconst(types::I32, 0);
+                    bx.ins().return_(&[ok, r]);
                 }
                 // Result not annotated, of a simple type (or `nil`): a value in the slot.
                 Term::Return { reg, .. }

@@ -631,7 +631,6 @@ impl Proto {
     pub fn untyped(&self) -> bool {
         matches!(self.kind, ProtoKind::Function | ProtoKind::Lambda)
             && self.spec.is_none()
-            && self.ncells == 0
             && !self.is_generic()
             && self.params.iter().any(|p| p.ty.is_none())
     }
