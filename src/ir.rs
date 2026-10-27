@@ -91,9 +91,33 @@ pub struct Proto {
     pub handlers: Vec<Handler>,
     /// Number of slots where a handler keeps the error it caught (`Term::Reraise`).
     pub nslots: u32,
-    /// `forall` function: its copies typed for given type arguments (`T = int`), for
-    /// the typed JIT.
+    /// `forall` function, or method of a generic class: its copies typed for given type
+    /// arguments (`T = int`), for the typed JIT.
     pub specs: std::cell::RefCell<Vec<(Vec<RtType>, Rc<Proto>)>>,
+    /// Method of a generic class (`class Box(T)`): the names of its type parameters.
+    pub class_params: Vec<Symbol>,
+    /// Typed copy (`specialize`): the type parameters replaced, and by what.
+    pub spec: Option<Rc<Spec>>,
+}
+
+/// Type parameters of a typed copy of a function, and their types.
+#[derive(Debug)]
+pub struct Spec {
+    pub names: Vec<Symbol>,
+    pub tys: Vec<RtType>,
+}
+
+impl Spec {
+    /// Type of annotation `expr` when it is one of the parameters (`T`).
+    pub fn param_ty(&self, expr: &TypeExpr) -> Option<&RtType> {
+        match &expr.kind {
+            crate::ast::TypeKind::Named(p) if p.len() == 1 => {
+                let i = self.names.iter().position(|n| *n == p[0])?;
+                Some(&self.tys[i])
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Where an error raised in a block goes (`begin … rescue` / `ensure`).
@@ -586,35 +610,31 @@ impl Proto {
     /// Type arguments of this `forall` function for a call, each found from a parameter
     /// written `T` or `[T]` (`arg(k)`: type of argument `k`); `None` if one is unknown.
     pub fn type_args(&self, arg: &dyn Fn(usize) -> Option<RtType>) -> Option<Vec<RtType>> {
+        let names: Vec<Symbol> = self.decl.as_ref()?.forall.iter().map(|p| p.name).collect();
+        names.iter().map(|n| self.type_arg(*n, arg)).collect()
+    }
+
+    /// Type of parameter `name`, found from a parameter written `name` or `[name]`.
+    pub fn type_arg(&self, name: Symbol, arg: &dyn Fn(usize) -> Option<RtType>) -> Option<RtType> {
         use crate::ast::TypeKind;
-        let decl = self.decl.as_ref()?;
-        decl.forall
-            .iter()
-            .map(|tp| {
-                let is_t =
-                    |e: &TypeExpr| matches!(&e.kind, TypeKind::Named(p) if p[..] == [tp.name]);
-                self.params.iter().enumerate().find_map(|(k, p)| {
-                    let e = &p.ty.as_ref()?.expr;
-                    match &e.kind {
-                        _ if is_t(e) => arg(k),
-                        TypeKind::List(x) if is_t(x) => match arg(k)? {
-                            RtType::List(t) => Some(*t),
-                            _ => None,
-                        },
-                        _ => None,
-                    }
-                })
-            })
-            .collect()
+        let is_t = |e: &TypeExpr| matches!(&e.kind, TypeKind::Named(p) if p[..] == [name]);
+        self.params.iter().enumerate().find_map(|(k, p)| {
+            let e = &p.ty.as_ref()?.expr;
+            match &e.kind {
+                _ if is_t(e) => arg(k),
+                TypeKind::List(x) if is_t(x) => match arg(k)? {
+                    RtType::List(t) => Some(*t),
+                    _ => None,
+                },
+                _ => None,
+            }
+        })
     }
 
     /// Copy of this `forall` function with its type parameters replaced by `tys` in the
     /// annotations of its parameters and its return (created once per `tys`). Same code:
     /// only the typed JIT, which reads the annotations, sees a difference.
     pub fn specialize(&self, tys: &[RtType]) -> Rc<Proto> {
-        if let Some((_, p)) = self.specs.borrow().iter().find(|(k, _)| k == tys) {
-            return p.clone();
-        }
         let names: Vec<Symbol> = self
             .decl
             .as_ref()
@@ -623,8 +643,17 @@ impl Proto {
             .iter()
             .map(|p| p.name)
             .collect();
+        self.specialize_as(&names, tys)
+    }
+
+    /// Same, for the parameters `names` (always the same ones for a given function: those
+    /// of its class for a method).
+    pub fn specialize_as(&self, names: &[Symbol], tys: &[RtType]) -> Rc<Proto> {
+        if let Some((_, p)) = self.specs.borrow().iter().find(|(k, _)| k == tys) {
+            return p.clone();
+        }
         let sub = |t: &TypeRef| TypeRef {
-            ty: Rc::new(subst_rt(&t.expr, &t.ty, &names, tys)),
+            ty: Rc::new(subst_rt(&t.expr, &t.ty, names, tys)),
             ..t.clone()
         };
         let p = Rc::new(Proto {
@@ -662,6 +691,11 @@ impl Proto {
             handlers: self.handlers.clone(),
             nslots: self.nslots,
             specs: Default::default(),
+            class_params: self.class_params.clone(),
+            spec: Some(Rc::new(Spec {
+                names: names.to_vec(),
+                tys: tys.to_vec(),
+            })),
         });
         self.specs.borrow_mut().push((tys.to_vec(), p.clone()));
         p

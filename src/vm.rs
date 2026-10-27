@@ -219,6 +219,10 @@ impl Runtime {
     /// caller's registers.
     pub(crate) fn invoke_regs(&mut self, c: &Closure, args: &[Value], span: Span) -> R {
         #[cfg(feature = "jit")]
+        if let Some(r) = self.native_fast(&c.proto, None, args, span) {
+            return r;
+        }
+        #[cfg(feature = "jit")]
         if let Some(r) = self.invoke_native(c, args, span) {
             return r;
         }
@@ -713,6 +717,40 @@ impl Runtime {
                 access,
             } => {
                 let site = &proto.calls[*site as usize];
+                // Declared method already compiled: called directly.
+                #[cfg(feature = "jit")]
+                if self.jit_enabled
+                    && site.named.is_empty()
+                    && !site.block
+                    && let Value::Object(o) = &reg!(*recv)
+                {
+                    let m = {
+                        let b = o.borrow();
+                        let info = &b.info;
+                        // A `type`'s field holding a function is called instead.
+                        let plain =
+                            info.kind == TypeDeclKind::Class || info.field_index(*name).is_none();
+                        plain.then(|| info.methods.get(name).cloned()).flatten()
+                    };
+                    if let Some(m) = m
+                        && (m.vis == Visibility::Public || *access == Access::THIS)
+                    {
+                        let start = site.start as usize;
+                        let args = &regs[start..start + site.npos as usize];
+                        let this = &regs[*recv as usize];
+                        // Method of a generic class: its copy for these fields and arguments.
+                        let m = match m.class_params.is_empty() {
+                            true => Some(m),
+                            false => method_spec(&m, this, args),
+                        };
+                        if let Some(m) = m
+                            && let Some(r) = self.native_fast(&m, Some(this), args, span)
+                        {
+                            reg!(*dst) = r?;
+                            return Ok(());
+                        }
+                    }
+                }
                 let r = reg!(*recv).clone();
                 // Value with no declared method or field (string, list, number…): built-in
                 // method, directly.
@@ -1307,6 +1345,60 @@ impl Runtime {
         }
     }
 
+    /// Direct call of the typed native code of `proto`, already compiled, when the
+    /// arguments are of exactly its native types (`int`, `float`, `bool`; `this` first for
+    /// a method): no frame, no conversion. `None`: general path (which also produces the
+    /// errors of wrong arguments).
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn native_fast(
+        &mut self,
+        proto: &Rc<Proto>,
+        this: Option<&Value>,
+        args: &[Value],
+        span: Span,
+    ) -> Option<R> {
+        let r = {
+            let state = proto.jit.borrow();
+            let JitState::Native(code) = &*state else {
+                return None;
+            };
+            let skip = this.is_some() as usize;
+            if code.params.len() != skip + args.len() || self.depth + 1 >= self.max_depth {
+                return None;
+            }
+            let exact = code.params[skip..].iter().zip(args).all(|(t, v)| {
+                matches!(
+                    (t, v),
+                    (RegTy::Int, Value::Int(_))
+                        | (RegTy::Float, Value::Float(_))
+                        | (RegTy::Bool, Value::Bool(_))
+                )
+            });
+            if !exact {
+                return None;
+            }
+            let jit = self.jit.as_mut()?;
+            match jit.call(
+                code,
+                this.into_iter().chain(args),
+                self.depth + 1,
+                self.max_depth,
+            ) {
+                Some(r) => r,
+                None => {
+                    // Assumption failed: the function stays interpreted.
+                    if jit.bailed {
+                        drop(state);
+                        *proto.jit.borrow_mut() = JitState::Rejected;
+                    }
+                    return None;
+                }
+            }
+        };
+        Some(r.map_err(|e| self.traced(e, proto, span)))
+    }
+
     /// Runs `proto` natively if it is (or becomes) compiled; `None` otherwise.
     #[cfg(feature = "jit")]
     fn try_jit(&mut self, proto: &Rc<Proto>, regs: &[Value]) -> Option<R> {
@@ -1318,10 +1410,23 @@ impl Runtime {
             ProtoKind::Method if matches!(regs[0], Value::Object(_)) => true,
             _ => return None,
         };
-        // `forall` function: its copy typed for these arguments (`T = int`).
+        let declared = proto;
+        // `forall` function, method of a generic class: its copy typed for these
+        // arguments and fields (`T = int`).
         let spec;
         let proto = if proto.is_generic() {
             spec = specialization(proto, regs)?;
+            &spec
+        } else if method && !proto.class_params.is_empty() {
+            let args: Vec<Value> = proto
+                .params
+                .iter()
+                .map(|p| regs[p.reg as usize].clone())
+                .collect();
+            spec = method_spec(proto, &regs[0], &args)?;
+            if !fits_params(&spec, regs) {
+                return None;
+            }
             &spec
         } else {
             proto
@@ -1332,7 +1437,7 @@ impl Runtime {
                 Value::Object(o) if method => {
                     let info = o.borrow().info.clone();
                     let name = proto.decl.as_ref()?.name;
-                    Some(crate::objects::method_owner(&info, name, proto))
+                    Some(crate::objects::method_owner(&info, name, declared))
                 }
                 _ => None,
             };
@@ -1990,14 +2095,25 @@ impl TypeInfo {
 /// its annotations are `any`). `None`: no typed copy for these arguments.
 #[cfg(feature = "jit")]
 fn specialization(proto: &Rc<Proto>, regs: &[Value]) -> Option<Rc<Proto>> {
-    fn simple(v: &Value) -> Option<RtType> {
+    let arg = |k: usize| {
+        let v = &regs[proto.params.get(k)?.reg as usize];
         match v {
-            Value::Int(_) => Some(RtType::Int),
-            Value::Float(_) => Some(RtType::Float),
-            Value::Bool(_) => Some(RtType::Bool),
-            _ => None,
+            Value::List(l) => {
+                let first = simple_ty(l.borrow().first()?)?;
+                Some(RtType::List(Box::new(first)))
+            }
+            v => simple_ty(v),
         }
-    }
+    };
+    let tys = proto.type_args(&arg)?;
+    let spec = proto.specialize(&tys);
+    fits_params(&spec, regs).then_some(spec)
+}
+
+/// The arguments in `regs` are exactly of the types of the parameters of typed copy
+/// `spec` (`int` for an `int`, a list of `int` for an `[int]`…).
+#[cfg(feature = "jit")]
+fn fits_params(spec: &Proto, regs: &[Value]) -> bool {
     fn fits(v: &Value, t: &RtType) -> bool {
         match (t, v) {
             (RtType::Int, Value::Int(_))
@@ -2008,23 +2124,59 @@ fn specialization(proto: &Rc<Proto>, regs: &[Value]) -> Option<Rc<Proto>> {
             _ => false,
         }
     }
-    let arg = |k: usize| {
-        let v = &regs[proto.params.get(k)?.reg as usize];
-        match v {
-            Value::List(l) => {
-                let first = simple(l.borrow().first()?)?;
-                Some(RtType::List(Box::new(first)))
-            }
-            v => simple(v),
-        }
-    };
-    let tys = proto.type_args(&arg)?;
-    let spec = proto.specialize(&tys);
-    let ok = spec.params.iter().all(|p| match &p.ty {
+    spec.params.iter().all(|p| match &p.ty {
         Some(t) => fits(&regs[p.reg as usize], &t.ty),
         None => true,
-    });
-    ok.then_some(spec)
+    })
+}
+
+/// Typed copy of method `m` of a generic class for `this` and its arguments: each type
+/// parameter found from the first field written `T` (the class's fields come first), or
+/// from a parameter. `None` if one is not a simple type.
+#[cfg(feature = "jit")]
+fn method_spec(m: &Rc<Proto>, this: &Value, args: &[Value]) -> Option<Rc<Proto>> {
+    let Value::Object(o) = this else {
+        return None;
+    };
+    let o = o.borrow();
+    let deduce = |n: Symbol| {
+        let field = o.info.fields.iter().zip(&o.fields).find(|(f, _)| {
+            f.ty.as_ref().is_some_and(
+                |t| matches!(&t.expr.kind, crate::ast::TypeKind::Named(p) if p[..] == [n]),
+            )
+        });
+        match field {
+            Some((_, v)) => simple_ty(v),
+            None => m.type_arg(n, &|k| simple_ty(args.get(k)?)),
+        }
+    };
+    // A copy already made (no allocation on every call).
+    for (tys, p) in m.specs.borrow().iter() {
+        if m.class_params
+            .iter()
+            .zip(tys)
+            .all(|(n, t)| deduce(*n).as_ref() == Some(t))
+        {
+            return Some(p.clone());
+        }
+    }
+    let tys = m
+        .class_params
+        .iter()
+        .map(|n| deduce(*n))
+        .collect::<Option<Vec<_>>>()?;
+    Some(m.specialize_as(&m.class_params, &tys))
+}
+
+/// `int` / `float` / `bool` of a value.
+#[cfg(feature = "jit")]
+fn simple_ty(v: &Value) -> Option<RtType> {
+    match v {
+        Value::Int(_) => Some(RtType::Int),
+        Value::Float(_) => Some(RtType::Float),
+        Value::Bool(_) => Some(RtType::Bool),
+        _ => None,
+    }
 }
 
 /// Advances the iterator in register `iter`: `true` and the element in `dst`, or `false`.

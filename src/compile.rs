@@ -561,6 +561,8 @@ struct Fn_ {
     /// Method of a class or a trait (and its lambdas): the global slot of that type
     /// (for its `private` and `protected` methods).
     class: Option<u32>,
+    /// Method of a generic class: the class's type parameters.
+    class_params: Vec<Symbol>,
     /// Register 0 is `self`.
     has_self: bool,
     /// Fields of the type whose default value is being computed.
@@ -653,6 +655,7 @@ impl Compiler<'_> {
             this,
             sup,
             class,
+            class_params: Vec::new(),
             has_self: false,
             ctx_fields,
             region,
@@ -728,6 +731,8 @@ impl Compiler<'_> {
             has_loop,
             plain_params,
             specs: Default::default(),
+            class_params: f.class_params,
+            spec: None,
         })
     }
 
@@ -1772,7 +1777,18 @@ impl Compiler<'_> {
             .iter()
             .map(|p| self.annotations_ir(&p.annotations))
             .collect();
+        // The type parameters in scope, apart from the method's own `forall`: its class's.
+        let class_params: Vec<Symbol> = match (&decl, kind) {
+            (Some(d), ProtoKind::Method) => self
+                .tparams
+                .iter()
+                .filter(|n| !d.forall.iter().any(|p| p.name == **n))
+                .copied()
+                .collect(),
+            _ => Vec::new(),
+        };
         self.begin(kind, name);
+        self.f().class_params = class_params;
         self.f().decl = decl;
         self.f().annotations = annotations;
         self.push_scope(false);

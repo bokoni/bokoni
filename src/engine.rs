@@ -210,9 +210,10 @@ impl Engine {
         else {
             return false;
         };
-        info.methods
-            .get(&m)
-            .is_some_and(|p| matches!(*p.jit.borrow(), crate::ir::JitState::Native(_)))
+        let native = |p: &crate::ir::Proto| matches!(*p.jit.borrow(), crate::ir::JitState::Native(_));
+        info.methods.get(&m).is_some_and(|p| {
+            native(p) || p.specs.borrow().iter().any(|(_, s)| native(s))
+        })
     }
 
     /// Maximum call depth before the "infinite recursion?" error (default: 1000).

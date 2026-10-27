@@ -257,6 +257,7 @@ const CORPUS: &[&str] = &[
     "class P\n  def init(@v: int)\n  end\n  private def dbl(): int = @v * 2\n  protected def v = @v\n  def sum(o: P): int = self.dbl() + o.v\nend\nmodule Q\n  private def k(): int = 5\n  def run(): int = P(k()).sum(P(1))\nend\nQ.run()",
     "class Bx(T)\n  def init(@v: T)\n  end\n  def get(): T = @v\n  def map(f: (T): U): Bx(U) forall U = Bx(f(@v))\nend\ndef first(xs: [T]): T? forall T = xs[0]?\nlet b: Bx(int) = Bx(2)\n[b.map(|x| x * 3).get(), first([4, 5]), first([])]",
     "class P\n  def init(@x: int, @w: float)\n  end\n  def grow(d: int): int\n    @x += d\n    @w = @w * 2.0\n    @x\n  end\n  def v(): int = @x * 2\nend\nclass Q < P\n  def v(): int = @x + 1\nend\ndef sum(ps: [P]): int\n  let t = 0\n  for p in ps\n    t += p.v()\n  end\n  t\nend\nlet p = P(1, 0.5)\nfor i in 0..20\n  p.grow(i)\nend\n[sum([p, P(3, 1.0)]), sum([p, Q(2, 0.0)]), p.v()]",
+    "class G(T)\n  def init(@s: T, @n: int)\n  end\n  def add(x: T): T\n    @s = @s + x\n    @n += 1\n    @s\n  end\n  def two(): T = self.add(self.add(@s))\nend\nlet a = G(1, 0)\nlet b = G(0.5, 0)\nlet c = G(\"a\", 0)\nfor i in 0..30\n  a.add(i)\n  b.add(i * 0.25)\n  c.add(\"b\")\nend\n[a.add(0), b.add(0.0), c.add(\"\").len(), a.two()]",
 ];
 
 /// Mutates a program: deletes, duplicates or swaps lines, inserts a token, deletes or

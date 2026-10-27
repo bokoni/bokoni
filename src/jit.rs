@@ -21,6 +21,10 @@
 //! - A `forall` function (its annotations `T` are `any` at run time) is compiled as a copy
 //!   typed for the arguments of a call (`T = int`, see `Proto::specialize`): one copy per
 //!   type, called directly by native code, or by the interpreter when the arguments fit.
+//!   Same for a method of a generic class (`class Box(T)`), `T` found from the fields of
+//!   `self` and the arguments; its fields of type `T` are checked on entry.
+//! - The interpreter calls native code directly (`Runtime::native_fast`) when the
+//!   arguments are exactly of its native types.
 //!
 //! Internal calling convention: `fn(ctx, params…) -> (status, result)`, status 0 = success,
 //! 1 = error (described in `ctx`). Each function also has an entry point for Rust:
@@ -603,6 +607,9 @@ struct Analysis<'a> {
 struct Target {
     proto: Rc<Proto>,
     this: Option<Rc<crate::objects::TypeInfo>>,
+    /// Method: the one declared by the class (`proto` may be its typed copy), checked
+    /// against the object's when calling.
+    declared: Option<Rc<Proto>>,
 }
 
 impl Target {
@@ -611,10 +618,20 @@ impl Target {
     }
 }
 
-/// Native type of field `idx` of `info`: annotated `int` / `float` / `bool` (always
-/// of that type: checked on every assignment).
-fn field_jty(info: &crate::objects::TypeInfo, idx: u32) -> Option<JTy> {
+/// Native type of field `idx` of `info`: annotated `int` / `float` / `bool`, or of a type
+/// parameter replaced by one of them in the typed copy `spec` (`@value: T`, `T = int`).
+/// Checked on entry of the method.
+fn field_jty(
+    info: &crate::objects::TypeInfo,
+    idx: u32,
+    spec: Option<&crate::ir::Spec>,
+) -> Option<JTy> {
     let t = info.fields.get(idx as usize)?.ty.as_ref()?;
+    if let Some(s) = spec
+        && let Some(r) = s.param_ty(&t.expr)
+    {
+        return prim(r).map(jty);
+    }
     prim(&t.ty).map(jty)
 }
 
@@ -687,14 +704,14 @@ impl Analysis<'_> {
             },
             // `@x` in a method: an annotated field of a simple type.
             FieldAt(_, a, idx) => match (g(*a)?, &this) {
-                (JTy::This, Some(info)) => field_jty(info, *idx)?,
+                (JTy::This, Some(info)) => field_jty(info, *idx, p.spec.as_deref())?,
                 _ => return None,
             },
             SetFieldAt { obj, idx, src, .. } => {
                 let (JTy::This, Some(info)) = (g(*obj)?, &this) else {
                     return None;
                 };
-                let t = field_jty(info, *idx)?;
+                let t = field_jty(info, *idx, p.spec.as_deref())?;
                 let s = g(*src)?;
                 if !(s == t || (t == JTy::Float && s == JTy::Int)) {
                     return None;
@@ -726,7 +743,19 @@ impl Analysis<'_> {
                     },
                     _ => return None,
                 };
-                let m = info.methods.get(name)?.clone();
+                let declared = info.methods.get(name)?.clone();
+                // Method of a generic class called on `self` in a typed copy: the copy for
+                // the same type arguments.
+                let m = match &p.spec {
+                    Some(s)
+                        if !declared.class_params.is_empty()
+                            && declared.class_params == p.class_params
+                            && g(*recv)? == JTy::This =>
+                    {
+                        declared.specialize_as(&declared.class_params, &s.tys)
+                    }
+                    _ => declared.clone(),
+                };
                 let (cparams, _) = native_sig(&m)?;
                 if m.kind != ProtoKind::Method
                     || site.block
@@ -748,13 +777,14 @@ impl Analysis<'_> {
                         return None;
                     }
                 }
-                let owner = crate::objects::method_owner(&info, *name, &m);
+                let owner = crate::objects::method_owner(&info, *name, &declared);
                 let ret = value_jty(&mut self.anns, &m.ret.as_ref()?.ty);
                 self.targets.insert(
                     ins as *const Instr as usize,
                     Target {
                         proto: m,
                         this: Some(owner),
+                        declared: Some(declared),
                     },
                 );
                 ret
@@ -878,6 +908,7 @@ impl Analysis<'_> {
                             Target {
                                 proto: callee.clone(),
                                 this: None,
+                                declared: None,
                             },
                         );
                         for (k, pt) in cparams.iter().enumerate() {
@@ -1272,8 +1303,9 @@ impl Jit {
         let mut todo = vec![Target {
             proto: root.clone(),
             this,
+            declared: None,
         }];
-        while let Some(Target { proto: p, this }) = todo.pop() {
+        while let Some(Target { proto: p, this, .. }) = todo.pop() {
             let key = Rc::as_ptr(&p) as usize;
             if plans.contains_key(&key) {
                 continue;
@@ -1684,20 +1716,14 @@ impl Jit {
                 bx.ins().brif(null, fail, &[id.into()], ok, &[]);
                 bx.switch_to_block(ok);
                 this_fp = Some(fp);
-                let mut read: Vec<u32> = p
-                    .blocks
-                    .iter()
-                    .flat_map(|b| &b.instrs)
-                    .filter_map(|i| match i {
-                        Instr::FieldAt(_, 0, idx) => Some(*idx),
-                        _ => None,
-                    })
-                    .collect();
-                read.sort();
-                read.dedup();
-                for idx in read {
+                // Every field used (a field of type `T` may hold anything: its old value
+                // must also be simple to be overwritten).
+                let mut used = used;
+                used.sort();
+                used.dedup();
+                for idx in used {
                     let off = idx as i32 * crate::value::layout::SIZE;
-                    let want = match field_jty(info, idx).ok_or(())? {
+                    let want = match field_jty(info, idx, p.spec.as_deref()).ok_or(())? {
                         JTy::Int => crate::value::layout::TAG_INT,
                         JTy::Float => crate::value::layout::TAG_FLOAT,
                         _ => crate::value::layout::TAG_BOOL,
@@ -1960,7 +1986,10 @@ impl Jit {
                         let info = plan.this.as_ref().ok_or(())?;
                         let off = *idx as i32 * crate::value::layout::SIZE;
                         let v = bx.use_var(uvar!(*src));
-                        let (tag, v) = match (field_jty(info, *idx).ok_or(())?, tyof!(*src)) {
+                        let (tag, v) = match (
+                            field_jty(info, *idx, p.spec.as_deref()).ok_or(())?,
+                            tyof!(*src),
+                        ) {
                             (JTy::Float, Some(JTy::Int)) => (
                                 crate::value::layout::TAG_FLOAT,
                                 bx.ins().fcvt_from_sint(types::F64, v),
@@ -1993,7 +2022,8 @@ impl Jit {
                         let site = &p.calls[*site as usize];
                         let obj = bx.use_var(uvar!(*recv));
                         let nm = bx.ins().iconst(types::I32, name.0 as i64);
-                        let pp = bx.ins().iconst(types::I64, Rc::as_ptr(&q) as i64);
+                        let declared = target.declared.as_ref().ok_or(())?;
+                        let pp = bx.ins().iconst(types::I64, Rc::as_ptr(declared) as i64);
                         let call = bx.ins().call(method_ref, &[obj, nm, pp]);
                         let other = bx.inst_results(call)[0];
                         check!(bx, other, ErrKind::Bail, span);
@@ -2514,19 +2544,22 @@ impl Jit {
     /// `None`: the native stack is too small for the requested depth; the call must be
     /// redone by the interpreter (whose stack grows on the heap). This is safe: compiled
     /// functions have no side effects.
-    pub fn call(
+    /// `args`: one per native parameter (`self` first for a method), alive during the
+    /// call.
+    pub fn call<'a>(
         &mut self,
         code: &NativeCode,
-        args: &[Value],
+        args: impl IntoIterator<Item = &'a Value>,
         depth: usize,
         max_depth: usize,
     ) -> Option<Result<Value, Error>> {
+        let n = code.params.len();
         let mut raw = [0u64; 16];
         let mut heap = Vec::new();
-        let buf: &mut [u64] = if args.len() <= raw.len() {
-            &mut raw[..args.len()]
+        let buf: &mut [u64] = if n <= raw.len() {
+            &mut raw[..n]
         } else {
-            heap.resize(args.len(), 0);
+            heap.resize(n, 0);
             &mut heap
         };
         for (slot, v) in buf.iter_mut().zip(args) {

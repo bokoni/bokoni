@@ -558,3 +558,48 @@ fn methods_errors_match_the_interpreter() {
         "class A\n  def init(@n: int)\n  end\n  def half(d: int): int = @n / d\nend\nlet a = A(4)\n[a.half(2), a.half(0)]",
     );
 }
+
+#[test]
+fn methods_of_generic_classes_are_compiled_per_type() {
+    let src = "class Acc(T)
+  def init(@sum: T, @n: int)
+  end
+  def add(x: T): T
+    @sum = @sum + x
+    @n += 1
+    @sum
+  end
+  def get(): T = @sum
+  def twice(): T = self.get() + self.get()
+end
+def run(a: Acc(int), k: int): int
+  let t = 0
+  for i in 0...k
+    t += a.twice()
+  end
+  t
+end
+let i = Acc(0, 0)
+let f = Acc(0.5, 0)
+let s = Acc(\"\", 0)
+for k in 0...100
+  i.add(k)
+  f.add(k * 0.5)
+  s.add(\"x\")
+end
+[i.get(), f.get(), s.get().len(), i.twice(), f.twice(), run(i, 10)]";
+    assert_eq!(same(src), "[4950, 2475.5, 100, 9900, 4951.0, 99000]");
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    e.eval(src).unwrap();
+    // A copy for `int` and one for `float`; the strings stay interpreted.
+    for m in ["add", "get", "twice"] {
+        assert!(e.is_native_method("Acc", m), "`Acc.{m}` should be compiled");
+    }
+    // A field of type `T` holding something else than expected: checked on entry.
+    assert_eq!(
+        e.eval_as::<String>("let z = Acc(1, 0)\nz.add(2)\nlet w = Acc(\"a\", 0)\nw.add(\"b\")")
+            .unwrap(),
+        "ab"
+    );
+}

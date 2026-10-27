@@ -268,7 +268,8 @@ namespaces, `trait` for shared behavior.
 - [x] Typed JIT for `forall` functions: a copy per type of the arguments
       (`T = int`, `[float]`, objects), called directly by native code or by the
       interpreter; ×37 on a generic `max` in a hot loop
-- [ ] Methods of generic classes (fields of type `T`), compiled per type argument
+- [x] Methods of generic classes (fields of type `T`), compiled per type argument
+      (v0.13): `T` found from the fields of `self` and the arguments
 
 ### v0.13 — Methods in the typed JIT
 
@@ -281,8 +282,11 @@ namespaces, `trait` for shared behavior.
 - [x] No abandon after a side effect: a method that writes fields contains only
       arithmetic, branches and fields (their types checked on entry), and native code
       does not call it
-- [ ] Faster calls from the interpreter to a native method (the general call path
-      dominates: ×1.5)
+- [x] Interpreter → native code called directly when the arguments are of its native
+      types (no frame, no conversion): a method called in a loop of the script ×1.5 →
+      ×5.8 against the interpreter, a typed function 56 → 28 ns per call
+- [ ] Native code called with type arguments known only to the checker (a parameter
+      `a: Acc(int)` in a typed function: erased, its methods are not called directly)
 
 ### Next
 
