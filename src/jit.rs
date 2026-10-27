@@ -10,6 +10,8 @@
 //!   compiled.
 //! - Same rules as the interpreter: overflow, division by zero and call depth are checked,
 //!   with the same messages and the same call stack.
+//! - Small functions and getters are inlined (`inlinable`, `emit_inline`); an inlined
+//!   method's class is checked with a cache per call site.
 //! - Lists are modified in place (`xs << x`, `xs[i] = v`). Where a list may change (this
 //!   function modifies one, or calls another), the elements read are copied rather than
 //!   pointed to, and a `for` goes over a copy of the list.
@@ -428,6 +430,176 @@ extern "C" fn bk_clone_into(dst: *mut Value, src: *const Value) {
     }
 }
 
+/// Inline cache of an inlined method call: the class last seen whose method `name` is
+/// `proto` (not redefined).
+struct MethodCache {
+    info: std::cell::RefCell<Option<Rc<crate::objects::TypeInfo>>>,
+    name: crate::intern::Symbol,
+    proto: *const Proto,
+}
+
+/// Fields of `obj` if its method `name` is the inlined one (cached by class); null
+/// otherwise (resumed in the interpreter, which makes the call).
+extern "C" fn bk_fields_cached(obj: *const Value, cache: *const MethodCache) -> *mut Value {
+    // SAFETY: `obj` is a live value, `cache` is kept alive by the `Jit`.
+    unsafe {
+        let cache = &*cache;
+        let Value::Object(o) = &*obj else {
+            return std::ptr::null_mut();
+        };
+        let Ok(mut b) = o.try_borrow_mut() else {
+            return std::ptr::null_mut();
+        };
+        let known = cache
+            .info
+            .borrow()
+            .as_ref()
+            .is_some_and(|i| Rc::ptr_eq(i, &b.info));
+        if !known {
+            match b.info.methods.get(&cache.name) {
+                Some(m) if Rc::as_ptr(m) == cache.proto => {
+                    *cache.info.borrow_mut() = Some(b.info.clone());
+                }
+                _ => return std::ptr::null_mut(),
+            }
+        }
+        b.fields.as_mut_ptr()
+    }
+}
+
+/// A small function, inlined at its calls: one block ending with its return, no call,
+/// simple values only (arithmetic, fields of `self`), from the same script (its errors
+/// point into it).
+fn inlinable(q: &Proto, p: &Proto) -> bool {
+    use Instr::*;
+    let [b] = q.blocks.as_slice() else {
+        return false;
+    };
+    Rc::ptr_eq(&q.script, &p.script)
+        && q.handlers.is_empty()
+        && b.instrs.len() <= 16
+        && matches!(b.term, Term::Return { .. })
+        && native_sig(q).is_some_and(|(ps, r)| {
+            r != RegTy::Value
+                && ps
+                    .iter()
+                    .skip((q.kind == ProtoKind::Method) as usize)
+                    .all(|t| *t != RegTy::Value)
+        })
+        && b.instrs.iter().all(|i| {
+            matches!(
+                i,
+                Int(..)
+                    | Float(..)
+                    | Bool(..)
+                    | Move(..)
+                    | Guard(..)
+                    | IBin(..)
+                    | IBinK(..)
+                    | FBin(..)
+                    | INeg(..)
+                    | FNeg(..)
+                    | IToF(..)
+                    | FieldAt(_, 0, _)
+            )
+        })
+}
+
+/// Emits the body of inlinable function `q` (`plan`: its analysis) with its native
+/// arguments `args` (`fields`: those of `self` for a method); its result. `err`:
+/// integer overflow / division by zero (span in `q`); `bail`: a field of another type.
+#[allow(clippy::too_many_arguments)]
+fn emit_inline(
+    bx: &mut FunctionBuilder,
+    q: &Proto,
+    plan: &Plan,
+    args: &[CValue],
+    fields: Option<CValue>,
+    frem_ref: FuncRef,
+    err: &mut dyn FnMut(&mut FunctionBuilder, CValue, ErrKind, Span),
+    bail: &mut dyn FnMut(&mut FunctionBuilder, CValue),
+) -> Option<CValue> {
+    use Instr::*;
+    let b = &q.blocks[0];
+    let mut vals: FxHashMap<Reg, (CValue, JTy)> = FxHashMap::default();
+    for (prm, v) in q.params.iter().zip(args) {
+        vals.insert(prm.reg, (*v, plan.entry[0][prm.reg as usize].get()?));
+    }
+    for (k, (ins, &span)) in b.instrs.iter().zip(&b.spans).enumerate() {
+        let dty = plan.defs[0][k];
+        let get = |r: &Reg| vals.get(r).copied();
+        let (d, v) = match ins {
+            Int(d, n) => (*d, bx.ins().iconst(types::I64, *n)),
+            Float(d, f) => (*d, bx.ins().f64const(*f)),
+            Bool(d, v) => (*d, bx.ins().iconst(types::I8, *v as i64)),
+            Move(d, a) | Guard(d, a, _) => {
+                let (v, t) = get(a)?;
+                match (dty?, t) {
+                    (JTy::Float, JTy::Int) => (*d, bx.ins().fcvt_from_sint(types::F64, v)),
+                    _ => (*d, v),
+                }
+            }
+            IBin(op, d, a, c) => {
+                let (x, y) = (get(a)?.0, get(c)?.0);
+                (
+                    *d,
+                    int_bin(bx, *op, x, y, &mut |bx, c, k| err(bx, c, k, span)),
+                )
+            }
+            IBinK(op, d, a, n) => {
+                let x = get(a)?.0;
+                let y = bx.ins().iconst(types::I64, *n);
+                (
+                    *d,
+                    int_bin(bx, *op, x, y, &mut |bx, c, k| err(bx, c, k, span)),
+                )
+            }
+            FBin(op, d, a, c) => {
+                let (x, y) = (get(a)?.0, get(c)?.0);
+                (*d, float_bin(bx, *op, x, y, frem_ref))
+            }
+            INeg(d, a) => {
+                let x = get(a)?.0;
+                let c = bx.ins().icmp_imm_s(IntCC::Equal, x, i64::MIN);
+                err(bx, c, ErrKind::Overflow, span);
+                (*d, bx.ins().ineg(x))
+            }
+            FNeg(d, a) => (*d, bx.ins().fneg(get(a)?.0)),
+            IToF(d, a) => (*d, bx.ins().fcvt_from_sint(types::F64, get(a)?.0)),
+            FieldAt(d, 0, idx) => {
+                let fp = fields?;
+                let off = *idx as i32 * crate::value::layout::SIZE;
+                let (cty, want) = match dty? {
+                    JTy::Float => (types::F64, crate::value::layout::TAG_FLOAT),
+                    JTy::Bool => (types::I8, crate::value::layout::TAG_BOOL),
+                    _ => (types::I64, crate::value::layout::TAG_INT),
+                };
+                let tag = bx.ins().load(types::I8, MemFlagsData::trusted(), fp, off);
+                let bad = bx.ins().icmp_imm_s(IntCC::NotEqual, tag, want as i64);
+                bail(bx, bad);
+                let v = bx.ins().load(
+                    cty,
+                    MemFlagsData::trusted(),
+                    fp,
+                    off + crate::value::layout::PAYLOAD,
+                );
+                (*d, v)
+            }
+            _ => return None,
+        };
+        vals.insert(d, (v, dty?));
+    }
+    let Term::Return { reg, .. } = &b.term else {
+        return None;
+    };
+    let (v, t) = vals.get(reg).copied()?;
+    let (_, ret) = native_sig(q)?;
+    Some(match (ret, t) {
+        (RegTy::Float, JTy::Int) => bx.ins().fcvt_from_sint(types::F64, v),
+        _ => v,
+    })
+}
+
 /// Kind of a native value passed to a list helper (`kind_code`).
 fn kind_of_code(c: i32) -> Kind {
     match c {
@@ -600,6 +772,10 @@ pub struct Jit {
     /// address.
     #[allow(clippy::vec_box)]
     field_caches: Vec<Box<FieldCache>>,
+    /// Caches of the inlined method calls (addresses held by native code).
+    #[allow(clippy::vec_box)]
+    method_caches: Vec<Box<MethodCache>>,
+    fields_cached_fn: FuncId,
     next: u32,
 }
 
@@ -1510,6 +1686,7 @@ impl Jit {
         builder.symbol("bk_method_is", bk_method_is as *const u8);
         builder.symbol("bk_resume", bk_resume as *const u8);
         builder.symbol("bk_list_push", bk_list_push as *const u8);
+        builder.symbol("bk_fields_cached", bk_fields_cached as *const u8);
         builder.symbol("bk_list_set", bk_list_set as *const u8);
         builder.symbol("bk_list_snapshot", bk_list_snapshot as *const u8);
         builder.symbol("bk_list_view", bk_list_view as *const u8);
@@ -1602,6 +1779,13 @@ impl Jit {
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr));
         sig.params.push(AbiParam::new(ptr));
+        sig.returns.push(AbiParam::new(ptr));
+        let fields_cached_fn = module
+            .declare_function("bk_fields_cached", Linkage::Import, &sig)
+            .ok()?;
+        let mut sig = module.make_signature();
+        sig.params.push(AbiParam::new(ptr));
+        sig.params.push(AbiParam::new(ptr));
         sig.returns.push(AbiParam::new(types::I32));
         let list_fn = module
             .declare_function("bk_list_view", Linkage::Import, &sig)
@@ -1655,6 +1839,8 @@ impl Jit {
             dyn_fns: None,
             fast_fns: Vec::new(),
             field_caches: Vec::new(),
+            method_caches: Vec::new(),
+            fields_cached_fn,
             next: 0,
         })
     }
@@ -1864,6 +2050,9 @@ impl Jit {
         let push_ref = self.module.declare_func_in_func(push_fn, &mut ctx.func);
         let set_ref = self.module.declare_func_in_func(set_fn, &mut ctx.func);
         let snapshot_ref = self.module.declare_func_in_func(snapshot_fn, &mut ctx.func);
+        let fields_cached_ref = self
+            .module
+            .declare_func_in_func(self.fields_cached_fn, &mut ctx.func);
         let this_fields_ref = self
             .module
             .declare_func_in_func(this_fields_fn, &mut ctx.func);
@@ -1925,16 +2114,26 @@ impl Jit {
             }
         }
         let reg_ref = borrowed.clone();
-        // Lists modified here, or possibly by a function called.
+        // Calls of small functions: inlined (their analysis gives the types of their
+        // registers).
+        let mut inlines: FxHashMap<usize, (Rc<Proto>, Plan)> = FxHashMap::default();
+        for (k, t) in &plan.targets {
+            if inlinable(&t.proto, p)
+                && let Some(qp) = analyze(&t.proto, t.this.clone(), globals, self.len_sym)
+            {
+                inlines.insert(*k, (t.proto.clone(), qp));
+            }
+        }
+        // Lists modified here, or possibly by a function called (not inlined: an inlined
+        // body modifies nothing).
         let may_mutate = p.blocks.iter().flat_map(|b| &b.instrs).any(|i| {
-            matches!(
-                i,
-                Instr::Bin(BinOp::Push, ..)
-                    | Instr::SetIndex(..)
-                    | Instr::SetFieldAt { .. }
-                    | Instr::Call { .. }
-                    | Instr::CallMethod { .. }
-            )
+            let called = matches!(i, Instr::Call { .. } | Instr::CallMethod { .. })
+                && !inlines.contains_key(&(i as *const Instr as usize));
+            called
+                || matches!(
+                    i,
+                    Instr::Bin(BinOp::Push, ..) | Instr::SetIndex(..) | Instr::SetFieldAt { .. }
+                )
         });
         let mut written = vec![false; nregs];
         loop {
@@ -2318,6 +2517,22 @@ impl Jit {
                 }
             }};
         }
+        // Error in inlined code: its frame (`tid`) added to the call stack.
+        macro_rules! inline_err {
+            ($bx:expr, $cond:expr, $kind:expr, $span:expr, $tid:expr) => {{
+                err_sites.push(($kind, $span));
+                let eid = err_base + (err_sites.len() - 1) as i64;
+                let e = $bx.create_block();
+                let cont = $bx.create_block();
+                $bx.ins().brif($cond, e, &[], cont, &[]);
+                $bx.switch_to_block(e);
+                let t = $bx.ins().iconst(types::I32, $tid);
+                $bx.ins().call(trace_ref, &[ctxv, t]);
+                let id = $bx.ins().iconst(types::I64, eid);
+                $bx.ins().jump(fail, &[id.into()]);
+                $bx.switch_to_block(cont);
+            }};
+        }
         // A native value as (bits, kind) for the list helpers.
         macro_rules! native_arg {
             ($bx:expr, $r:expr) => {{
@@ -2545,6 +2760,61 @@ impl Jit {
                             off + crate::value::layout::PAYLOAD,
                         );
                     }
+                    // Inlined method: its class checked with a cache (resumed in the
+                    // interpreter, which makes the call, if it redefines the method).
+                    CallMethod {
+                        dst,
+                        recv,
+                        name,
+                        site,
+                        ..
+                    } if inlines.contains_key(&(ins as *const Instr as usize)) => {
+                        let (q, qp) = &inlines[&(ins as *const Instr as usize)];
+                        let target = &plan.targets[&(ins as *const Instr as usize)];
+                        let declared = target.declared.as_ref().ok_or(())?;
+                        self.method_caches.push(Box::new(MethodCache {
+                            info: std::cell::RefCell::new(None),
+                            name: *name,
+                            proto: Rc::as_ptr(declared),
+                        }));
+                        let cache = &**self.method_caches.last().unwrap() as *const MethodCache;
+                        let obj = bx.use_var(uvar!(*recv));
+                        let cp = bx.ins().iconst(types::I64, cache as i64);
+                        let call = bx.ins().call(fields_cached_ref, &[obj, cp]);
+                        let fp = bx.inst_results(call)[0];
+                        let null = bx.ins().icmp_imm_s(IntCC::Equal, fp, 0);
+                        bail!(bx, null);
+                        let (cparams, _) = native_sig(q).ok_or(())?;
+                        let site = &p.calls[*site as usize];
+                        let mut args = Vec::new();
+                        for (k, pt) in cparams[1..].iter().enumerate() {
+                            let r = site.start + k as u32;
+                            let v = bx.use_var(uvar!(r));
+                            args.push(match (pt, tyof!(r)) {
+                                (RegTy::Float, Some(JTy::Int)) => {
+                                    bx.ins().fcvt_from_sint(types::F64, v)
+                                }
+                                _ => v,
+                            });
+                        }
+                        // Methods have `self` in register 0, not passed as an argument.
+                        let tid = {
+                            call_sites.push((q.name.clone(), span));
+                            trace_base + (call_sites.len() - 1) as i64
+                        };
+                        let v = emit_inline(
+                            &mut bx,
+                            q,
+                            qp,
+                            &args,
+                            Some(fp),
+                            frem_ref,
+                            &mut |bx, c, k, s| inline_err!(bx, c, k, s, tid),
+                            &mut |bx, c| bail!(bx, c),
+                        )
+                        .ok_or(())?;
+                        bx.def_var(dvar!(*dst), v);
+                    }
                     // Method called directly: abandon if the object's class redefines it.
                     CallMethod {
                         dst,
@@ -2764,6 +3034,42 @@ impl Jit {
                             })
                             .collect::<Result<Vec<_>, ()>>()?;
                         build!(bx, *d, None, items, (*start..*start + *n).collect());
+                    }
+                    // Inlined function: its body here (it is redefined: this code is
+                    // recompiled).
+                    Call { dst, site, .. }
+                        if inlines.contains_key(&(ins as *const Instr as usize)) =>
+                    {
+                        let (q, qp) = &inlines[&(ins as *const Instr as usize)];
+                        let (cparams, _) = native_sig(q).ok_or(())?;
+                        let site = &p.calls[*site as usize];
+                        let mut args = Vec::new();
+                        for (k, pt) in cparams.iter().enumerate() {
+                            let r = site.start + k as u32;
+                            let v = bx.use_var(uvar!(r));
+                            args.push(match (pt, tyof!(r)) {
+                                (RegTy::Float, Some(JTy::Int)) => {
+                                    bx.ins().fcvt_from_sint(types::F64, v)
+                                }
+                                _ => v,
+                            });
+                        }
+                        let tid = {
+                            call_sites.push((q.name.clone(), span));
+                            trace_base + (call_sites.len() - 1) as i64
+                        };
+                        let v = emit_inline(
+                            &mut bx,
+                            q,
+                            qp,
+                            &args,
+                            None,
+                            frem_ref,
+                            &mut |bx, c, k, s| inline_err!(bx, c, k, s, tid),
+                            &mut |bx, c| bail!(bx, c),
+                        )
+                        .ok_or(())?;
+                        bx.def_var(dvar!(*dst), v);
                     }
                     Call { dst, f, site } => {
                         let Some(JTy::Callee(_)) = tyof!(*f) else {

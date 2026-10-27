@@ -796,3 +796,37 @@ let b = Bag([], 0)
     // Out of bounds: the interpreter's error.
     same("def w(xs: [int]): int\n  xs[5] = 1\n  0\nend\nw([1])");
 }
+
+#[test]
+fn small_functions_and_getters_are_inlined() {
+    let src = "class P
+  def init(@x: float, @y: float)
+  end
+  def x(): float = @x
+  def y(): float = @y
+  def norm2(): float = @x * @x + @y * @y
+end
+class Q < P
+  def x(): float = @x * 10.0
+end
+def sq(v: float): float = v * v
+def total(ps: [P]): float
+  let t = 0.0
+  for p in ps
+    t += sq(p.x()) + p.y() + p.norm2()
+  end
+  t
+end
+def big(n: int): int = n * 4611686018427387904
+def use_big(n: int): int = big(n) + 1
+[total([P(1.0, 2.0), P(3.0, 4.0)]), total([P(1.0, 1.0), Q(1.0, 1.0), P(2.0, 0.0)])]";
+    assert_eq!(same(src), "[46.0, 115.0]");
+    // (Without the call on a `Q`, which resumes in the interpreter.)
+    let defs = &src[..src.rfind("\n[").unwrap()];
+    let mut e = Engine::new();
+    e.eval(&format!("{defs}\ntotal([P(1.0, 2.0)])")).unwrap();
+    assert!(e.is_native("total"));
+    // An error in inlined code: the same message and call stack.
+    same(&format!("{src}\nuse_big(1)"));
+    same(&format!("{src}\nuse_big(2)"));
+}

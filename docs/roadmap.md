@@ -305,7 +305,12 @@ namespaces, `trait` for shared behavior.
 - [x] Native calls to methods that write fields (and no restriction on what such a
       method contains): the type of a field is checked on every access, a method
       called may change it; a typed loop calling `c.add(k)`: 0.11 s → 0.02 s
-- [ ] Inlining of small functions and getters
+- [x] Inlining of small functions and getters (one block, arithmetic and fields of
+      `self`, same script): their body in the caller, an error keeps their frame in
+      the call stack; a method's class checked by a cache per call site
+      (`bk_fields_cached`, resumed in the interpreter if it redefines the method); an
+      inlined call does not count as a call that may modify lists (no copy); a typed
+      loop calling `sq(p.x()) + p.y()`: 0.18 s → 0.01 s
 - [ ] Strings in native code
 
 ### Next
