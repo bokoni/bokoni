@@ -866,7 +866,7 @@ end
 
 ### Reading
 
-In a macro (planned: reading annotations is not available to macros yet):
+In a macro (see [Macros](#macros)):
 
 ```ruby
 macro validate_fields
@@ -884,9 +884,13 @@ macro validate_fields
 end
 ```
 
-- `x.annotation(A)`: the last `A` annotation (or `nil`).
+- `x.annotation(A)`: the last `A` annotation (or `nil`), on `@type`, a field, `@def` or
+  a parameter.
 - `x.annotations(A)` / `x.annotations()`: all `A` annotations / all of them.
-- Arguments are read like fields: `v.min`, `v.max`.
+- Arguments are read like fields: `v.min`, `v.max` (named or positional, in the order of
+  the annotation's fields; the declared default otherwise, `nil` read as absent);
+  `v.name`, `v.args` (all the arguments) when the annotation has no such field.
+- `{% if v = … %}` binds `v` and tests it.
 
 From Rust:
 
@@ -1000,11 +1004,11 @@ code is a `begin … end` whose value is the last expression).
 
 | Variable     | Content                                               |
 |--------------|-------------------------------------------------------|
-| `@type`      | in the body of a type, the type as declared before the call: `name`, `fields` (each with `name`, `type`; fields declared by `init(@x)` included), `methods` |
+| `@type`      | in the body of a type, the type as declared before the call: `name`, `fields` (fields declared by `init(@x)` included), `methods`, `annotation(…)` |
+| `@def`       | in the body of a method: `name`, `params`, `return_type`, `annotation(…)` |
+| a field or a parameter | `name`, `type` (`any` if not annotated), `default` (`nil` if none), `annotation(…)` |
 | `name.id`    | a node converted to an identifier                     |
 | `node.stringify` | the source code of a node, as a `str`             |
-
-Planned: `@def` (the current method), `annotation(…)` on types and fields.
 
 ### Rules
 

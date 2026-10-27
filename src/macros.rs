@@ -47,15 +47,81 @@ pub struct Macros {
     pub(crate) full: String,
     /// Number of expansions (for hygienic names).
     pub(crate) count: u32,
+    /// Fields of the annotations declared (name, default value as written: empty if
+    /// none), in order: positional arguments are read by field.
+    pub(crate) annotations: HashMap<String, Rc<[(String, String)]>>,
 }
 
-/// The type whose body contains the call (`@type`).
+/// Where the call is: the type (`@type`) and the method (`@def`) whose body contains it.
+#[derive(Clone, Copy, Default)]
+pub struct Ctx<'a> {
+    pub ty: Option<&'a TypeCtx>,
+    pub def: Option<&'a DefCtx>,
+}
+
+/// The type whose body contains the call (`@type`): as declared before the call.
 #[derive(Clone, Debug, Default)]
 pub struct TypeCtx {
     pub name: String,
-    /// (name, type as written: empty if not annotated).
-    pub fields: Vec<(String, String)>,
-    pub methods: Vec<String>,
+    pub fields: Vec<Rc<VarCtx>>,
+    pub methods: Vec<Rc<DefCtx>>,
+    pub annotations: Vec<Rc<AnnCtx>>,
+}
+
+/// A method (`@def`, items of `@type.methods`).
+#[derive(Clone, Debug, Default)]
+pub struct DefCtx {
+    pub name: String,
+    pub params: Vec<Rc<VarCtx>>,
+    /// Return type as written (empty: not annotated).
+    pub ret: String,
+    pub annotations: Vec<Rc<AnnCtx>>,
+}
+
+/// A field or a parameter.
+#[derive(Clone, Debug, Default)]
+pub struct VarCtx {
+    pub name: String,
+    /// Type as written (empty: not annotated).
+    pub ty: String,
+    /// Default value as written (empty: none).
+    pub default: String,
+    pub annotations: Vec<Rc<AnnCtx>>,
+}
+
+/// An annotation attached to a declaration (`@[Validate(min: 1)]`).
+#[derive(Clone, Debug, Default)]
+pub struct AnnCtx {
+    pub name: String,
+    /// Arguments: (name if named, source code).
+    pub args: Vec<(Option<String>, String)>,
+    /// Fields of the annotation's declaration, if known (see [`Macros::annotations`]).
+    pub fields: Option<Rc<[(String, String)]>>,
+}
+
+impl AnnCtx {
+    /// Value of field `f`: named argument, positional one in field order, or the
+    /// declared default; `None` if `f` is not a field of the declaration.
+    fn field(&self, f: &str) -> Option<MVal> {
+        if let Some((_, v)) = self.args.iter().find(|(n, _)| n.as_deref() == Some(f)) {
+            return Some(MVal::Node(v.clone()));
+        }
+        let Some(fields) = &self.fields else {
+            return Some(MVal::Nil);
+        };
+        let k = fields.iter().position(|(n, _)| n == f)?;
+        let positional: Vec<&String> = self
+            .args
+            .iter()
+            .filter(|(n, _)| n.is_none())
+            .map(|(_, v)| v)
+            .collect();
+        Some(match positional.get(k) {
+            Some(v) => MVal::Node((*v).clone()),
+            None if fields[k].1.is_empty() || fields[k].1 == "nil" => MVal::Nil,
+            None => MVal::Node(fields[k].1.clone()),
+        })
+    }
 }
 
 /// Value at expansion time.
@@ -68,7 +134,9 @@ enum MVal {
     Bool(bool),
     Nil,
     List(Vec<MVal>),
-    Field(String, String),
+    Var(Rc<VarCtx>),
+    Def(Rc<DefCtx>),
+    Ann(Rc<AnnCtx>),
     Type(Rc<TypeCtx>),
     /// `|v| expr` (argument of `map`).
     Lambda(String, Rc<Expr>),
@@ -83,7 +151,9 @@ impl MVal {
             MVal::Bool(b) => b.to_string(),
             MVal::Nil => String::new(),
             MVal::List(items) => items.iter().map(MVal::text).collect::<Vec<_>>().join(", "),
-            MVal::Field(n, _) => n.clone(),
+            MVal::Var(v) => v.name.clone(),
+            MVal::Def(d) => d.name.clone(),
+            MVal::Ann(a) => a.name.clone(),
             MVal::Type(t) => t.name.clone(),
             MVal::Lambda(..) => "<lambda>".into(),
         }
@@ -94,14 +164,9 @@ impl MVal {
     }
 }
 
-/// Expands macro `def` called with `args` (source code of each argument), in the body
-/// of type `ty` if any: the generated source, or an error message.
-pub fn expand(
-    def: &MacroDef,
-    args: Vec<String>,
-    ty: Option<&TypeCtx>,
-    count: u32,
-) -> Result<String, String> {
+/// Expands macro `def` called with `args` (source code of each argument), at `ctx`: the
+/// generated source, or an error message.
+pub fn expand(def: &MacroDef, args: Vec<String>, ctx: Ctx, count: u32) -> Result<String, String> {
     if args.len() < def.params.len() || (def.splat.is_none() && args.len() > def.params.len()) {
         return Err(format!(
             "macro `{}` expects {} argument{}, got {}",
@@ -119,8 +184,11 @@ pub fn expand(
     if let Some(s) = &def.splat {
         env.insert(s.clone(), MVal::List(args.map(MVal::Node).collect()));
     }
-    if let Some(t) = ty {
+    if let Some(t) = ctx.ty {
         env.insert("@type".into(), MVal::Type(Rc::new(t.clone())));
+    }
+    if let Some(d) = ctx.def {
+        env.insert("@def".into(), MVal::Def(Rc::new(d.clone())));
     }
     let nodes = parse_template(&def.body)?;
     let mut out = Vec::new();
@@ -406,12 +474,48 @@ fn rename(t: &str, names: &[String], count: u32) -> String {
     let chars: Vec<char> = t.chars().collect();
     let mut i = 0;
     let mut in_str = false;
+    // Open `#{` interpolations: braces opened in each.
+    let mut interp: Vec<u32> = Vec::new();
+    let mut prev_word = String::new();
     while i < chars.len() {
         let c = chars[i];
-        if c == '"' && (i == 0 || chars[i - 1] != '\\') {
-            in_str = !in_str;
+        if in_str {
+            if c == '\\' {
+                out.push(c);
+                if let Some(&n) = chars.get(i + 1) {
+                    out.push(n);
+                }
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                in_str = false;
+            } else if c == '#' && chars.get(i + 1) == Some(&'{') {
+                out.push_str("#{");
+                i += 2;
+                in_str = false;
+                interp.push(0);
+                continue;
+            }
+            out.push(c);
+            i += 1;
+            continue;
         }
-        if !in_str && (c.is_alphabetic() || c == '_') {
+        match c {
+            '"' => in_str = true,
+            '{' if !interp.is_empty() => *interp.last_mut().unwrap() += 1,
+            '}' if !interp.is_empty() => {
+                let top = interp.last_mut().unwrap();
+                if *top == 0 {
+                    interp.pop();
+                    in_str = true;
+                } else {
+                    *top -= 1;
+                }
+            }
+            _ => {}
+        }
+        if c.is_alphabetic() || c == '_' {
             let start = i;
             while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
                 i += 1;
@@ -419,14 +523,14 @@ fn rename(t: &str, names: &[String], count: u32) -> String {
             let word: String = chars[start..i].iter().collect();
             let before = if start > 0 { chars[start - 1] } else { ' ' };
             let after = chars.get(i).copied().unwrap_or(' ');
-            let renamable = names.contains(&word)
-                && before != '@'
-                && before != '.'
-                && !(after == ':' && chars.get(i + 1) != Some(&':'));
+            // `name: value` is a named argument, but `let x: T` declares `x`.
+            let named_arg = after == ':' && chars.get(i + 1) != Some(&':') && prev_word != "let";
+            let renamable = names.contains(&word) && before != '@' && before != '.' && !named_arg;
             out.push_str(&word);
             if renamable {
                 out.push_str(&format!("__m{count}"));
             }
+            prev_word = word;
             continue;
         }
         out.push(c);
@@ -449,6 +553,7 @@ enum Expr {
     Bin(String, Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
     Lambda(String, Rc<Expr>),
+    Assign(String, Box<Expr>),
 }
 
 #[derive(Debug)]
@@ -537,6 +642,7 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 ',' => ",",
                 '|' => "|",
                 '+' => "+",
+                '=' => "=",
                 _ => return Err(format!("unexpected `{ch}` in a macro expression")),
             };
             out.push(Tok::Sym(s));
@@ -556,7 +662,7 @@ fn parse_expr(src: &str) -> Result<Expr, String> {
         toks: lex(src)?,
         pos: 0,
     };
-    let e = p.or()?;
+    let e = p.assign()?;
     if p.pos < p.toks.len() {
         return Err(format!(
             "unexpected `{:?}` in the macro expression `{src}`",
@@ -572,21 +678,7 @@ impl EParser {
     }
 
     fn eat_sym(&mut self, s: &str) -> bool {
-        if self.peek()
-            == Some(&Tok::Sym(match s {
-                "." => ".",
-                "(" => "(",
-                ")" => ")",
-                "[" => "[",
-                "]" => "]",
-                "," => ",",
-                "|" => "|",
-                "+" => "+",
-                "==" => "==",
-                "!=" => "!=",
-                _ => return false,
-            }))
-        {
+        if matches!(self.peek(), Some(Tok::Sym(x)) if *x == s) {
             self.pos += 1;
             true
         } else {
@@ -609,6 +701,19 @@ impl EParser {
         } else {
             Err(format!("expected `{s}` in a macro expression"))
         }
+    }
+
+    /// `name = expr` (binds `name`, its value is the expression's: `{% if v = … %}`), or
+    /// an expression.
+    fn assign(&mut self) -> Result<Expr, String> {
+        if let (Some(Tok::Name(n)), Some(Tok::Sym("="))) = (
+            self.toks.get(self.pos).cloned(),
+            self.toks.get(self.pos + 1),
+        ) {
+            self.pos += 2;
+            return Ok(Expr::Assign(n, Box::new(self.or()?)));
+        }
+        self.or()
     }
 
     fn or(&mut self) -> Result<Expr, String> {
@@ -789,7 +894,9 @@ fn kind(v: &MVal) -> &'static str {
         MVal::Bool(_) => "a boolean",
         MVal::Nil => "nil",
         MVal::List(_) => "a list",
-        MVal::Field(..) => "a field",
+        MVal::Var(_) => "a field or a parameter",
+        MVal::Def(_) => "a method",
+        MVal::Ann(_) => "an annotation",
         MVal::Type(_) => "a type",
         MVal::Lambda(..) => "a lambda",
     }
@@ -803,6 +910,9 @@ fn lookup(env: &[HashMap<String, MVal>], name: &str) -> Result<MVal, String> {
     }
     if name == "@type" {
         return Err("`@type` is only available in the body of a type".into());
+    }
+    if name == "@def" {
+        return Err("`@def` is only available in the body of a method".into());
     }
     Err(format!("unknown name `{name}` in a macro"))
 }
@@ -830,6 +940,11 @@ fn eval(e: &Expr, env: &mut Vec<HashMap<String, MVal>>) -> Result<MVal, String> 
                 .collect::<Result<_, _>>()?,
         ),
         Expr::Lambda(v, body) => MVal::Lambda(v.clone(), body.clone()),
+        Expr::Assign(name, e) => {
+            let v = eval(e, env)?;
+            env.last_mut().unwrap().insert(name.clone(), v.clone());
+            v
+        }
         Expr::Not(x) => MVal::Bool(!eval(x, env)?.truthy()),
         Expr::Bin(op, a, b) => {
             let a = eval(a, env)?;
@@ -871,20 +986,65 @@ fn method(
             None => Err(format!("`.{name}` expects an argument")),
         }
     };
+    let or_any = |t: &str| MVal::Node(if t.is_empty() { "any".into() } else { t.into() });
+    // `annotation(Validate)`: the annotation's name (a name bound in the macro: its text).
+    let ann_name = |env: &mut Vec<HashMap<String, MVal>>| -> Result<Option<String>, String> {
+        Ok(match args.first() {
+            None => None,
+            Some(Expr::Name(n)) if lookup(env, n).is_err() => Some(n.clone()),
+            Some(e) => Some(eval(e, env)?.text()),
+        })
+    };
+    let anns = match &r {
+        MVal::Type(t) => Some(&t.annotations),
+        MVal::Def(d) => Some(&d.annotations),
+        MVal::Var(v) => Some(&v.annotations),
+        _ => None,
+    };
+    if let Some(anns) = anns
+        && matches!(name, "annotation" | "annotations")
+    {
+        let wanted = ann_name(env)?;
+        let mut found = anns
+            .iter()
+            .filter(|a| wanted.as_ref().is_none_or(|w| *w == a.name))
+            .map(|a| MVal::Ann(a.clone()));
+        return Ok(if name == "annotation" {
+            found.next_back().unwrap_or(MVal::Nil)
+        } else {
+            MVal::List(found.collect())
+        });
+    }
+    if let MVal::Ann(a) = &r {
+        match a.field(name) {
+            Some(v) => return Ok(v),
+            None if name == "name" => return Ok(MVal::Node(a.name.clone())),
+            None if name == "args" => {
+                return Ok(MVal::List(
+                    a.args.iter().map(|(_, v)| MVal::Node(v.clone())).collect(),
+                ));
+            }
+            None => return Err(format!("annotation `{}` has no field `{name}`", a.name)),
+        }
+    }
     Ok(match (name, r) {
         ("id", v) => MVal::Node(v.text().trim().to_string()),
         ("stringify", v) => MVal::Str(format!("{:?}", v.text().trim())),
-        ("name", MVal::Field(n, _)) => MVal::Node(n),
-        ("type", MVal::Field(_, t)) => MVal::Node(if t.is_empty() { "any".into() } else { t }),
+        ("name", MVal::Var(v)) => MVal::Node(v.name.clone()),
+        ("type", MVal::Var(v)) => or_any(&v.ty),
+        ("default", MVal::Var(v)) if v.default.is_empty() => MVal::Nil,
+        ("default", MVal::Var(v)) => MVal::Node(v.default.clone()),
+        ("name", MVal::Def(d)) => MVal::Node(d.name.clone()),
+        ("params", MVal::Def(d)) => {
+            MVal::List(d.params.iter().map(|p| MVal::Var(p.clone())).collect())
+        }
+        ("return_type", MVal::Def(d)) => or_any(&d.ret),
         ("name", MVal::Type(t)) => MVal::Node(t.name.clone()),
-        ("fields", MVal::Type(t)) => MVal::List(
-            t.fields
-                .iter()
-                .map(|(n, ty)| MVal::Field(n.clone(), ty.clone()))
-                .collect(),
-        ),
+        ("fields", MVal::Type(t)) => {
+            MVal::List(t.fields.iter().map(|f| MVal::Var(f.clone())).collect())
+        }
         ("methods", MVal::Type(t)) => {
-            MVal::List(t.methods.iter().map(|m| MVal::Node(m.clone())).collect())
+            MVal::List(t.methods.iter().map(|m| MVal::Def(m.clone())).collect())
         }
         ("size" | "len", MVal::List(items)) => MVal::Int(items.len() as i64),
         ("size" | "len", v) => MVal::Int(v.text().chars().count() as i64),
@@ -948,7 +1108,7 @@ mod tests {
             "{% for n in names %}def {{n}} = @{{n}}\n{% end %}",
         );
         assert_eq!(
-            expand(&d, vec!["a".into(), "b".into()], None, 1).unwrap(),
+            expand(&d, vec!["a".into(), "b".into()], Ctx::default(), 1).unwrap(),
             "def a = @a\ndef b = @b\n"
         );
         let d = def(
@@ -956,24 +1116,48 @@ mod tests {
             None,
             "{% if x == \"1\" %}one{% elsif x == \"2\" %}two{% else %}other{% end %}",
         );
-        assert_eq!(expand(&d, vec!["2".into()], None, 1).unwrap(), "two");
-        assert_eq!(expand(&d, vec!["5".into()], None, 1).unwrap(), "other");
+        assert_eq!(
+            expand(&d, vec!["2".into()], Ctx::default(), 1).unwrap(),
+            "two"
+        );
+        assert_eq!(
+            expand(&d, vec!["5".into()], Ctx::default(), 1).unwrap(),
+            "other"
+        );
         let d = def(
             &["x"],
             None,
             "{% let s = [x, \"b\"].map(|v| v.upper).join(\"-\") %}{{s}} {{x.stringify}}",
         );
-        assert_eq!(expand(&d, vec!["a".into()], None, 1).unwrap(), "A-B \"a\"");
+        assert_eq!(
+            expand(&d, vec!["a".into()], Ctx::default(), 1).unwrap(),
+            "A-B \"a\""
+        );
         // Hygiene: the macro's own `let t` is renamed, not the inserted `t`.
         let d = def(&["v"], None, "let t = {{v}}\nt + 1");
         assert_eq!(
-            expand(&d, vec!["t".into()], None, 4).unwrap(),
+            expand(&d, vec!["t".into()], Ctx::default(), 4).unwrap(),
             "let t__m4 = t\nt__m4 + 1"
+        );
+        let d = def(&[], None, "let t: int = 1\nprint(\"#{t} t\", t: t)");
+        assert_eq!(
+            expand(&d, vec![], Ctx::default(), 2).unwrap(),
+            "let t__m2: int = 1\nprint(\"#{t__m2} t\", t: t__m2)"
         );
         let ty = TypeCtx {
             name: "P".into(),
-            fields: vec![("x".into(), "int".into()), ("y".into(), String::new())],
-            methods: vec![],
+            fields: ["x", "y"]
+                .iter()
+                .zip(["int", ""])
+                .map(|(n, ty)| {
+                    Rc::new(VarCtx {
+                        name: n.to_string(),
+                        ty: ty.to_string(),
+                        ..Default::default()
+                    })
+                })
+                .collect(),
+            ..Default::default()
         };
         let d = def(
             &[],
@@ -981,16 +1165,25 @@ mod tests {
             "{{@type.name}}: {{@type.fields.map(|f| \"#{f.name}=\\#{@#{f.name}}\").join(\", \")}}",
         );
         assert_eq!(
-            expand(&d, vec![], Some(&ty), 1).unwrap(),
+            expand(
+                &d,
+                vec![],
+                Ctx {
+                    ty: Some(&ty),
+                    def: None
+                },
+                1
+            )
+            .unwrap(),
             "P: x=#{@x}, y=#{@y}"
         );
         assert!(
-            expand(&d, vec![], None, 1)
+            expand(&d, vec![], Ctx::default(), 1)
                 .unwrap_err()
                 .contains("`@type` is only available")
         );
         assert!(
-            expand(&def(&["a"], None, ""), vec![], None, 1)
+            expand(&def(&["a"], None, ""), vec![], Ctx::default(), 1)
                 .unwrap_err()
                 .contains("expects 1 argument")
         );

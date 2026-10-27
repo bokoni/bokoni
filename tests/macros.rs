@@ -120,6 +120,84 @@ fn macros_from_previous_scripts_and_required_files() {
 }
 
 #[test]
+fn annotations_and_def() {
+    // The example of `docs/syntax.md`: fields' annotations, positional or named.
+    let src = "annotation Validate
+  min: int? = nil
+  max: int? = nil
+end
+
+macro type_doc
+  def doc(): str = {{@type.annotation(Doc).text}}
+end
+
+macro validate_fields
+  def validate(): [str]
+    let errors: [str] = []
+    {% for f in @type.fields %}
+      {% if v = f.annotation(Validate) %}
+        {% if v.min %}
+          errors << \"{{f.name}} < {{v.min}}\" if @{{f.name}} < {{v.min}}
+        {% end %}
+        {% if v.max %}
+          errors << \"{{f.name}} > {{v.max}}\" if @{{f.name}} > {{v.max}}
+        {% end %}
+      {% end %}
+    {% end %}
+    errors
+  end
+end
+
+@[Doc(\"A server\")]
+type Server
+  @[Validate(min: 1, max: 65535)]
+  port: int = 0
+  @[Validate(0)]
+  workers: int = 0
+  name: str = \"\"
+  validate_fields()
+  type_doc()
+end
+
+let s = Server(workers: -2)
+[s.validate(), s.doc()]";
+    assert_eq!(
+        run(src),
+        "=> [[\"port < 1\", \"workers < 0\"], \"A server\"]"
+    );
+    // `@def`: the method whose body contains the call.
+    let src = "macro trace
+  print({{\"#{@def.name}(#{@def.params.map(|p| \"#{p.name}: #{p.type}\").join(\", \")}): #{@def.return_type}\".stringify}})
+  {% if a = @def.annotation(Deprecated) %}
+  print(\"deprecated: \" + {{a.message}})
+  {% end %}
+end
+@[Deprecated(\"use plus\")]
+def add(a: int, b = 2): int
+  trace()
+  a + b
+end
+def f
+  trace()
+end
+add(1)
+f()";
+    assert_eq!(
+        run(src),
+        "add(a: int, b: any): int\ndeprecated: use plus\nf(): any\n=> nil"
+    );
+    let out = run("macro m\n  {{@def.name}}\nend\nm()");
+    assert!(
+        out.contains("`@def` is only available in the body of a method"),
+        "{out}"
+    );
+    let out = run(
+        "annotation A\n  x: int = 0\nend\nmacro m\n  {{@type.annotation(A).y}}\nend\n@[A]\ntype T\n  m()\nend",
+    );
+    assert!(out.contains("annotation `A` has no field `y`"), "{out}");
+}
+
+#[test]
 fn macro_errors() {
     let check = |src: &str, msg: &str| {
         let out = run(src);

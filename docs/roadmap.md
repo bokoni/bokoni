@@ -342,14 +342,15 @@ namespaces, `trait` for shared behavior.
       and its call)
 - [x] Calls as statements, as type members (with `@type`: name, fields, methods) and
       as expressions (a `begin … end`)
-- [x] Hygiene: the `let`s of the macro's own text renamed
+- [x] Hygiene: the `let`s of the macro's own text renamed (in interpolations too)
+- [x] `@def` (name, parameters, return type) and annotations read by macros
+      (`f.annotation(Validate)`, `{% if v = … %}`): the `validate_fields` example works
 - [x] Macros kept by the engine: usable by later scripts and by the files that
       `require` the one declaring them
 
 ### Next
 
-- Macros: `@def`, annotations read by macros (`f.annotation(Validate)`), calls without
-  parentheses.
+- Macros: calls without parentheses, named arguments.
 
 No design decision needed:
 

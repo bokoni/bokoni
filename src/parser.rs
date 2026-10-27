@@ -26,7 +26,7 @@ use crate::ast::*;
 use crate::diagnostic::{Error, Errors, Result};
 use crate::intern::{Interner, Symbol};
 use crate::lexer::{Lexer, Token, TokenKind};
-use crate::macros::{MacroDef, Macros, TypeCtx};
+use crate::macros::{AnnCtx, Ctx, DefCtx, MacroDef, Macros, TypeCtx, VarCtx};
 use crate::span::{Span, line_col};
 use std::rc::Rc;
 
@@ -59,6 +59,13 @@ pub fn parse_with(
     macros: &mut Macros,
 ) -> std::result::Result<Program, Errors> {
     macros.full = src.to_string();
+    // The annotations the engine declares.
+    for (name, field, default) in [("Deprecated", "message", "nil"), ("Doc", "text", "")] {
+        macros
+            .annotations
+            .entry(name.into())
+            .or_insert_with(|| Rc::from([(field.to_string(), default.to_string())]));
+    }
     let mut lexer = Lexer::new(src);
     let cur = lexer.next_token();
     let mut p = Parser {
@@ -70,6 +77,7 @@ pub fn parse_with(
         interner,
         macros,
         macro_depth: 0,
+        cur_def: None,
         ast: Ast::default(),
         s_exprs: Vec::new(),
         s_args: Vec::new(),
@@ -120,6 +128,8 @@ struct Parser<'s, 'i> {
     macros: &'i mut Macros,
     /// Nesting of macro expansions being parsed.
     macro_depth: u32,
+    /// The method whose body is being parsed (`@def` in a macro).
+    cur_def: Option<Rc<DefCtx>>,
     ast: Ast,
     // Temporary stacks for lists under construction (nesting: each list records its
     // starting height and only removes its own elements).
@@ -777,7 +787,12 @@ impl Parser<'_, '_> {
             );
         }
         self.macros.count += 1;
-        match crate::macros::expand(&def, texts, ty, self.macros.count) {
+        let in_def = self.cur_def.clone();
+        let ctx = Ctx {
+            ty,
+            def: in_def.as_deref(),
+        };
+        match crate::macros::expand(&def, texts, ctx, self.macros.count) {
             Ok(text) => Ok(Some((text, call, name))),
             Err(msg) => self.error_at(format!("macro `{name}`: {msg}"), call),
         }
@@ -854,34 +869,112 @@ impl Parser<'_, '_> {
     }
 
     /// The type whose body is being parsed, for `@type`.
-    fn type_ctx(&self, name: Symbol, members: &[Member]) -> TypeCtx {
+    fn type_ctx(&self, name: Symbol, members: &[Member], annotations: &[AnnotationUse]) -> TypeCtx {
         let mut ctx = TypeCtx {
             name: self.interner.resolve(name).to_string(),
+            annotations: self.anns_ctx(annotations),
             ..Default::default()
-        };
-        let ty_text = |t: &Option<TypeExpr>| {
-            t.as_ref()
-                .map_or(String::new(), |t| t.span.text(self.src).to_string())
         };
         for m in members {
             match m {
-                Member::Field(f) => ctx
-                    .fields
-                    .push((self.interner.resolve(f.name).to_string(), ty_text(&f.ty))),
-                Member::Method(f) => {
-                    let n = self.interner.resolve(f.name).to_string();
-                    if n == "init" {
+                Member::Field(f) => {
+                    ctx.fields
+                        .push(self.var_ctx(f.name, &f.ty, f.default, &f.annotations))
+                }
+                Member::Method(f) | Member::Abstract(f) => {
+                    if self.interner.resolve(f.name) == "init" {
                         for p in f.params.iter().flatten().filter(|p| p.is_field) {
                             ctx.fields
-                                .push((self.interner.resolve(p.name).to_string(), ty_text(&p.ty)));
+                                .push(self.var_ctx(p.name, &p.ty, p.default, &p.annotations));
                         }
                     }
-                    ctx.methods.push(n);
+                    ctx.methods.push(Rc::new(self.def_ctx(
+                        f.name,
+                        f.params.as_deref(),
+                        &f.ret,
+                        &f.annotations,
+                    )));
                 }
                 _ => {}
             }
         }
         ctx
+    }
+
+    /// A method, for `@def`.
+    fn def_ctx(
+        &self,
+        name: Symbol,
+        params: Option<&[Param]>,
+        ret: &Option<TypeExpr>,
+        annotations: &[AnnotationUse],
+    ) -> DefCtx {
+        DefCtx {
+            name: self.interner.resolve(name).to_string(),
+            params: params
+                .unwrap_or_default()
+                .iter()
+                .map(|p| self.var_ctx(p.name, &p.ty, p.default, &p.annotations))
+                .collect(),
+            ret: self.ty_text(ret),
+            annotations: self.anns_ctx(annotations),
+        }
+    }
+
+    fn var_ctx(
+        &self,
+        name: Symbol,
+        ty: &Option<TypeExpr>,
+        default: Option<ExprId>,
+        annotations: &[AnnotationUse],
+    ) -> Rc<VarCtx> {
+        Rc::new(VarCtx {
+            name: self.interner.resolve(name).to_string(),
+            ty: self.ty_text(ty),
+            default: default.map_or(String::new(), |e| self.src_text(self.span(e))),
+            annotations: self.anns_ctx(annotations),
+        })
+    }
+
+    fn ty_text(&self, t: &Option<TypeExpr>) -> String {
+        t.as_ref().map_or(String::new(), |t| self.src_text(t.span))
+    }
+
+    fn anns_ctx(&self, annotations: &[AnnotationUse]) -> Vec<Rc<AnnCtx>> {
+        annotations
+            .iter()
+            .map(|a| {
+                let name = a
+                    .path
+                    .last()
+                    .map_or(String::new(), |s| self.interner.resolve(*s).to_string());
+                Rc::new(AnnCtx {
+                    fields: self.macros.annotations.get(&name).cloned(),
+                    args: self
+                        .ast
+                        .get(a.args)
+                        .iter()
+                        .map(|arg| {
+                            (
+                                arg.name.map(|n| self.interner.resolve(n).to_string()),
+                                self.src_text(self.span(arg.value)),
+                            )
+                        })
+                        .collect(),
+                    name,
+                })
+            })
+            .collect()
+    }
+
+    /// Text of `span`, in the source or in the code generated by a macro.
+    fn src_text(&self, span: Span) -> String {
+        let src = if span.end as usize <= self.src.len() {
+            self.src
+        } else {
+            self.macros.full.as_str()
+        };
+        span.text(src).to_string()
     }
 
     /// Parses `text`, generated by macro `name` called at `call`, with `f`: placed after
@@ -910,6 +1003,7 @@ impl Parser<'_, '_> {
             interner: &mut *self.interner,
             macros: &mut *self.macros,
             macro_depth: self.macro_depth + 1,
+            cur_def: self.cur_def.clone(),
             ast: std::mem::take(&mut self.ast),
             s_exprs: Vec::new(),
             s_args: Vec::new(),
@@ -1147,7 +1241,27 @@ impl Parser<'_, '_> {
         let start = self.bump().span;
         let (name, name_span, params, ret) = self.signature()?;
         let forall = self.forall()?;
-        let body = if self.eat(T::Eq) {
+        // `@def` for the macros called in the body.
+        let ctx = self.def_ctx(name, params.as_deref(), &ret, &annotations);
+        let outer = self.cur_def.replace(Rc::new(ctx));
+        let body = self.def_body(name, start);
+        self.cur_def = outer;
+        let body = body?;
+        Ok(FnDecl {
+            name,
+            name_span,
+            params,
+            ret,
+            body,
+            annotations,
+            vis: Visibility::Public,
+            forall,
+            span: self.span_from(start),
+        })
+    }
+
+    fn def_body(&mut self, name: Symbol, start: Span) -> Result<Block> {
+        Ok(if self.eat(T::Eq) {
             let e = self.expr()?;
             expr_block(e, self.span(e))
         } else {
@@ -1159,17 +1273,6 @@ impl Parser<'_, '_> {
                 ));
             }
             self.body_end("def", start)?
-        };
-        Ok(FnDecl {
-            name,
-            name_span,
-            params,
-            ret,
-            body,
-            annotations,
-            vis: Visibility::Public,
-            forall,
-            span: self.span_from(start),
         })
     }
 
@@ -1387,7 +1490,7 @@ impl Parser<'_, '_> {
             // the type, `@type`, as declared so far).
             let mut new = Vec::new();
             if self.at_macro() {
-                let ctx = self.type_ctx(name, &members);
+                let ctx = self.type_ctx(name, &members, &annotations);
                 let expansion =
                     self.recovering(&[T::End], "the macro call", |p| p.macro_here(Some(&ctx)))?;
                 if let Some(Some((text, call, mname))) = expansion {
@@ -1468,6 +1571,23 @@ impl Parser<'_, '_> {
             }
         }
         self.end(opener, kw.span)?;
+        if kind == TypeDeclKind::Annotation {
+            // Its fields, for macros that read its uses.
+            let fields: Vec<(String, String)> = members
+                .iter()
+                .filter_map(|m| match m {
+                    Member::Field(f) => Some((
+                        self.interner.resolve(f.name).to_string(),
+                        f.default
+                            .map_or(String::new(), |e| self.src_text(self.span(e))),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            self.macros
+                .annotations
+                .insert(self.interner.resolve(name).to_string(), Rc::from(fields));
+        }
         Ok(TypeDecl {
             kind,
             name,
