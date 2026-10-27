@@ -246,3 +246,26 @@ fn deprecated_uses_are_warned() {
     assert!(log[1].contains("`C.m` est obsolète"), "{log:?}");
     assert!(log[2].starts_with("print 3"), "{log:?}");
 }
+
+#[test]
+fn deprecated_parameters_are_warned_when_passed() {
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    let src = "def connect(host: str, @[Deprecated(\"utiliser timeout_ms\")] timeout: int = 0, timeout_ms: int = 0) = host\n";
+    e.eval(&format!("{src}connect(\"a\")\nconnect(\"a\", 5)\nconnect(\"a\", timeout_ms: 5)\nconnect(\"a\", timeout: 1)")).unwrap();
+    let w: Vec<String> = e
+        .take_warnings()
+        .iter()
+        .map(|w| w.message.clone())
+        .collect();
+    assert_eq!(
+        w,
+        [
+            "le paramètre `timeout` de `connect` est obsolète : utiliser timeout_ms",
+            "le paramètre `timeout` de `connect` est obsolète : utiliser timeout_ms",
+        ]
+    );
+    // Fonction d'un script précédent : même avertissement.
+    e.eval("connect(\"b\", timeout: 2)").unwrap();
+    assert_eq!(e.take_warnings().len(), 1);
+}

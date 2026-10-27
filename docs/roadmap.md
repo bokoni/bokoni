@@ -177,7 +177,8 @@ Temps compilation comprise.
 - [x] `Deprecated` et `Doc` déclarées par un prélude ; avertissement à chaque utilisation
       d'une déclaration `@[Deprecated]` (`ErrorKind::Warning`, `Engine::take_warnings`,
       `Engine::set_warning_handler`, affichés par l'exécutable)
-- [ ] Paramètre `@[Deprecated]` : pas d'avertissement quand l'argument est passé
+- [x] Paramètre `@[Deprecated]` : avertissement quand l'argument est passé (par
+      position ou par nom)
 
 ### Ensuite
 

@@ -47,6 +47,7 @@ pub fn check(
         prims: Prims::default(),
         warnings: Vec::new(),
         deprecated_fns: FxHashMap::default(),
+        deprecated_params: FxHashMap::default(),
     };
     c.block_stmts(&program.body);
     (c.errors, c.warnings, c.prims)
@@ -287,6 +288,8 @@ struct Checker<'a> {
     warnings: Vec<Error>,
     /// Fonctions et méthodes `@[Deprecated]` (clé : adresse de la signature).
     deprecated_fns: FxHashMap<usize, Dep>,
+    /// Paramètres `@[Deprecated]` (clé : adresse de la signature, index du paramètre).
+    deprecated_params: FxHashMap<(usize, usize), Dep>,
 }
 
 /// Bloc de construction d'un type inconnu : assignations libres, sans erreur en cascade.
@@ -423,6 +426,27 @@ impl Checker<'_> {
     fn mark_fn(&mut self, sig: &Rc<FnSig>, dep: Option<Dep>) {
         if let Some(d) = dep {
             self.deprecated_fns.insert(Rc::as_ptr(sig) as usize, d);
+        }
+    }
+
+    /// Paramètres obsolètes d'une fonction de ce programme (annotations source).
+    fn mark_params_ast(&mut self, sig: &Rc<FnSig>, params: Option<&[Param]>) {
+        for (k, p) in params.unwrap_or(&[]).iter().enumerate() {
+            if let Some(d) = self.ast_deprecation(&p.annotations) {
+                self.deprecated_params
+                    .insert((Rc::as_ptr(sig) as usize, k), d);
+            }
+        }
+    }
+
+    /// Paramètres obsolètes d'une fonction déjà compilée (annotations de l'IR : celles de
+    /// l'AST désignent le source d'un autre programme).
+    fn mark_params_ir(&mut self, sig: &Rc<FnSig>, p: &crate::ir::Proto) {
+        for (k, prm) in p.params.iter().enumerate() {
+            if let Some(d) = self.ir_deprecation(&prm.annotations) {
+                self.deprecated_params
+                    .insert((Rc::as_ptr(sig) as usize, k), d);
+            }
         }
     }
 
@@ -579,6 +603,7 @@ impl Checker<'_> {
                         self.quiet -= 1;
                         let dep = self.ir_deprecation(&c.proto.annotations);
                         self.mark_fn(&sig, dep);
+                        self.mark_params_ir(&sig, &c.proto);
                         Ty::Fn(sig)
                     }
                     None => Ty::Any,
@@ -668,6 +693,7 @@ impl Checker<'_> {
                 let sig = self.signature(d.params.as_deref().unwrap_or(&[]), d.ret.as_ref(), false);
                 let dep = self.ir_deprecation(&p.annotations);
                 self.mark_fn(&sig, dep);
+                self.mark_params_ir(&sig, p);
                 sig
             }
             None => Rc::new(FnSig {
@@ -876,6 +902,7 @@ impl Checker<'_> {
                         );
                         let dep = self.ast_deprecation(&f.annotations);
                         self.mark_fn(&sig, dep);
+                        self.mark_params_ast(&sig, f.params.as_deref());
                         methods.insert(f.name, sig);
                     }
                     Member::Stmt(_) => {}
@@ -928,6 +955,7 @@ impl Checker<'_> {
                         );
                         let dep = self.ast_deprecation(&m.annotations);
                         self.mark_fn(&sig, dep);
+                        self.mark_params_ast(&sig, m.params.as_deref());
                         (m.name, sig)
                     })
                     .collect();
@@ -939,6 +967,7 @@ impl Checker<'_> {
                 let sig = self.signature(f.params.as_deref().unwrap_or(&[]), f.ret.as_ref(), false);
                 let dep = self.ast_deprecation(&f.annotations);
                 self.mark_fn(&sig, dep);
+                self.mark_params_ast(&sig, f.params.as_deref());
                 self.declare(f.name, Ty::Fn(sig), VarKind::Func);
             }
         }
@@ -1015,6 +1044,7 @@ impl Checker<'_> {
                         );
                         let dep = self.ast_deprecation(&f.annotations);
                         self.mark_fn(&sig, dep);
+                        self.mark_params_ast(&sig, f.params.as_deref());
                         sig
                     }
                 };
@@ -1422,7 +1452,12 @@ impl Checker<'_> {
                 block,
             } => {
                 let f = self.expr(callee, None);
-                self.call(&f, args, block, span, None)
+                // Appel d'une fonction nommée : son nom dans les messages.
+                let label = match ast.kind(callee) {
+                    ExprKind::Ident(n) => Some(format!("`{}`", self.name(n))),
+                    _ => None,
+                };
+                self.call(&f, args, block, span, label.as_deref())
             }
             ExprKind::MethodCall {
                 recv,
@@ -1976,6 +2011,11 @@ impl Checker<'_> {
                     if given[i] {
                         let msg = format!("argument `{}` donné deux fois", self.name(p.name));
                         self.error(msg, ast.span(a.value));
+                    }
+                    let key = (sig as *const FnSig as usize, i);
+                    if let Some(dep) = self.deprecated_params.get(&key).cloned() {
+                        let param = format!("le paramètre `{}` de {what}", self.name(p.name));
+                        self.warn_deprecated(Some(&dep), &param, ast.span(a.value));
                     }
                     given[i] = true;
                     let label = format!(" pour `{}`", self.name(p.name));

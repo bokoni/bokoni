@@ -536,7 +536,8 @@ Elles sont déclarées par le moteur comme des annotations ordinaires
 
 L'avertissement de `Deprecated` est émis par la vérification, avant l'exécution, à chaque
 utilisation : appel ou mention d'une fonction, d'un type, d'un enum, d'une variante
-(`Protocol::Ftp`), lecture ou passage par nom d'un champ, appel d'une méthode — y compris
+(`Protocol::Ftp`), lecture ou passage par nom d'un champ, appel d'une méthode, argument
+passé à un paramètre obsolète — y compris
 depuis un script suivant. Depuis Rust : `engine.take_warnings()` ou
 `engine.set_warning_handler(…)` ; l'exécutable les affiche sur la sortie d'erreur.
 
