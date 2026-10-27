@@ -683,3 +683,82 @@ fn range_limits() {
         "10"
     );
 }
+
+/// Exécute `f` dans un fil à petite pile : une récursion non maîtrisée y déborderait.
+fn small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(1 << 20)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn deep_structures_do_not_overflow() {
+    // Données imbriquées 200 000 fois : construites, comparées, affichées, libérées
+    // (la libération récursive faisait déborder la pile).
+    let out = small_stack(|| {
+        let mut out = Vec::new();
+        for src in [
+            "let l = []\nfor i in 0...200000\n  l = [l]\nend\nl.len()",
+            "let a = []\nlet b = []\nfor i in 0...200000\n  a = [a]\n  b = [b]\nend\na == b",
+            "let a = []\nlet b = [1]\nfor i in 0...200000\n  a = [a]\n  b = [b]\nend\na == b",
+            "let h = {}\nfor i in 0...200000\n  h = {\"k\" => h}\nend\nh.len()",
+            "let r = {v: 0}\nfor i in 0...200000\n  r = {v: r}\nend\nr == r",
+            "let t = (0, 0)\nfor i in 0...200000\n  t = (t, i)\nend\nt.1",
+            "type N\n  suiv = nil\nend\nlet n = N()\nfor i in 0...200000\n  n = N(suiv: n)\nend\nn == n",
+            "let f = || 0\nfor i in 0...200000\n  let g = f\n  f = || g()\nend\n1",
+            "let a = []\nfor i in 0...200000\n  a = [a, i]\nend\na.to_s().len() > 10",
+        ] {
+            let mut e = Engine::new();
+            e.set_output(|_| {});
+            // Variables qui changent de type à chaque tour : vérification dynamique.
+            e.set_static_checks(false);
+            out.push(
+                e.eval(src)
+                    .map(|v| e.inspect(&v))
+                    .unwrap_or_else(|err| err.to_string()),
+            );
+        }
+        out
+    });
+    assert_eq!(
+        out,
+        [
+            "1", "true", "false", "1", "true", "199999", "true", "1", "true"
+        ]
+    );
+}
+
+#[test]
+fn deep_sources_do_not_overflow() {
+    let out = small_stack(|| {
+        let mut out = Vec::new();
+        for src in [
+            format!("1{}", " + 1".repeat(200_000)),
+            format!("{}1", "- ".repeat(100_000)),
+            format!("{}true", "not ".repeat(100_001)),
+            format!("let a = [1]\na{}", ".len().to_s()".repeat(20_000)),
+            format!("{}1{}", "(".repeat(100_000), ")".repeat(100_000)),
+        ] {
+            let mut e = Engine::new();
+            e.set_output(|_| {});
+            out.push(match e.eval(&src) {
+                Ok(v) => e.inspect(&v),
+                Err(err) => {
+                    // Message borné, même pour une ligne de 200 000 caractères.
+                    let shown = err.render(&src, "test");
+                    assert!(shown.len() < 1000, "{} octets", shown.len());
+                    err[0].message.clone()
+                }
+            });
+        }
+        out
+    });
+    assert_eq!(out[0], "200001");
+    assert_eq!(out[1], "1");
+    assert_eq!(out[2], "false");
+    assert_eq!(out[3], "\"1\"");
+    assert_eq!(out[4], "imbrication trop profonde");
+}

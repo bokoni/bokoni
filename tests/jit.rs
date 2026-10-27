@@ -438,12 +438,12 @@ fn native_allocations_are_freed() {
             def loop2(xs: [V], n: int): float\n  let t = 0.0\n  let i = 0\n  while i < n\n    for p in keep(xs)\n      t += add(p, again(xs)).x\n    end\n    i += 1\n  end\n  t\nend")
         .unwrap();
     let counts = |e: &mut Engine| -> Vec<usize> {
-        let (bokoni::Value::List(l), bokoni::Value::Object(v)) =
+        let (bokoni::Value::List(ref l), bokoni::Value::Object(ref v)) =
             (e.eval("vs").unwrap(), e.eval("v").unwrap())
         else {
             panic!()
         };
-        let mut c = vec![Rc::strong_count(&l), Rc::strong_count(&v)];
+        let mut c = vec![Rc::strong_count(l), Rc::strong_count(v)];
         c.extend(l.borrow().iter().map(|x| match x {
             bokoni::Value::Object(o) => Rc::strong_count(o),
             _ => 0,

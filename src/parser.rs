@@ -1244,6 +1244,11 @@ impl Parser<'_, '_> {
     }
 
     fn binary(&mut self, min_bp: u8) -> Result<ExprId> {
+        // Opérateurs préfixes imbriqués (`- - - x`) : récursion sans passer par `expr`.
+        stacker::maybe_grow(RED_ZONE, STACK_GROW, || self.binary_inner(min_bp))
+    }
+
+    fn binary_inner(&mut self, min_bp: u8) -> Result<ExprId> {
         let mut lhs = self.prefix()?;
         loop {
             let kind = self.peek();

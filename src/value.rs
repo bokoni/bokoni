@@ -266,6 +266,22 @@ impl Value {
     pub fn equals(&self, other: &Value) -> bool {
         use Value::*;
         match (self, other) {
+            // Conteneurs : comparaison récursive, la pile grandit sur le tas au besoin
+            // (structures imbriquées très profondément).
+            (List(_), List(_))
+            | (Tuple(_), Tuple(_))
+            | (Hash(_), Hash(_))
+            | (Record(_), Record(_))
+            | (Object(_), Object(_)) => {
+                stacker::maybe_grow(64 * 1024, 1024 * 1024, || self.equals_deep(other))
+            }
+            _ => self.equals_deep(other),
+        }
+    }
+
+    fn equals_deep(&self, other: &Value) -> bool {
+        use Value::*;
+        match (self, other) {
             (Nil, Nil) => true,
             (Bool(a), Bool(b)) => a == b,
             (Int(a), Int(b)) => a == b,
@@ -498,6 +514,138 @@ pub mod layout {
     pub const FIRST_HEAP_TAG: u8 = 4;
     pub const PAYLOAD: i32 = 8;
     pub const SIZE: i32 = 24;
+}
+
+/// Libération sans récursion : une structure imbriquée très profondément (liste de liste
+/// de liste…, 300 000 niveaux) ferait sinon déborder la pile en se libérant.
+///
+/// Seul le dernier propriétaire d'un conteneur le démonte : ses éléments conteneurs vont
+/// sur une pile de travail (sur le tas), les autres sont libérés sur place.
+impl Drop for Value {
+    #[inline]
+    fn drop(&mut self) {
+        // Cas courant (nombre, chaîne, conteneur partagé ou sans conteneur imbriqué) :
+        // libération ordinaire, rien à faire ici.
+        if is_container(self) && has_nested(self) {
+            drop_deep(self);
+        }
+    }
+}
+
+/// Démonte `v` et ses descendants sans récursion.
+#[inline(never)]
+fn drop_deep(v: &mut Value) {
+    let mut stack: Vec<Value> = Vec::new();
+    take_children(v, &mut stack);
+    while let Some(mut v) = stack.pop() {
+        take_children(&mut v, &mut stack);
+        // `v` n'a plus d'éléments : sa libération ne descend pas.
+    }
+}
+
+/// `v` est l'unique propriétaire d'un conteneur qui contient lui-même un conteneur
+/// (`Rc::get_mut` : unicité et accès sans vérification d'emprunt).
+#[inline]
+fn has_nested(v: &mut Value) -> bool {
+    fn any<'a>(mut xs: impl Iterator<Item = &'a Value>) -> bool {
+        xs.any(is_container)
+    }
+    match v {
+        Value::List(rc) => Rc::get_mut(rc).is_some_and(|c| any(c.get_mut().iter())),
+        Value::Tuple(rc) => Rc::get_mut(rc).is_some_and(|c| any(c.iter())),
+        Value::Hash(rc) => {
+            Rc::get_mut(rc).is_some_and(|c| any(c.get_mut().entries.iter().map(|(_, x)| x)))
+        }
+        Value::Record(rc) => {
+            Rc::get_mut(rc).is_some_and(|c| any(c.get_mut().fields.iter().map(|(_, x)| x)))
+        }
+        Value::Object(rc) => Rc::get_mut(rc).is_some_and(|c| any(c.get_mut().fields.iter())),
+        Value::Function(rc) => Rc::get_mut(rc).is_some_and(|f| match f {
+            Function::Script(c) => c
+                .upvals
+                .iter_mut()
+                .any(|u| Rc::get_mut(u).is_some_and(|u| is_container(u.get_mut()))),
+            _ => false,
+        }),
+        Value::Iter(rc) => Rc::get_mut(rc).is_some_and(|c| match c.get_mut() {
+            crate::vm::IterState::Values(items) => any(items.as_slice().iter()),
+            _ => false,
+        }),
+        _ => false,
+    }
+}
+
+/// Conteneur susceptible de contenir d'autres valeurs.
+#[inline]
+fn is_container(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::List(_)
+            | Value::Tuple(_)
+            | Value::Hash(_)
+            | Value::Record(_)
+            | Value::Object(_)
+            | Value::Function(_)
+            | Value::Iter(_)
+    )
+}
+
+/// Retire les éléments de `v` si `v` est l'unique propriétaire d'un conteneur : les
+/// conteneurs vont dans `out`, le reste est libéré tout de suite.
+fn take_children(v: &mut Value, out: &mut Vec<Value>) {
+    let mut push = |x: Value| {
+        if is_container(&x) {
+            out.push(x);
+        }
+    };
+    match v {
+        Value::List(rc) => {
+            if let Some(cell) = Rc::get_mut(rc) {
+                cell.get_mut().drain(..).for_each(&mut push);
+            }
+        }
+        Value::Tuple(rc) => {
+            if let Some(items) = Rc::get_mut(rc) {
+                for x in items.iter_mut() {
+                    push(std::mem::replace(x, Value::Nil));
+                }
+            }
+        }
+        Value::Hash(rc) => {
+            if let Some(cell) = Rc::get_mut(rc) {
+                let h = cell.get_mut();
+                h.index.clear();
+                h.entries.drain(..).for_each(|(_, x)| push(x));
+            }
+        }
+        Value::Record(rc) => {
+            if let Some(cell) = Rc::get_mut(rc) {
+                cell.get_mut().fields.drain(..).for_each(|(_, x)| push(x));
+            }
+        }
+        Value::Object(rc) => {
+            if let Some(cell) = Rc::get_mut(rc) {
+                cell.get_mut().fields.drain(..).for_each(&mut push);
+            }
+        }
+        Value::Function(rc) => {
+            if let Some(Function::Script(c)) = Rc::get_mut(rc) {
+                for cell in c.upvals.iter_mut() {
+                    if let Some(cell) = Rc::get_mut(cell) {
+                        push(std::mem::replace(cell.get_mut(), Value::Nil));
+                    }
+                }
+            }
+        }
+        Value::Iter(rc) => {
+            if let Some(cell) = Rc::get_mut(rc)
+                && let crate::vm::IterState::Values(items) = cell.get_mut()
+            {
+                items.for_each(&mut push);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

@@ -690,10 +690,10 @@ impl Runtime {
                 if !args.shapes.is_empty() {
                     args.shapes.remove(site.npos as usize - 1);
                 }
-                let Value::Function(func) = block else {
+                let Value::Function(func) = &block else {
                     unreachable!()
                 };
-                let Function::Script(c) = &*func else {
+                let Function::Script(c) = &**func else {
                     unreachable!()
                 };
                 self.construct(info, args, Some(c), span)?

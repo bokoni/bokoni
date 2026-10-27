@@ -39,7 +39,10 @@ fn seed(base: u64) -> Rng {
 /// Nombre de cas : `n` (un cinquième en debug, pour que `cargo test` reste rapide),
 /// multiplié par `BK_FUZZ`.
 fn count(n: usize) -> usize {
-    match std::env::var("BK_FUZZ").ok().and_then(|s| s.parse::<usize>().ok()) {
+    match std::env::var("BK_FUZZ")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
         Some(k) => n * k,
         None if cfg!(debug_assertions) => n / 5,
         None => n,

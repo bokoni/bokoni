@@ -244,6 +244,10 @@ impl Resolver<'_> {
 
     /// Analyse une expression ; vrai si elle contient une assignation.
     fn expr(&mut self, e: ExprId) -> bool {
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || self.expr_inner(e))
+    }
+
+    fn expr_inner(&mut self, e: ExprId) -> bool {
         let ast = self.ast;
         let a = match ast.kind(e) {
             ExprKind::Int(_)

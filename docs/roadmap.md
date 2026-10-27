@@ -211,6 +211,26 @@ Ce qui comptait, mesuré au profileur : la quantité de mémoire touchée. Passe
 par nœud à l'AST compact a divisé le temps de parsing par deux (120 ms → 60 ms) ; les autres
 optimisations (lexer à la demande, interning des noms courts) n'ont apporté que quelques %.
 
+## Robustesse
+
+- Fuzzing (`tests/fuzz.rs`) : textes aléatoires, mutations de programmes valides,
+  programmes générés ; interpréteur, JIT et code de base, avec et sans vérification
+  statique : ni panique, ni blocage, mêmes résultats. Campagnes longues :
+  `BK_FUZZ=50 BK_FUZZ_SEED=3 cargo test --release --test fuzz`
+- Aucune récursion sur la pile pour des entrées démesurées : source imbriqué (limite
+  d'imbrication du parseur, longues chaînes d'opérateurs), données imbriquées des
+  centaines de milliers de fois (libération itérative de `Value`, comparaison sur une
+  pile qui grandit sur le tas)
+- Allocations démesurées refusées par une erreur plutôt qu'un arrêt du processus :
+  chaîne répétée au-delà de 2 Gio, intervalle converti en liste au-delà de 2^27
+  éléments ; `map` / `filter` / `each` / `reduce` / `find` parcourent un intervalle
+  sans le copier
+- Messages d'erreur bornés : seule une fenêtre de 120 caractères d'une longue ligne est
+  affichée
+- `Value` implémente `Drop` (libération itérative) : depuis Rust, lier ses champs par
+  référence (`if let Value::List(ref l) = v`) ou les cloner ; coût mesuré de 3 à 8 % sur
+  les programmes qui allouent beaucoup
+
 ## Limites connues (v0.1)
 
 - Cycles de références : une fonction locale qui se capture elle-même n'est jamais libérée

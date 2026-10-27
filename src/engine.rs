@@ -111,8 +111,8 @@ impl Engine {
     /// La fonction globale `name` a-t-elle été compilée en code natif (après au moins un
     /// appel) ?
     pub fn is_native(&self, name: &str) -> bool {
-        match self.get_global(name) {
-            Some(Value::Function(f)) => match &*f {
+        match self.get_global(name).as_ref() {
+            Some(Value::Function(f)) => match &**f {
                 Function::Script(c) => {
                     matches!(*c.proto.jit.borrow(), crate::ir::JitState::Native(_))
                 }
@@ -182,16 +182,16 @@ impl Engine {
     /// Description d'un `type`, d'une `class` ou d'une `annotation` : champs, méthodes,
     /// annotations (leurs arguments sont évalués maintenant).
     pub fn type_info(&mut self, name: &str) -> Result<crate::reflect::TypeDesc, Errors> {
-        match self.get_global(name) {
-            Some(Value::Type(info)) => Ok(self.rt.type_desc(&info)?),
+        match self.get_global(name).as_ref() {
+            Some(Value::Type(info)) => Ok(self.rt.type_desc(info)?),
             _ => Err(Self::not_found(name, "un type déclaré")),
         }
     }
 
     /// Description d'une fonction du script : paramètres, retour, annotations.
     pub fn function_info(&mut self, name: &str) -> Result<crate::reflect::FnDesc, Errors> {
-        match self.get_global(name) {
-            Some(Value::Function(f)) => match &*f {
+        match self.get_global(name).as_ref() {
+            Some(Value::Function(f)) => match &**f {
                 crate::value::Function::Script(c) => {
                     let p = c.proto.clone();
                     Ok(self.rt.fn_desc(name, &p)?)
@@ -204,8 +204,8 @@ impl Engine {
 
     /// Description d'un `enum` : variantes, méthodes, annotations.
     pub fn enum_info(&mut self, name: &str) -> Result<crate::reflect::EnumDesc, Errors> {
-        match self.get_global(name) {
-            Some(Value::Enum(info)) => Ok(self.rt.enum_desc(&info)?),
+        match self.get_global(name).as_ref() {
+            Some(Value::Enum(info)) => Ok(self.rt.enum_desc(info)?),
             _ => Err(Self::not_found(name, "un enum déclaré")),
         }
     }

@@ -49,6 +49,9 @@ impl std::ops::DerefMut for Error {
     }
 }
 
+/// Largeur maximale de l'extrait de source affiché (en caractères).
+const WINDOW: usize = 120;
+
 impl Error {
     pub fn new(kind: ErrorKind, message: impl Into<String>, span: Option<Span>) -> Self {
         Error(Box::new(ErrorData {
@@ -112,12 +115,30 @@ impl Error {
         // Soulignement limité à la ligne de départ.
         let end = (span.end as usize).clamp(start, line_end);
         let width = src[start..end].chars().count().max(1);
+        // Ligne très longue : seulement une fenêtre autour de la position.
+        let chars: Vec<char> = line_text.chars().collect();
+        let (from, to) = if chars.len() > WINDOW {
+            let from = (col - 1).saturating_sub(WINDOW / 3);
+            (from, (from + WINDOW).min(chars.len()))
+        } else {
+            (0, chars.len())
+        };
+        let mut shown: String = chars[from..to].iter().collect();
+        let mut caret = col - 1 - from;
+        if from > 0 {
+            shown.insert(0, '…');
+            caret += 1;
+        }
+        if to < chars.len() {
+            shown.push('…');
+        }
+        let width = width.min(to.saturating_sub(col - 1).max(1));
         out.push_str(&format!("{pad}--> {file}:{line}:{col}\n"));
         out.push_str(&format!("{pad} |\n"));
-        out.push_str(&format!("{line} | {line_text}\n"));
+        out.push_str(&format!("{line} | {shown}\n"));
         out.push_str(&format!(
             "{pad} | {}{}\n",
-            " ".repeat(col - 1),
+            " ".repeat(caret),
             "^".repeat(width)
         ));
         for (name, call) in &self.trace {
