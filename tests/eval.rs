@@ -578,3 +578,52 @@ fn spec_examples_run() {
         }
     }
 }
+
+#[test]
+fn float_display() {
+    let show = |src: &str| {
+        let mut e = Engine::new();
+        let v = e.eval(src).unwrap();
+        (e.inspect(&v), e.display(&v))
+    };
+    for (src, want) in [
+        ("3.0", "3.0"),
+        ("-0.0", "-0.0"),
+        ("0.1 + 0.2", "0.30000000000000004"),
+        ("1e15", "1000000000000000.0"),
+        ("1e16", "1e16"),
+        ("1.5e16", "1.5e16"),
+        ("1e300", "1e300"),
+        ("-1e300", "-1e300"),
+        ("5e-324", "5e-324"),
+        ("0.0001", "0.0001"),
+        ("0.00001", "1e-5"),
+        ("1.7976931348623157e308", "1.7976931348623157e308"),
+        ("1e308 * 10.0", "inf"),
+        ("-1e308 * 10.0", "-inf"),
+        ("0.0 / 0.0", "NaN"),
+    ] {
+        assert_eq!(show(src), (want.to_string(), want.to_string()), "{src}");
+        // Interpolation : même écriture.
+        assert_eq!(show(&format!("\"#{{{src}}}\"")).1, want, "{src}");
+    }
+    // Chaque écriture finie se relit comme littéral et redonne exactement le nombre.
+    let mut e = Engine::new();
+    for src in [
+        "1e300",
+        "5e-324",
+        "1.2345678901234568e17",
+        "0.1 + 0.2",
+        "1e-7",
+        "2.0 / 3.0",
+        "123456.789e10",
+    ] {
+        let v = e.eval(src).unwrap();
+        let shown = e.inspect(&v);
+        let again = e.eval(&shown).unwrap();
+        let (bokoni::Value::Float(a), bokoni::Value::Float(b)) = (&v, &again) else {
+            panic!("{src} → {shown}")
+        };
+        assert_eq!(a.to_bits(), b.to_bits(), "{src} → {shown}");
+    }
+}

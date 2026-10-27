@@ -456,12 +456,11 @@ impl Value {
 }
 
 /// `2.0` reste `2.0` (et non `2`) pour distinguer les décimaux des entiers.
+/// Écriture la plus courte qui redonne exactement le nombre : `3.0`, `0.1`, `1e300`,
+/// `5e-324`, `1.2345678901234568e17` (notation scientifique pour les très grands et très
+/// petits nombres), `NaN`, `inf`.
 fn write_float(out: &mut String, f: f64) {
-    if f.is_finite() && f == f.trunc() && f.abs() < 1e16 {
-        let _ = write!(out, "{f:.1}");
-    } else {
-        let _ = write!(out, "{f}");
-    }
+    let _ = write!(out, "{f:?}");
 }
 
 impl fmt::Debug for Value {

@@ -53,7 +53,7 @@ peut être désactivée (`engine.set_static_checks(false)`).
 | Type              | Exemple                       |
 |-------------------|-------------------------------|
 | `int`             | `42`, `-1`, `1_000`           |
-| `float`           | `3.14`                        |
+| `float`           | `3.14`, `1e300`, `2.5e-8`     |
 | `str`             | `"hello #{name}"`             |
 | `bool`            | `true`, `false`               |
 | `nil`             | `nil`                         |
@@ -66,6 +66,11 @@ peut être désactivée (`engine.set_static_checks(false)`).
 | `A \| B`          | `int \| str`                  |
 | littéraux         | `"dev" \| "prod"`, `2 \| 4`   |
 | `(A, B): R`       | type d'une fonction / lambda  |
+
+Un décimal s'affiche avec l'écriture la plus courte qui redonne exactement sa valeur :
+`3.0`, `0.1`, `1e300`, `5e-324`, `1.2345678901234568e17` (notation scientifique pour les
+très grands et très petits nombres), `inf`, `-inf`, `NaN`. Cette écriture se relit comme
+littéral.
 
 Les types primitifs sont en minuscules, les types utilisateur commencent par une majuscule.
 
