@@ -690,7 +690,7 @@ impl Proto {
             consts: self.consts.clone(),
             calls: self.calls.clone(),
             shapes: self.shapes.clone(),
-            types: self.types.clone(),
+            types: self.types.iter().map(sub).collect(),
             records: self.records.clone(),
             children: self.children.clone(),
             decls: self.decls.clone(),

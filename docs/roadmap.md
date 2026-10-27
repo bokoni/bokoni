@@ -297,7 +297,11 @@ namespaces, `trait` for shared behavior.
       included) and runs the rest of the function from that instruction; a typed copy
       resumes as the function written (`Spec::origin`); a result of another type than
       the native one is passed to the native caller, which resumes after the call
-- [ ] Lists modified in native code (`xs << x`, `xs[i] = v`, list fields)
+- [x] Lists modified in native code: `xs << x`, `xs[i] = v`, `[]` given its type by
+      an annotation (`let out: [int] = []`), list fields of `self` read and assigned;
+      in a function that modifies lists or calls another, the elements read are copied
+      and a `for` goes over a copy of the list (as the interpreter does); building a
+      list in a typed loop ×5.9
 - [x] Native calls to methods that write fields (and no restriction on what such a
       method contains): the type of a field is checked on every access, a method
       called may change it; a typed loop calling `c.add(k)`: 0.11 s → 0.02 s

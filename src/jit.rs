@@ -10,6 +10,9 @@
 //!   compiled.
 //! - Same rules as the interpreter: overflow, division by zero and call depth are checked,
 //!   with the same messages and the same call stack.
+//! - Lists are modified in place (`xs << x`, `xs[i] = v`). Where a list may change (this
+//!   function modifies one, or calls another), the elements read are copied rather than
+//!   pointed to, and a `for` goes over a copy of the list.
 //! - When an assumption does not hold (value of another type, index out of bounds,
 //!   method redefined, native stack nearly full), the native code is not abandoned: the
 //!   interpreter resumes at that instruction, with the registers rebuilt (`DeoptSite`,
@@ -425,6 +428,68 @@ extern "C" fn bk_clone_into(dst: *mut Value, src: *const Value) {
     }
 }
 
+/// Kind of a native value passed to a list helper (`kind_code`).
+fn kind_of_code(c: i32) -> Kind {
+    match c {
+        0 => Kind::Int,
+        1 => Kind::Float,
+        2 => Kind::Bool,
+        _ => Kind::Ref,
+    }
+}
+
+/// `list << v`: 0, or 1 if `list` is not a list (or is borrowed).
+extern "C" fn bk_list_push(list: *const Value, bits: u64, kind: i32) -> i32 {
+    // SAFETY: `list` is a live value; for `Kind::Ref`, `bits` is the address of a live
+    // value.
+    unsafe {
+        let Value::List(l) = &*list else {
+            return 1;
+        };
+        let v = from_bits(kind_of_code(kind), bits);
+        match l.try_borrow_mut() {
+            Ok(mut l) => {
+                l.push(v);
+                0
+            }
+            Err(_) => 1,
+        }
+    }
+}
+
+/// `list[i] = v` (negative: from the end): 0, or 1 if not a list or out of bounds (the
+/// interpreter then gives the error).
+extern "C" fn bk_list_set(list: *const Value, i: i64, bits: u64, kind: i32) -> i32 {
+    // SAFETY: as for `bk_list_push`.
+    unsafe {
+        let Value::List(l) = &*list else {
+            return 1;
+        };
+        let Ok(mut l) = l.try_borrow_mut() else {
+            return 1;
+        };
+        let n = l.len() as i64;
+        let pos = if i < 0 { i + n } else { i };
+        if !(0..n).contains(&pos) {
+            return 1;
+        }
+        l[pos as usize] = from_bits(kind_of_code(kind), bits);
+        0
+    }
+}
+
+/// Copy of the list `src` into the slot `dst` (a `for` over a list that may change, as
+/// the interpreter does); `nil` if it is not a list.
+extern "C" fn bk_list_snapshot(dst: *mut Value, src: *const Value) {
+    // SAFETY: `dst` is a slot of the native frame, `src` a live value.
+    unsafe {
+        *dst = match &*src {
+            Value::List(l) => Value::list(l.borrow().clone()),
+            _ => Value::Nil,
+        };
+    }
+}
+
 /// Result of a native function into the caller's slot `dst`: moved out of a slot of the
 /// function (`owned`), copied otherwise (borrowed value).
 extern "C" fn bk_move_out(dst: *mut Value, src: *mut Value, owned: i32) {
@@ -515,6 +580,8 @@ pub struct Jit {
     list_fn: FuncId,
     /// `bk_this_fields`, `bk_method_is`.
     this_fns: [FuncId; 2],
+    /// `bk_list_push`, `bk_list_set`, `bk_list_snapshot`.
+    list_fns: [FuncId; 3],
     /// `bk_build`, `bk_clone_into`, `bk_move_out`, `bk_drop_slots`.
     mem_fns: [FuncId; 4],
     /// Construction plans (addresses held by native code).
@@ -834,6 +901,19 @@ impl Target {
     }
 }
 
+/// Elements a native list can hold: simple values, objects of a declared type.
+fn elem_ok(e: &RtType) -> bool {
+    prim(e).is_some() || matches!(e, RtType::Named(..))
+}
+
+/// Field `idx` of `info` annotated as a list (`@items: [int]`): its element type.
+fn field_list(info: &crate::objects::TypeInfo, idx: u32) -> Option<RtType> {
+    match &*info.fields.get(idx as usize)?.ty.as_ref()?.ty {
+        RtType::List(e) if elem_ok(e) => Some((**e).clone()),
+        _ => None,
+    }
+}
+
 /// Native type of field `idx` of `info`: annotated `int` / `float` / `bool`, or of a type
 /// parameter replaced by one of them in the typed copy `spec` (`@value: T`, `T = int`).
 /// Checked on entry of the method.
@@ -884,13 +964,19 @@ impl Analysis<'_> {
             },
             // `@x` in a method: an annotated field of a simple type.
             FieldAt(_, a, idx) => match (g(*a)?, &this) {
-                (JTy::This, Some(info)) => field_jty(info, *idx, p.spec.as_deref())?,
+                (JTy::This, Some(info)) => match field_list(info, *idx) {
+                    Some(e) => JTy::List(intern_ann(&mut self.anns, &e)),
+                    None => field_jty(info, *idx, p.spec.as_deref())?,
+                },
                 _ => return None,
             },
             SetFieldAt { obj, idx, src, .. } => {
                 let (JTy::This, Some(info)) = (g(*obj)?, &this) else {
                     return None;
                 };
+                if field_list(info, *idx).is_some() {
+                    return matches!(g(*src)?, JTy::List(_)).then_some(None);
+                }
                 let t = field_jty(info, *idx, p.spec.as_deref())?;
                 let s = g(*src)?;
                 if !(s == t || (t == JTy::Float && s == JTy::Int)) {
@@ -899,13 +985,61 @@ impl Analysis<'_> {
                 return Some(None);
             }
             IterNew { src, .. } => match g(*src)? {
-                JTy::List(a) => JTy::Iter(a),
+                JTy::List(a) if elem_ok(&self.anns[a as usize]) => JTy::Iter(a),
                 _ => return None,
             },
             Index(_, a, i) => match (g(*a)?, g(*i)?) {
-                (JTy::List(e), JTy::Int) => elem_jty(&self.anns, e),
+                (JTy::List(e), JTy::Int) if elem_ok(&self.anns[e as usize]) => {
+                    elem_jty(&self.anns, e)
+                }
                 _ => return None,
             },
+            // `xs << v`, `xs[i] = v`: any native value (the elements are checked when read).
+            Bin(BinOp::Push, _, a, b) => match (g(*a)?, g(*b)?) {
+                (
+                    JTy::List(e),
+                    JTy::Int | JTy::Float | JTy::Bool | JTy::Obj(_) | JTy::List(_),
+                ) => JTy::List(e),
+                _ => return None,
+            },
+            SetIndex(a, i, v) => match (g(*a)?, g(*i)?, g(*v)?) {
+                (
+                    JTy::List(_),
+                    JTy::Int,
+                    JTy::Int | JTy::Float | JTy::Bool | JTy::Obj(_) | JTy::List(_),
+                ) => return Some(None),
+                _ => return None,
+            },
+            // `let out: [int] = []`, an annotation already satisfied.
+            // (A list literal's shape converts nothing when it has no record.)
+            Coerce {
+                src, ty, shape, ..
+            } if shape.is_none_or(|s| {
+                matches!(&*p.shapes[s as usize], crate::ir::Shape::List(items) if items.iter().all(Option::is_none))
+            }) =>
+            {
+                let target = p.types[*ty as usize].ty.clone();
+                match (&*target, g(*src)?) {
+                    (t, s) if prim(t).is_some() => {
+                        let want = jty(prim(t).unwrap());
+                        if !(s == want || (want == JTy::Float && s == JTy::Int)) {
+                            return None;
+                        }
+                        want
+                    }
+                    (RtType::List(e), JTy::List(a))
+                        if elem_ok(e)
+                            && (self.anns[a as usize] == RtType::Any
+                                || same_ann_exact(e, &self.anns[a as usize])) =>
+                    {
+                        JTy::List(intern_ann(&mut self.anns, e))
+                    }
+                    (t @ RtType::Named(..), JTy::Obj(a)) if same_ann(t, &self.anns[a as usize]) => {
+                        JTy::Obj(a)
+                    }
+                    _ => return None,
+                }
+            }
             // Declared method of an object of known type (`self`, or a parameter): called
             // directly, if not redefined by the object's class (checked when calling).
             CallMethod {
@@ -1005,9 +1139,11 @@ impl Analysis<'_> {
                 JTy::Int
             }
             // List literal: elements all of the same type.
+            // `[]`: elements of unknown type (an annotation gives them).
+            List(_, _, 0) => JTy::List(intern_ann(&mut self.anns, &RtType::Any)),
             List(_, start, n) => {
                 let first = g(*start)?;
-                if *n == 0 || (0..*n).any(|k| g(*start + k) != Some(first)) {
+                if (0..*n).any(|k| g(*start + k) != Some(first)) {
                     return None;
                 }
                 let e = match first {
@@ -1296,6 +1432,8 @@ fn reads_writes(p: &Proto, ins: &Instr) -> Option<(Vec<Reg>, Option<Reg>)> {
         List(d, start, n) => ((*start..*start + *n).collect(), Some(*d)),
         FieldAt(d, a, _) => (vec![*a], Some(*d)),
         SetFieldAt { obj, src, .. } => (vec![*obj, *src], None),
+        SetIndex(a, i, v) => (vec![*a, *i, *v], None),
+        Coerce { dst, src, .. } => (vec![*src], Some(*dst)),
         CallMethod {
             dst, recv, site, ..
         } => {
@@ -1371,6 +1509,9 @@ impl Jit {
         builder.symbol("bk_this_fields", bk_this_fields as *const u8);
         builder.symbol("bk_method_is", bk_method_is as *const u8);
         builder.symbol("bk_resume", bk_resume as *const u8);
+        builder.symbol("bk_list_push", bk_list_push as *const u8);
+        builder.symbol("bk_list_set", bk_list_set as *const u8);
+        builder.symbol("bk_list_snapshot", bk_list_snapshot as *const u8);
         builder.symbol("bk_list_view", bk_list_view as *const u8);
         builder.symbol("bk_build", bk_build as *const u8);
         builder.symbol("bk_clone_into", bk_clone_into as *const u8);
@@ -1437,6 +1578,29 @@ impl Jit {
             .ok()?;
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I32));
+        sig.returns.push(AbiParam::new(types::I32));
+        let push_fn = module
+            .declare_function("bk_list_push", Linkage::Import, &sig)
+            .ok()?;
+        let mut sig = module.make_signature();
+        sig.params.push(AbiParam::new(ptr));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I32));
+        sig.returns.push(AbiParam::new(types::I32));
+        let set_fn = module
+            .declare_function("bk_list_set", Linkage::Import, &sig)
+            .ok()?;
+        let mut sig = module.make_signature();
+        sig.params.push(AbiParam::new(ptr));
+        sig.params.push(AbiParam::new(ptr));
+        let snapshot_fn = module
+            .declare_function("bk_list_snapshot", Linkage::Import, &sig)
+            .ok()?;
+        let mut sig = module.make_signature();
+        sig.params.push(AbiParam::new(ptr));
         sig.params.push(AbiParam::new(ptr));
         sig.returns.push(AbiParam::new(types::I32));
         let list_fn = module
@@ -1483,6 +1647,7 @@ impl Jit {
             fields_fn,
             list_fn,
             this_fns: [this_fields_fn, method_fn],
+            list_fns: [push_fn, set_fn, snapshot_fn],
             mem_fns,
             build_plans: Vec::new(),
             known_types: Vec::new(),
@@ -1695,6 +1860,10 @@ impl Jit {
             .module
             .declare_func_in_func(self.list_fn, &mut ctx.func);
         let [this_fields_fn, method_fn] = self.this_fns;
+        let [push_fn, set_fn, snapshot_fn] = self.list_fns;
+        let push_ref = self.module.declare_func_in_func(push_fn, &mut ctx.func);
+        let set_ref = self.module.declare_func_in_func(set_fn, &mut ctx.func);
+        let snapshot_ref = self.module.declare_func_in_func(snapshot_fn, &mut ctx.func);
         let this_fields_ref = self
             .module
             .declare_func_in_func(this_fields_fn, &mut ctx.func);
@@ -1756,16 +1925,32 @@ impl Jit {
             }
         }
         let reg_ref = borrowed.clone();
+        // Lists modified here, or possibly by a function called.
+        let may_mutate = p.blocks.iter().flat_map(|b| &b.instrs).any(|i| {
+            matches!(
+                i,
+                Instr::Bin(BinOp::Push, ..)
+                    | Instr::SetIndex(..)
+                    | Instr::SetFieldAt { .. }
+                    | Instr::Call { .. }
+                    | Instr::CallMethod { .. }
+            )
+        });
         let mut written = vec![false; nregs];
         loop {
             let mut changed = false;
             for b in &p.blocks {
                 for ins in &b.instrs {
                     let (w, from_borrowed) = match ins {
-                        Instr::Move(d, a) | Instr::Index(d, a, _) => {
-                            (Some(*d), borrowed[*a as usize])
+                        Instr::Move(d, a)
+                        | Instr::Coerce { dst: d, src: a, .. }
+                        | Instr::Bin(BinOp::Push, d, a, _) => (Some(*d), borrowed[*a as usize]),
+                        // A list may change during the call: its elements are copied, a
+                        // `for` goes over a copy of it (as in the interpreter).
+                        Instr::Index(d, a, _) => (Some(*d), borrowed[*a as usize] && !may_mutate),
+                        Instr::IterNew { dst, src, .. } => {
+                            (Some(*dst), borrowed[*src as usize] && !may_mutate)
                         }
-                        Instr::IterNew { dst, src, .. } => (Some(*dst), borrowed[*src as usize]),
                         other => (reads_writes(p, other).and_then(|(_, w)| w), false),
                     };
                     if let Some(w) = w {
@@ -2133,6 +2318,18 @@ impl Jit {
                 }
             }};
         }
+        // A native value as (bits, kind) for the list helpers.
+        macro_rules! native_arg {
+            ($bx:expr, $r:expr) => {{
+                let v = $bx.use_var(uvar!($r));
+                match tyof!($r) {
+                    Some(JTy::Int) => (v, 0i64),
+                    Some(JTy::Float) => ($bx.ins().bitcast(types::I64, MemFlagsData::new(), v), 1),
+                    Some(JTy::Bool) => ($bx.ins().uextend(types::I64, v), 2),
+                    _ => (v, 3),
+                }
+            }};
+        }
         // Drops the slots (before every exit).
         macro_rules! drop_slots {
             ($bx:expr) => {{
@@ -2241,7 +2438,7 @@ impl Jit {
                         let v = bx.use_var(uvar!(*a));
                         put_ref!(bx, *d, v);
                     }
-                    Move(d, a) | Guard(d, a, _) => {
+                    Move(d, a) | Guard(d, a, _) | Coerce { dst: d, src: a, .. } => {
                         let v = bx.use_var(uvar!(*a));
                         let v = match (dty, tyof!(*a)) {
                             (Some(JTy::Float), Some(JTy::Int)) => {
@@ -2255,6 +2452,46 @@ impl Jit {
                         let (x, y) = (bx.use_var(uvar!(*a)), bx.use_var(uvar!(*b2)));
                         let v = int_bin(&mut bx, *op, x, y, &mut |bx, c, k| check!(bx, c, k, span));
                         bx.def_var(dvar!(*d), v);
+                    }
+                    // `xs << v`, `xs[i] = v`: the helper refuses a list being borrowed or an
+                    // index out of bounds (resumed in the interpreter, which gives the error).
+                    Bin(BinOp::Push, d, a, b2) => {
+                        let list = bx.use_var(uvar!(*a));
+                        let (bits, kind) = native_arg!(bx, *b2);
+                        let k = bx.ins().iconst(types::I32, kind);
+                        let call = bx.ins().call(push_ref, &[list, bits, k]);
+                        let failed = bx.inst_results(call)[0];
+                        bail!(bx, failed);
+                        bx.def_var(dvar!(*d), list);
+                    }
+                    SetIndex(a, i, v) => {
+                        let list = bx.use_var(uvar!(*a));
+                        let i = bx.use_var(uvar!(*i));
+                        let (bits, kind) = native_arg!(bx, *v);
+                        let k = bx.ins().iconst(types::I32, kind);
+                        let call = bx.ins().call(set_ref, &[list, i, bits, k]);
+                        let failed = bx.inst_results(call)[0];
+                        bail!(bx, failed);
+                    }
+                    // A list field of `self`: copied into its slot (the field may change).
+                    FieldAt(d, 0, idx)
+                        if tyof!(0) == Some(JTy::This) && matches!(dty, Some(JTy::List(_))) =>
+                    {
+                        let fp = this_fp.ok_or(())?;
+                        let off = *idx as i32 * crate::value::layout::SIZE;
+                        let addr = bx.ins().iadd_imm_s(fp, off as i64);
+                        put_ref!(bx, *d, addr);
+                    }
+                    SetFieldAt {
+                        obj: 0, idx, src, ..
+                    } if tyof!(0) == Some(JTy::This)
+                        && matches!(tyof!(*src), Some(JTy::List(_))) =>
+                    {
+                        let fp = this_fp.ok_or(())?;
+                        let off = *idx as i32 * crate::value::layout::SIZE;
+                        let addr = bx.ins().iadd_imm_s(fp, off as i64);
+                        let v = bx.use_var(uvar!(*src));
+                        bx.ins().call(clone_ref, &[addr, v]);
                     }
                     // `@x` of `self`: its type was checked on entry.
                     FieldAt(d, 0, idx) if tyof!(0) == Some(JTy::This) => {
@@ -2605,7 +2842,8 @@ impl Jit {
                         // changes during the loop).
                         if !borrowed[*dst as usize] {
                             let slot = own!(bx, *dst);
-                            bx.ins().call(clone_ref, &[slot, list]);
+                            let f = if may_mutate { snapshot_ref } else { clone_ref };
+                            bx.ins().call(f, &[slot, list]);
                             list = slot;
                         }
                         let (data, len) = view!(bx, list, span);

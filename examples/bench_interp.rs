@@ -31,6 +31,10 @@ const PROGRAMS: &[(&str, &str)] = &[
         "class Acc(T)\n  def init(@sum: T, @n: int)\n  end\n  def add(x: T): T\n    @n += 1\n    @sum = @sum + x\n    @sum\n  end\nend\nlet a = Acc(0.0, 0)\nfor i in 0...1000000\n  a.add(i * 0.5)\nend\na.add(0.0)",
     ),
     (
+        "lists built in typed code (100 k, 10 passes)",
+        "def squares(n: int): [int]\n  let out: [int] = []\n  for i in 0...n\n    out << i * i\n  end\n  out\nend\ndef run(): int\n  let t = 0\n  for k in 0...10\n    let xs = squares(100000)\n    xs[0] = k\n    t += xs[k] + xs.len()\n  end\n  t\nend\nrun()",
+    ),
+    (
         "float: harmonic series (1 M)",
         "def h(n: int): float\n  let s = 0.0\n  for i in 1..n\n    s += 1.0 / i\n  end\n  s\nend\nh(1000000)",
     ),

@@ -724,3 +724,75 @@ let r2 = run([a, l, b], 10)
     e.eval(src).unwrap();
     assert!(e.is_native_method("Counter", "add"));
 }
+
+#[test]
+fn lists_modified_in_native_code() {
+    let src = "def doubled(xs: [int]): [int]
+  let out: [int] = []
+  for x in xs
+    out << x * 2
+  end
+  out
+end
+def bump(xs: [float]): int
+  let i = 0
+  for x in xs
+    xs[i] = x + 0.5
+    i += 1
+  end
+  xs.len()
+end
+def grow(xs: [int], n: int): int
+  for x in xs
+    xs << x
+  end
+  let t = 0
+  for i in 0...n
+    xs << i
+    t += xs[-1]
+  end
+  xs.len()
+end
+class Bag
+  def init(@items: [int], @n: int)
+  end
+  def add(x: int): int
+    @items << x
+    @n += 1
+    @items.len()
+  end
+  def reset(): int
+    @items = []
+    @n
+  end
+  def total(): int
+    let t = 0
+    for x in @items
+      t += x
+    end
+    t
+  end
+end
+def fill(b: Bag, k: int): int
+  let t = 0
+  for i in 0...k
+    t += b.add(i)
+  end
+  t + b.total()
+end
+let fs = [1.0, 2.0]
+let b = Bag([], 0)
+[doubled([1, 2, 3]), bump(fs), fs, grow([1, 2], 3), fill(b, 4), b.reset(), b.total(),
+ doubled([]), bump([1.0, 2])]";
+    assert_eq!(same(src), "[[2, 4, 6], 2, [1.5, 2.5], 7, 16, 4, 0, [], 2]");
+    let mut e = Engine::new();
+    e.eval(src).unwrap();
+    for f in ["doubled", "bump", "grow", "fill"] {
+        assert!(e.is_native(f), "`{f}` should be compiled");
+    }
+    for m in ["add", "reset", "total"] {
+        assert!(e.is_native_method("Bag", m), "`Bag.{m}` should be compiled");
+    }
+    // Out of bounds: the interpreter's error.
+    same("def w(xs: [int]): int\n  xs[5] = 1\n  0\nend\nw([1])");
+}
