@@ -2,6 +2,7 @@
 #![cfg(feature = "jit")]
 
 use bokoni::Engine;
+use std::rc::Rc;
 
 /// Résultat (ou message d'erreur affiché, pile d'appels comprise) d'un programme.
 fn outcome(src: &str, jit: bool) -> String {
@@ -385,4 +386,84 @@ fn interpolation() {
     e.eval(ty).unwrap();
     assert!(e.eval("\"a #{Q()} b\"").is_err());
     assert_eq!(e.eval_as::<String>("\"x#{1}y\"").unwrap(), "x1y");
+}
+
+const VEC: &str = "type V\n  x: float = 0.0\n  y: float = 0.0\nend\n\
+    def add(a: V, b: V): V = V(x: a.x + b.x, y: a.y + b.y)\n\
+    def scale(v: V, k: float): V = V(x: v.x * k, y: v.y * k)\n\
+    def id(v: V): V = v\n\
+    def pick(a: V, b: V, c: bool): V = if c then a else b end\n\
+    def run(n: int): float\n  let p = V(x: 0.0, y: 0.0)\n  let d = V(x: 1.0, y: 0.5)\n  let i = 0\n  while i < n\n    p = add(p, scale(d, 2.0))\n    p = id(p)\n    i += 1\n  end\n  p.x + p.y\nend\n\
+    def pair(a: int, b: int): [int] = [a, b]\n\
+    def both(v: V): [V] = [v, scale(v, 3.0)]\n\
+    def firsts(xs: [int]): int = pair(xs[0], xs[-1])[1] + pair(1, 2).len()\n\
+    def boom(v: V, n: int): V\n  let w = V(x: v.x, y: 1.0)\n  let k = 10 / n\n  scale(w, k)\nend\n\
+    def bail(xs: [int]): V\n  let w = V(x: 2.0, y: 1.0)\n  let y = xs[5]\n  scale(w, y)\nend\n";
+
+#[test]
+fn typed_functions_create_objects_and_lists() {
+    for c in [
+        "[run(1000), add(V(x: 1.0), V(y: 2.0)), id(V(x: 3.0)), pick(V(x: 1.0), V(x: 2.0), false)]",
+        "[pair(3, 4), both(V(x: 1.0)), firsts([7, 8, 9])]",
+        "boom(V(x: 1.0), 2)",
+        "boom(V(x: 1.0), 0)",
+        "bail([1, 2])",
+        "bail([1, 2, 3, 4, 5, 6])",
+    ] {
+        same_eager(&format!("{VEC}{c}"));
+        same(&format!("{VEC}{c}"));
+    }
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    e.eval(VEC).unwrap();
+    e.eval("run(10)\nboth(V())\nfirsts([1, 2])\npick(V(), V(), true)")
+        .unwrap();
+    for f in [
+        "run", "add", "scale", "id", "pick", "pair", "both", "firsts",
+    ] {
+        assert!(e.is_native(f), "`{f}` devrait être compilée");
+    }
+}
+
+#[test]
+fn native_allocations_are_freed() {
+    // Les valeurs créées ou copiées par le code natif sont libérées exactement une fois :
+    // le compteur de références des valeurs partagées revient à sa valeur de départ.
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    e.eval(VEC).unwrap();
+    e.eval("let vs = [V(x: 1.0), V(x: 2.0)]\nlet v = V(x: 5.0)\n\
+            def keep(xs: [V]): [V] = [xs[0], xs[1], xs[0]]\n\
+            def again(xs: [V]): V\n  let w = xs[0]\n  w = xs[1]\n  w\nend\n\
+            def loop2(xs: [V], n: int): float\n  let t = 0.0\n  let i = 0\n  while i < n\n    for p in keep(xs)\n      t += add(p, again(xs)).x\n    end\n    i += 1\n  end\n  t\nend")
+        .unwrap();
+    let counts = |e: &mut Engine| -> Vec<usize> {
+        let (bokoni::Value::List(l), bokoni::Value::Object(v)) =
+            (e.eval("vs").unwrap(), e.eval("v").unwrap())
+        else {
+            panic!()
+        };
+        let mut c = vec![Rc::strong_count(&l), Rc::strong_count(&v)];
+        c.extend(l.borrow().iter().map(|x| match x {
+            bokoni::Value::Object(o) => Rc::strong_count(o),
+            _ => 0,
+        }));
+        c
+    };
+    let before = counts(&mut e);
+    for call in [
+        "loop2(vs, 1000)",
+        "keep(vs)",
+        "again(vs)",
+        "id(v)",
+        "pick(v, v, true)",
+        "both(v)",
+        "[keep(vs), both(v)]",
+        "boom(v, 0)",
+        "bail([1])",
+    ] {
+        let _ = e.eval(call);
+        assert_eq!(counts(&mut e), before, "après `{call}`");
+    }
+    assert!(e.is_native("loop2") && e.is_native("keep") && e.is_native("again"));
 }

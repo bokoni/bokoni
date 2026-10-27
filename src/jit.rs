@@ -103,6 +103,96 @@ extern "C" fn bk_obj_fields(
     }
 }
 
+/// Construction native d'un objet (`info`) ou d'une liste (`info` absent) : pour chaque
+/// argument, le champ visé (objet) et la conversion.
+struct BuildPlan {
+    info: Option<Rc<crate::objects::TypeInfo>>,
+    items: Vec<(usize, Kind)>,
+}
+
+/// Valeur du script à partir des bits d'une valeur native.
+///
+/// # Safety
+/// Pour `Kind::Ref`, `bits` est l'adresse d'une valeur vivante.
+unsafe fn from_bits(kind: Kind, bits: u64) -> Value {
+    match kind {
+        Kind::Int => Value::Int(bits as i64),
+        Kind::Float => Value::Float(f64::from_bits(bits)),
+        Kind::IntToFloat => Value::Float(bits as i64 as f64),
+        Kind::Bool => Value::Bool(bits & 0xff != 0),
+        // SAFETY : cf. ci-dessus.
+        Kind::Ref => unsafe { (*(bits as *const Value)).clone() },
+    }
+}
+
+/// Construit l'objet ou la liste décrit par `plan` dans la case `dst` (l'ancienne valeur
+/// est libérée après : un argument peut désigner `dst`).
+extern "C" fn bk_build(dst: *mut Value, args: *const u64, plan: *const BuildPlan) {
+    // SAFETY : `dst` est une case du cadre natif, `args` contient un argument par élément
+    // de `plan` (gardé par le `Jit`), les objets désignés vivent pendant l'appel.
+    unsafe {
+        let plan = &*plan;
+        let v = match &plan.info {
+            Some(info) => {
+                let mut fields = vec![Value::Nil; plan.items.len()];
+                for (k, (field, kind)) in plan.items.iter().enumerate() {
+                    fields[*field] = from_bits(*kind, *args.add(k));
+                }
+                Value::Object(Rc::new(std::cell::RefCell::new(crate::objects::Object {
+                    info: info.clone(),
+                    fields,
+                })))
+            }
+            None => {
+                let items = plan
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(k, (_, kind))| from_bits(*kind, *args.add(k)))
+                    .collect();
+                Value::List(Rc::new(std::cell::RefCell::new(items)))
+            }
+        };
+        *dst = v;
+    }
+}
+
+/// Copie (comptage de références) de `*src` dans la case `dst`.
+extern "C" fn bk_clone_into(dst: *mut Value, src: *const Value) {
+    // SAFETY : `dst` est une case du cadre natif, `src` une valeur vivante.
+    unsafe {
+        let v = (*src).clone();
+        *dst = v;
+    }
+}
+
+/// Résultat d'une fonction native vers la case `dst` de l'appelant : déplacé depuis une
+/// case de la fonction (`owned`), sinon copié (valeur empruntée).
+extern "C" fn bk_move_out(dst: *mut Value, src: *mut Value, owned: i32) {
+    // SAFETY : `dst` est une case de l'appelant, `src` une valeur vivante ; si `owned`,
+    // `src` est une case de la fonction qui se termine.
+    unsafe {
+        let v = if owned != 0 {
+            std::mem::replace(&mut *src, Value::Nil)
+        } else {
+            (*src).clone()
+        };
+        *dst = v;
+    }
+}
+
+/// Libère les `n` cases du cadre natif.
+extern "C" fn bk_drop_slots(base: *mut Value, n: u64) {
+    // SAFETY : `base` désigne `n` cases du cadre, initialisées (au moins à `nil`).
+    unsafe {
+        for i in 0..n as usize {
+            let slot = base.add(i);
+            std::ptr::drop_in_place(slot);
+            slot.write(Value::Nil);
+        }
+    }
+}
+
 /// Éléments d'une liste : adresse dans `out[0]`, nombre dans `out[1]` ; 1 si ce n'est
 /// pas une liste.
 extern "C" fn bk_list_view(v: *const Value, out: *mut u64) -> i32 {
@@ -158,6 +248,11 @@ pub struct Jit {
     field_fn: FuncId,
     fields_fn: FuncId,
     list_fn: FuncId,
+    /// `bk_build`, `bk_clone_into`, `bk_move_out`, `bk_drop_slots`.
+    mem_fns: [FuncId; 4],
+    /// Plans de construction (adresses gardées par le code natif).
+    #[allow(clippy::vec_box)]
+    build_plans: Vec<Box<BuildPlan>>,
     /// Types dont le code natif connaît la disposition (gardés en vie : leur adresse sert
     /// d'identité).
     known_types: Vec<Rc<crate::objects::TypeInfo>>,
@@ -177,7 +272,7 @@ pub struct Jit {
 }
 
 /// Type d'un registre pour le code natif.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum JTy {
     Int,
     Float,
@@ -186,13 +281,15 @@ enum JTy {
     Nil,
     /// Fonction globale appelée directement (case globale).
     Callee(u32),
-    /// Objet du type `anns[i]` : pointeur vers la valeur (paramètre ou élément d'une
-    /// liste), vivante pendant tout l'appel.
+    /// Objet du type `anns[i]` : pointeur vers la valeur (empruntée à l'appelant, ou
+    /// dans une case du cadre natif).
     Obj(u32),
     /// Liste d'éléments du type `anns[i]` : pointeur vers la valeur.
     List(u32),
     /// Itérateur sur une liste d'éléments du type `anns[i]`.
     Iter(u32),
+    /// `type` d'une case globale, appelé pour construire un objet.
+    Ctor(u32),
 }
 
 fn prim(rt: &RtType) -> Option<RegTy> {
@@ -222,7 +319,19 @@ fn clif(t: RegTy) -> Type {
     }
 }
 
-/// Signature native d'une fonction : paramètres et retour simples, sinon `None`.
+/// Type natif d'une annotation : simple, ou `Value` (pointeur) pour un objet d'un type
+/// déclaré et une liste d'éléments simples ou d'objets.
+fn native_ty(rt: &RtType) -> Option<RegTy> {
+    match rt {
+        RtType::Named(..) => Some(RegTy::Value),
+        RtType::List(e) if matches!(**e, RtType::Named(..)) || prim(e).is_some() => {
+            Some(RegTy::Value)
+        }
+        t => prim(t),
+    }
+}
+
+/// Signature native d'une fonction (paramètres et retour), sinon `None`.
 fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
     if p.kind != ProtoKind::Function || !p.captures.is_empty() || p.ncells != 0 {
         return None;
@@ -232,22 +341,43 @@ fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
         if prm.has_default || prm.field.is_some() {
             return None;
         }
-        let ty = &prm.ty.as_ref()?.ty;
-        // Paramètre d'un type déclaré : l'objet, par pointeur (`Value`).
-        params.push(match &**ty {
-            RtType::Named(..) => RegTy::Value,
-            RtType::List(e) if matches!(**e, RtType::Named(..)) || prim(e).is_some() => {
-                RegTy::Value
-            }
-            t => prim(t)?,
-        });
+        params.push(native_ty(&prm.ty.as_ref()?.ty)?);
     }
-    Some((params, prim(&p.ret.as_ref()?.ty)?))
+    Some((params, native_ty(&p.ret.as_ref()?.ty)?))
 }
 
 /// Annotation du paramètre `i`.
 fn ann_of(q: &Proto, i: usize) -> Option<&RtType> {
     q.params[i].ty.as_ref().map(|t| &*t.ty)
+}
+
+/// Même type : un type déclaré se reconnaît à sa case globale.
+fn same_ann(a: &RtType, b: &RtType) -> bool {
+    match (a, b) {
+        (RtType::Named(x, _), RtType::Named(y, _)) => x == y,
+        (RtType::List(x), RtType::List(y)) => same_ann(x, y),
+        _ => a == b,
+    }
+}
+
+/// Index de `t` dans la table des types (ajouté au besoin).
+fn intern_ann(anns: &mut Vec<RtType>, t: &RtType) -> u32 {
+    match anns.iter().position(|a| same_ann(a, t)) {
+        Some(i) => i as u32,
+        None => {
+            anns.push(t.clone());
+            (anns.len() - 1) as u32
+        }
+    }
+}
+
+/// Type natif d'une valeur annotée `t` (`native_ty` l'accepte).
+fn value_jty(anns: &mut Vec<RtType>, t: &RtType) -> JTy {
+    match t {
+        RtType::Named(..) => JTy::Obj(intern_ann(anns, t)),
+        RtType::List(e) => JTy::List(intern_ann(anns, e)),
+        t => jty(prim(t).expect("type simple")),
+    }
 }
 
 /// Fonction du script dans une case globale.
@@ -261,14 +391,117 @@ fn global_proto(globals: &Globals, slot: u32) -> Option<Rc<Proto>> {
     }
 }
 
-/// Résultat de l'analyse d'une fonction : type de chaque registre, cases appelées.
+/// `type` (pas `class`) dans une case globale.
+fn global_type(globals: &Globals, slot: u32) -> Option<Rc<crate::objects::TypeInfo>> {
+    match &globals.at(slot).value {
+        Some(Value::Type(info)) if info.kind == crate::ast::TypeDeclKind::Type => {
+            Some(info.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Conversion d'une valeur native vers une valeur du script (construction).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Kind {
+    Int,
+    Float,
+    /// `int` donné pour un champ `float`.
+    IntToFloat,
+    Bool,
+    /// Objet ou liste : la valeur pointée est copiée (comptage de références).
+    Ref,
+}
+
+/// Valeur native de type `t` vers une valeur, pour un champ annoté `want` (`None` : non
+/// annoté). `None` si la conversion n'est pas garantie.
+fn kind_for(anns: &[RtType], t: JTy, want: Option<&RtType>) -> Option<Kind> {
+    let kind = match t {
+        JTy::Int => Kind::Int,
+        JTy::Float => Kind::Float,
+        JTy::Bool => Kind::Bool,
+        JTy::Obj(_) | JTy::List(_) => Kind::Ref,
+        _ => return None,
+    };
+    let Some(want) = want else {
+        return Some(kind);
+    };
+    match (want, t) {
+        (RtType::Int, JTy::Int) | (RtType::Float, JTy::Float) | (RtType::Bool, JTy::Bool) => {
+            Some(kind)
+        }
+        (RtType::Float, JTy::Int) => Some(Kind::IntToFloat),
+        (w @ RtType::Named(..), JTy::Obj(a)) if same_ann(w, &anns[a as usize]) => Some(kind),
+        (RtType::List(e), JTy::List(a)) if same_ann(e, &anns[a as usize]) => Some(kind),
+        _ => None,
+    }
+}
+
+/// Construction `T(…)` : pour chaque argument, (champ, conversion).
+fn ctor_plan(
+    info: &crate::objects::TypeInfo,
+    site: &crate::ir::CallSite,
+    tys: &[Option<JTy>],
+    anns: &[RtType],
+) -> Option<Vec<(usize, Kind)>> {
+    let n = site.npos as usize + site.named.len();
+    if site.block || n != info.fields.len() || site.shapes.iter().any(Option::is_some) {
+        return None;
+    }
+    let mut seen = vec![false; n];
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let field = match k.checked_sub(site.npos as usize) {
+            None => k,
+            Some(j) => info.field_index(site.named[j])?,
+        };
+        if std::mem::replace(&mut seen[field], true) {
+            return None;
+        }
+        let t = tys[site.start as usize + k]?;
+        let want = info.fields[field].ty.as_ref().map(|t| &*t.ty);
+        out.push((field, kind_for(anns, t, want)?));
+    }
+    Some(out)
+}
+
+/// Type d'un registre à un point du programme.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Lat {
+    /// Pas encore écrit.
+    Undef,
+    T(JTy),
+    /// Types différents selon le chemin (ou non écrit sur l'un d'eux) : illisible.
+    Conflict,
+}
+
+impl Lat {
+    fn get(self) -> Option<JTy> {
+        match self {
+            Lat::T(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    fn merge(self, o: Lat) -> Lat {
+        if self == o { self } else { Lat::Conflict }
+    }
+}
+
+/// Résultat de l'analyse d'une fonction : type des registres en chaque point.
 struct Plan {
-    tys: Vec<Option<JTy>>,
+    /// Types à l'entrée de chaque bloc.
+    entry: Vec<Vec<Lat>>,
+    /// Type écrit par chaque instruction de chaque bloc (et par le terminateur
+    /// `IterNext`), s'il y en a.
+    defs: Vec<Vec<Option<JTy>>>,
+    term_defs: Vec<Option<JTy>>,
+    /// Fonctions appelées directement.
     callees: Vec<u32>,
+    /// Types construits (`T(…)`).
+    ctors: Vec<u32>,
     /// Types des objets et des éléments de liste (`JTy::Obj` / `List` / `Iter`).
     anns: Vec<RtType>,
-    /// Annotation propre à chaque paramètre objet.
-    param_ann: Vec<Option<u32>>,
 }
 
 /// Type d'un élément de type `anns[a]`.
@@ -279,150 +512,265 @@ fn elem_jty(anns: &[RtType], a: u32) -> JTy {
     }
 }
 
-/// Types des registres d'une fonction compilable ; `None` si elle ne l'est pas.
-fn analyze(p: &Proto, globals: &Globals, len: crate::intern::Symbol) -> Option<Plan> {
-    let (params, ret) = native_sig(p)?;
-    let mut tys: Vec<Option<JTy>> = p
-        .regs
-        .iter()
-        .map(|t| (*t != RegTy::Value).then(|| jty(*t)))
-        .collect();
-    let mut anns: Vec<RtType> = Vec::new();
-    let mut param_ann = vec![None; params.len()];
-    for (k, (prm, t)) in p.params.iter().zip(&params).enumerate() {
-        tys[prm.reg as usize] = Some(match t {
-            RegTy::Value => {
-                let a = anns.len() as u32;
-                match &*prm.ty.as_ref()?.ty {
-                    t @ RtType::Named(..) => {
-                        anns.push(t.clone());
-                        param_ann[k] = Some(a);
-                        JTy::Obj(a)
-                    }
-                    RtType::List(e) => {
-                        anns.push((**e).clone());
-                        JTy::List(a)
-                    }
+/// Analyse d'une fonction : contexte partagé par les instructions.
+struct Analysis<'a> {
+    p: &'a Proto,
+    globals: &'a Globals,
+    len: crate::intern::Symbol,
+    anns: Vec<RtType>,
+    callees: Vec<u32>,
+    ctors: Vec<u32>,
+}
+
+impl Analysis<'_> {
+    fn sig_of(&self, slot: u32) -> Option<(Vec<RegTy>, RegTy)> {
+        global_proto(self.globals, slot).and_then(|q| native_sig(&q))
+    }
+
+    /// Type écrit par `ins` (lecture des opérandes dans `cur`) ; `None` : non compilable.
+    fn instr(&mut self, ins: &Instr, cur: &[Lat]) -> Option<Option<JTy>> {
+        use Instr::*;
+        let g = |r: Reg| cur[r as usize].get();
+        let value = |t: JTy| {
+            matches!(
+                t,
+                JTy::Int | JTy::Float | JTy::Bool | JTy::Obj(_) | JTy::List(_)
+            )
+        };
+        let numeric = |t: JTy| matches!(t, JTy::Int | JTy::Float);
+        let p = self.p;
+        Some(Some(match ins {
+            Int(..) => JTy::Int,
+            Float(..) => JTy::Float,
+            Bool(..) => JTy::Bool,
+            Nil(_) => JTy::Nil,
+            Move(_, a) => Some(g(*a)?).filter(|t| value(*t))?,
+            Guard(_, a, _) => {
+                Some(g(*a)?).filter(|t| matches!(t, JTy::Int | JTy::Float | JTy::Bool))?
+            }
+            FieldAs(_, a, _, t) => match g(*a)? {
+                JTy::Obj(_) => jty(*t),
+                _ => return None,
+            },
+            IterNew { src, .. } => match g(*src)? {
+                JTy::List(a) => JTy::Iter(a),
+                _ => return None,
+            },
+            Index(_, a, i) => match (g(*a)?, g(*i)?) {
+                (JTy::List(e), JTy::Int) => elem_jty(&self.anns, e),
+                _ => return None,
+            },
+            CallMethod {
+                recv, name, site, ..
+            } => {
+                let site = &p.calls[*site as usize];
+                let ok = *name == self.len
+                    && matches!(g(*recv)?, JTy::List(_))
+                    && site.npos == 0
+                    && site.named.is_empty()
+                    && !site.block;
+                if !ok {
+                    return None;
+                }
+                JTy::Int
+            }
+            // Liste littérale : éléments tous du même type.
+            List(_, start, n) => {
+                let first = g(*start)?;
+                if *n == 0 || (0..*n).any(|k| g(*start + k) != Some(first)) {
+                    return None;
+                }
+                let e = match first {
+                    JTy::Int => RtType::Int,
+                    JTy::Float => RtType::Float,
+                    JTy::Bool => RtType::Bool,
+                    JTy::Obj(a) => self.anns[a as usize].clone(),
+                    _ => return None,
+                };
+                JTy::List(intern_ann(&mut self.anns, &e))
+            }
+            IBin(op, _, a, b) => {
+                if g(*a)? != JTy::Int || g(*b)? != JTy::Int {
+                    return None;
+                }
+                if is_cmp(*op) { JTy::Bool } else { JTy::Int }
+            }
+            IBinK(op, _, a, _) => {
+                if g(*a)? != JTy::Int {
+                    return None;
+                }
+                if is_cmp(*op) { JTy::Bool } else { JTy::Int }
+            }
+            FBin(op, _, a, b) => {
+                if g(*a)? != JTy::Float || g(*b)? != JTy::Float {
+                    return None;
+                }
+                if is_cmp(*op) { JTy::Bool } else { JTy::Float }
+            }
+            INeg(_, a) => (g(*a) == Some(JTy::Int)).then_some(JTy::Int)?,
+            FNeg(_, a) => (g(*a) == Some(JTy::Float)).then_some(JTy::Float)?,
+            IToF(_, a) => (g(*a) == Some(JTy::Int)).then_some(JTy::Float)?,
+            Not(_, a) => match g(*a)? {
+                JTy::Int | JTy::Float | JTy::Bool => JTy::Bool,
+                _ => return None,
+            },
+            Bin(op, _, a, b) => {
+                let (ta, tb) = (g(*a)?, g(*b)?);
+                match (*op, ta, tb) {
+                    (op, JTy::Int, JTy::Int) if is_arith(op) => JTy::Int,
+                    (op, _, _) if is_arith(op) && numeric(ta) && numeric(tb) => JTy::Float,
+                    (op, _, _) if is_cmp(op) && numeric(ta) && numeric(tb) => JTy::Bool,
+                    (BinOp::Eq | BinOp::Ne, JTy::Bool, JTy::Bool) => JTy::Bool,
                     _ => return None,
                 }
             }
-            t => jty(*t),
-        });
-    }
-    let dead = dead_nils(p);
-    let mut callees = Vec::new();
-    // Signature (paramètres, retour) d'une fonction appelée.
-    let sig_of = |slot: u32| global_proto(globals, slot).and_then(|q| native_sig(&q));
-    let numeric = |t: Option<JTy>| matches!(t, Some(JTy::Int | JTy::Float));
-    // Point fixe : un registre peut être défini avant d'être lu dans l'ordre des blocs.
-    for _ in 0..p.blocks.len() + 2 {
-        let mut changed = false;
-        let mut set = |tys: &mut Vec<Option<JTy>>, r: Reg, t: JTy| -> Option<()> {
-            match tys[r as usize] {
-                None => {
-                    tys[r as usize] = Some(t);
-                    changed = true;
-                    Some(())
+            GetGlobal(_, slot) => {
+                if global_type(self.globals, *slot).is_some() {
+                    if !self.ctors.contains(slot) {
+                        self.ctors.push(*slot);
+                    }
+                    JTy::Ctor(*slot)
+                } else {
+                    self.sig_of(*slot)?;
+                    if !self.callees.contains(slot) {
+                        self.callees.push(*slot);
+                    }
+                    JTy::Callee(*slot)
                 }
-                Some(u) if u == t => Some(()),
-                // Registre `float` qui reçoit un `int` : converti.
-                Some(JTy::Float) if t == JTy::Int && p.regs[r as usize] == RegTy::Float => Some(()),
-                _ => None,
             }
-        };
-        for b in &p.blocks {
-            for ins in &b.instrs {
-                use Instr::*;
-                match ins {
-                    Int(d, _) => set(&mut tys, *d, JTy::Int)?,
-                    Float(d, _) => set(&mut tys, *d, JTy::Float)?,
-                    Bool(d, _) => set(&mut tys, *d, JTy::Bool)?,
-                    // `nil` jamais lu (valeur d'un `while`…) : le registre peut servir ailleurs
-                    // avec un autre type.
-                    Nil(_) if dead.contains(&(ins as *const Instr)) => {}
-                    Nil(d) => set(&mut tys, *d, JTy::Nil)?,
-                    Move(d, a) | Guard(d, a, _) => {
-                        if let Some(t) = tys[*a as usize] {
-                            set(&mut tys, *d, t)?;
-                        }
-                    }
-                    FieldAs(d, _, _, t) => set(&mut tys, *d, jty(*t))?,
-                    IterNew { dst, src, .. } => match tys[*src as usize] {
-                        Some(JTy::List(a)) => set(&mut tys, *dst, JTy::Iter(a))?,
-                        None => {}
-                        _ => return None,
-                    },
-                    Index(d, a, _) => match tys[*a as usize] {
-                        Some(JTy::List(e)) => set(&mut tys, *d, elem_jty(&anns, e))?,
-                        None => {}
-                        _ => return None,
-                    },
-                    CallMethod {
-                        dst, recv, name, ..
-                    } if *name == len => match tys[*recv as usize] {
-                        Some(JTy::List(_)) => set(&mut tys, *dst, JTy::Int)?,
-                        None => {}
-                        _ => return None,
-                    },
-                    IBin(op, d, _, _) | IBinK(op, d, _, _) | FBin(op, d, _, _) => {
-                        let t = if is_cmp(*op) {
-                            JTy::Bool
-                        } else if matches!(ins, FBin(..)) {
-                            JTy::Float
-                        } else {
-                            JTy::Int
-                        };
-                        set(&mut tys, *d, t)?
-                    }
-                    INeg(d, _) => set(&mut tys, *d, JTy::Int)?,
-                    FNeg(d, _) | IToF(d, _) => set(&mut tys, *d, JTy::Float)?,
-                    Not(d, _) => set(&mut tys, *d, JTy::Bool)?,
-                    Bin(op, d, a, b) => {
-                        let (ta, tb) = (tys[*a as usize], tys[*b as usize]);
-                        if ta.is_none() || tb.is_none() {
-                            continue;
-                        }
-                        let t = match (*op, ta?, tb?) {
-                            (op, JTy::Int, JTy::Int) if is_arith(op) => JTy::Int,
-                            (op, _, _) if is_arith(op) && numeric(ta) && numeric(tb) => JTy::Float,
-                            (op, _, _) if is_cmp(op) && numeric(ta) && numeric(tb) => JTy::Bool,
-                            (BinOp::Eq | BinOp::Ne, JTy::Bool, JTy::Bool) => JTy::Bool,
-                            _ => return None,
-                        };
-                        set(&mut tys, *d, t)?
-                    }
-                    GetGlobal(d, slot) => {
-                        sig_of(*slot)?;
-                        if !callees.contains(slot) {
-                            callees.push(*slot);
-                        }
-                        set(&mut tys, *d, JTy::Callee(*slot))?
-                    }
-                    Call { dst, f, site } => {
-                        let Some(JTy::Callee(slot)) = tys[*f as usize] else {
-                            if tys[*f as usize].is_none() {
-                                continue;
-                            }
-                            return None;
-                        };
-                        let site = &p.calls[*site as usize];
-                        let (cparams, cret) = sig_of(slot)?;
+            Call { f, site, .. } => {
+                let site = &p.calls[*site as usize];
+                match g(*f)? {
+                    JTy::Callee(slot) => {
+                        let (cparams, _) = self.sig_of(slot)?;
                         if site.block
                             || !site.named.is_empty()
                             || site.npos as usize != cparams.len()
                         {
                             return None;
                         }
-                        set(&mut tys, *dst, jty(cret))?
+                        let callee = global_proto(self.globals, slot)?;
+                        for (k, pt) in cparams.iter().enumerate() {
+                            let at = g(site.start + k as u32)?;
+                            let ok = match (pt, at) {
+                                (RegTy::Float, JTy::Int | JTy::Float) => true,
+                                // Objet ou liste transmis tel quel : même type, déjà vérifié.
+                                (RegTy::Value, JTy::Obj(_) | JTy::List(_)) => {
+                                    kind_for(&self.anns, at, ann_of(&callee, k)) == Some(Kind::Ref)
+                                }
+                                (t, a) => *t != RegTy::Value && jty(*t) == a,
+                            };
+                            if !ok {
+                                return None;
+                            }
+                        }
+                        value_jty(&mut self.anns, &callee.ret.as_ref()?.ty)
+                    }
+                    JTy::Ctor(slot) => {
+                        let info = global_type(self.globals, slot)?;
+                        let tys: Vec<Option<JTy>> = cur.iter().map(|l| l.get()).collect();
+                        ctor_plan(&info, site, &tys, &self.anns)?;
+                        let t = RtType::Named(slot, crate::intern::Symbol(u32::MAX));
+                        JTy::Obj(intern_ann(&mut self.anns, &t))
                     }
                     _ => return None,
                 }
             }
-            if let Term::IterNext { iter, dst, .. } = &b.term {
-                match tys[*iter as usize] {
-                    Some(JTy::Iter(a)) => set(&mut tys, *dst, elem_jty(&anns, a))?,
-                    None => {}
-                    _ => return None,
+            _ => return None,
+        }))
+    }
+}
+
+/// Types des registres d'une fonction compilable ; `None` si elle ne l'est pas.
+fn analyze(p: &Proto, globals: &Globals, len: crate::intern::Symbol) -> Option<Plan> {
+    let (_, ret) = native_sig(p)?;
+    let mut an = Analysis {
+        p,
+        globals,
+        len,
+        anns: Vec::new(),
+        callees: Vec::new(),
+        ctors: Vec::new(),
+    };
+    // Registres typés de l'IR : leur type ne change pas.
+    let fixed: Vec<Option<JTy>> = p
+        .regs
+        .iter()
+        .map(|t| (*t != RegTy::Value).then(|| jty(*t)))
+        .collect();
+    let mut start: Vec<Lat> = fixed.iter().map(|t| t.map_or(Lat::Undef, Lat::T)).collect();
+    for prm in &p.params {
+        start[prm.reg as usize] = Lat::T(value_jty(&mut an.anns, &prm.ty.as_ref()?.ty));
+    }
+    let ret_jty = value_jty(&mut an.anns, &p.ret.as_ref()?.ty);
+    let nb = p.blocks.len();
+    let mut entry: Vec<Option<Vec<Lat>>> = vec![None; nb];
+    entry[0] = Some(start);
+    let mut defs: Vec<Vec<Option<JTy>>> = p
+        .blocks
+        .iter()
+        .map(|b| vec![None; b.instrs.len()])
+        .collect();
+    let mut term_defs: Vec<Option<JTy>> = vec![None; nb];
+    loop {
+        let mut changed = false;
+        for (bi, b) in p.blocks.iter().enumerate() {
+            let Some(mut cur) = entry[bi].clone() else {
+                continue;
+            };
+            for (k, ins) in b.instrs.iter().enumerate() {
+                let t = an.instr(ins, &cur)?;
+                let d = reads_writes(p, ins)?.1;
+                if let (Some(d), Some(t)) = (d, t) {
+                    let t = match fixed[d as usize] {
+                        None => t,
+                        // Registre typé : même type, ou `int` vers `float` (converti).
+                        Some(f) if f == t || (f == JTy::Float && t == JTy::Int) => f,
+                        Some(_) => return None,
+                    };
+                    defs[bi][k] = Some(t);
+                    cur[d as usize] = Lat::T(t);
+                }
+            }
+            let g = |r: Reg| cur[r as usize].get();
+            let num = |r: Reg| matches!(g(r), Some(JTy::Int | JTy::Float));
+            let ok = match &b.term {
+                Term::Jump(_) => true,
+                Term::Branch { cond, .. } => {
+                    matches!(g(*cond), Some(JTy::Int | JTy::Float | JTy::Bool | JTy::Nil))
+                }
+                Term::IfInt { a, b: y, .. } => g(*a) == Some(JTy::Int) && g(*y) == Some(JTy::Int),
+                Term::IfIntK { a, .. } => g(*a) == Some(JTy::Int),
+                Term::Return { reg, .. } => match ret {
+                    RegTy::Float => num(*reg),
+                    _ => g(*reg) == Some(ret_jty),
+                },
+                Term::IterNext { iter, dst, .. } => match g(*iter) {
+                    Some(JTy::Iter(a)) => {
+                        let t = elem_jty(&an.anns, a);
+                        if fixed[*dst as usize].is_some_and(|f| f != t) {
+                            return None;
+                        }
+                        term_defs[bi] = Some(t);
+                        cur[*dst as usize] = Lat::T(t);
+                        true
+                    }
+                    _ => false,
+                },
+            };
+            if !ok {
+                return None;
+            }
+            let mut term = b.term.clone();
+            for s in term.targets_mut() {
+                let s = *s as usize;
+                let merged = match &entry[s] {
+                    None => cur.clone(),
+                    Some(old) => old.iter().zip(&cur).map(|(a, b)| a.merge(*b)).collect(),
+                };
+                if entry[s].as_ref() != Some(&merged) {
+                    entry[s] = Some(merged);
+                    changed = true;
                 }
             }
         }
@@ -430,111 +778,17 @@ fn analyze(p: &Proto, globals: &Globals, len: crate::intern::Symbol) -> Option<P
             break;
         }
     }
-    // Vérification des lectures : chaque opérande a le type attendu.
-    let ty = |r: Reg| tys[r as usize];
-    let is = |r: Reg, t: JTy| ty(r) == Some(t);
-    let num = |r: Reg| matches!(ty(r), Some(JTy::Int | JTy::Float));
-    for b in &p.blocks {
-        for ins in &b.instrs {
-            use Instr::*;
-            let ok = match ins {
-                Int(..) | Float(..) | Bool(..) | Nil(..) | GetGlobal(..) => true,
-                Move(_, a) => matches!(
-                    ty(*a),
-                    Some(JTy::Int | JTy::Float | JTy::Bool | JTy::Obj(_) | JTy::List(_))
-                ),
-                IterNew { src, .. } => matches!(ty(*src), Some(JTy::List(_))),
-                Index(_, a, i) => matches!(ty(*a), Some(JTy::List(_))) && is(*i, JTy::Int),
-                CallMethod {
-                    recv, name, site, ..
-                } => {
-                    let site = &p.calls[*site as usize];
-                    *name == len
-                        && matches!(ty(*recv), Some(JTy::List(_)))
-                        && site.npos == 0
-                        && site.named.is_empty()
-                        && !site.block
-                }
-                Guard(_, a, _) => matches!(ty(*a), Some(JTy::Int | JTy::Float | JTy::Bool)),
-                FieldAs(_, a, _, _) => matches!(ty(*a), Some(JTy::Obj(_))),
-                IBin(_, _, a, b2) => is(*a, JTy::Int) && is(*b2, JTy::Int),
-                IBinK(_, _, a, _) | INeg(_, a) | IToF(_, a) => is(*a, JTy::Int),
-                FBin(_, _, a, b2) => is(*a, JTy::Float) && is(*b2, JTy::Float),
-                FNeg(_, a) => is(*a, JTy::Float),
-                Not(_, a) => matches!(ty(*a), Some(JTy::Int | JTy::Float | JTy::Bool)),
-                Bin(_, _, a, b2) => {
-                    (num(*a) && num(*b2)) || (is(*a, JTy::Bool) && is(*b2, JTy::Bool))
-                }
-                Call { site, .. } => {
-                    let site = &p.calls[*site as usize];
-                    (0..site.npos).all(|k| {
-                        let r = site.start + k;
-                        num(r)
-                            || is(r, JTy::Bool)
-                            || matches!(ty(r), Some(JTy::Obj(_) | JTy::List(_)))
-                    })
-                }
-                _ => false,
-            };
-            if !ok {
-                return None;
-            }
-        }
-        let ok = match &b.term {
-            Term::Jump(_) => true,
-            Term::Branch { cond, .. } => matches!(
-                ty(*cond),
-                Some(JTy::Int | JTy::Float | JTy::Bool | JTy::Nil)
-            ),
-            Term::IfInt { a, b: y, .. } => is(*a, JTy::Int) && is(*y, JTy::Int),
-            Term::IfIntK { a, .. } => is(*a, JTy::Int),
-            Term::Return { reg, .. } => match ret {
-                RegTy::Float => num(*reg),
-                t => ty(*reg) == Some(jty(t)),
-            },
-            Term::IterNext { iter, .. } => matches!(ty(*iter), Some(JTy::Iter(_))),
-        };
-        if !ok {
-            return None;
-        }
-    }
-    // Arguments des appels : types compatibles avec les paramètres.
-    for b in &p.blocks {
-        for ins in &b.instrs {
-            if let Instr::Call { f, site, .. } = ins {
-                let Some(JTy::Callee(slot)) = ty(*f) else {
-                    return None;
-                };
-                let (cparams, _) = sig_of(slot)?;
-                let site = &p.calls[*site as usize];
-                for (k, pt) in cparams.iter().enumerate() {
-                    let at = ty(site.start + k as u32)?;
-                    let compatible = match (pt, at) {
-                        (RegTy::Float, JTy::Int | JTy::Float) => true,
-                        // Objet transmis tel quel : même annotation, donc déjà vérifié.
-                        (RegTy::Value, JTy::Obj(a)) => {
-                            let callee = global_proto(globals, slot)?;
-                            ann_of(&callee, k) == Some(&anns[a as usize])
-                        }
-                        // Liste transmise telle quelle : mêmes éléments.
-                        (RegTy::Value, JTy::List(a)) => {
-                            let callee = global_proto(globals, slot)?;
-                            matches!(ann_of(&callee, k), Some(RtType::List(e)) if **e == anns[a as usize])
-                        }
-                        (t, a) => jty(*t) == a,
-                    };
-                    if !compatible {
-                        return None;
-                    }
-                }
-            }
-        }
-    }
+    let n = p.regs.len();
     Some(Plan {
-        tys,
-        callees,
-        anns,
-        param_ann,
+        entry: entry
+            .into_iter()
+            .map(|e| e.unwrap_or_else(|| vec![Lat::Undef; n]))
+            .collect(),
+        defs,
+        term_defs,
+        callees: an.callees,
+        ctors: an.ctors,
+        anns: an.anns,
     })
 }
 
@@ -556,6 +810,7 @@ fn reads_writes(p: &Proto, ins: &Instr) -> Option<(Vec<Reg>, Option<Reg>)> {
             (vec![*a, *b], Some(*d))
         }
         IterNew { dst, src, .. } => (vec![*src], Some(*dst)),
+        List(d, start, n) => ((*start..*start + *n).collect(), Some(*d)),
         CallMethod {
             dst, recv, site, ..
         } => {
@@ -574,92 +829,6 @@ fn reads_writes(p: &Proto, ins: &Instr) -> Option<(Vec<Reg>, Option<Reg>)> {
         }
         _ => return None,
     })
-}
-
-/// Instructions `nil` dont la valeur n'est jamais lue (vivacité des registres).
-fn dead_nils(p: &Proto) -> Vec<*const Instr> {
-    let mut dead = Vec::new();
-    let n = p.regs.len();
-    let term_reads = |t: &Term| -> Option<Vec<Reg>> {
-        Some(match t {
-            Term::Jump(_) => vec![],
-            Term::Branch { cond, .. } => vec![*cond],
-            Term::IfInt { a, b, .. } => vec![*a, *b],
-            Term::IfIntK { a, .. } => vec![*a],
-            Term::Return { reg, .. } => vec![*reg],
-            // L'élément (`dst`) n'est écrit que vers le corps : compté comme non écrit,
-            // ce qui est prudent (moins de `nil` déclarés morts).
-            Term::IterNext { iter, .. } => vec![*iter],
-        })
-    };
-    let succs = |t: &Term| -> Vec<usize> {
-        let mut t = t.clone();
-        t.targets_mut().into_iter().map(|x| *x as usize).collect()
-    };
-    // Registres vivants à l'entrée de chaque bloc (point fixe arrière).
-    let mut live_in = vec![vec![false; n]; p.blocks.len()];
-    loop {
-        let mut changed = false;
-        for (bi, b) in p.blocks.iter().enumerate().rev() {
-            let mut live = vec![false; n];
-            for s in succs(&b.term) {
-                for (r, l) in live_in[s].iter().enumerate() {
-                    live[r] |= *l;
-                }
-            }
-            let Some(tr) = term_reads(&b.term) else {
-                return dead;
-            };
-            for r in tr {
-                live[r as usize] = true;
-            }
-            for ins in b.instrs.iter().rev() {
-                let Some((reads, write)) = reads_writes(p, ins) else {
-                    return dead;
-                };
-                if let Some(w) = write {
-                    live[w as usize] = false;
-                }
-                for r in reads {
-                    live[r as usize] = true;
-                }
-            }
-            if live != live_in[bi] {
-                live_in[bi] = live;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    // Un `nil` est mort si son registre n'est pas vivant juste après.
-    for b in &p.blocks {
-        let mut live = vec![false; n];
-        for s in succs(&b.term) {
-            for (r, l) in live_in[s].iter().enumerate() {
-                live[r] |= *l;
-            }
-        }
-        for r in term_reads(&b.term).unwrap_or_default() {
-            live[r as usize] = true;
-        }
-        for ins in b.instrs.iter().rev() {
-            let (reads, write) = reads_writes(p, ins).unwrap_or_default();
-            if let Instr::Nil(d) = ins
-                && !live[*d as usize]
-            {
-                dead.push(ins as *const Instr);
-            }
-            if let Some(w) = write {
-                live[w as usize] = false;
-            }
-            for r in reads {
-                live[r as usize] = true;
-            }
-        }
-    }
-    dead
 }
 
 fn is_cmp(op: BinOp) -> bool {
@@ -715,6 +884,10 @@ impl Jit {
         builder.symbol("bk_field_native", bk_field_native as *const u8);
         builder.symbol("bk_obj_fields", bk_obj_fields as *const u8);
         builder.symbol("bk_list_view", bk_list_view as *const u8);
+        builder.symbol("bk_build", bk_build as *const u8);
+        builder.symbol("bk_clone_into", bk_clone_into as *const u8);
+        builder.symbol("bk_move_out", bk_move_out as *const u8);
+        builder.symbol("bk_drop_slots", bk_drop_slots as *const u8);
         builder.symbol("bk_step", bk_step as *const u8);
         builder.symbol("bk_iter_next", bk_iter_next as *const u8);
         builder.symbol("bk_drop", bk_drop as *const u8);
@@ -762,6 +935,25 @@ impl Jit {
         let list_fn = module
             .declare_function("bk_list_view", Linkage::Import, &sig)
             .ok()?;
+        let mut mem = Vec::new();
+        for (name, nparams, i32_last) in [
+            ("bk_build", 3, false),
+            ("bk_clone_into", 2, false),
+            ("bk_move_out", 3, true),
+            ("bk_drop_slots", 2, false),
+        ] {
+            let mut sig = module.make_signature();
+            for k in 0..nparams {
+                let t = if i32_last && k == nparams - 1 {
+                    types::I32
+                } else {
+                    ptr
+                };
+                sig.params.push(AbiParam::new(t));
+            }
+            mem.push(module.declare_function(name, Linkage::Import, &sig).ok()?);
+        }
+        let mem_fns: [FuncId; 4] = mem.try_into().ok()?;
         Some(Jit {
             module,
             ctx: Box::new(JitCtx {
@@ -778,6 +970,8 @@ impl Jit {
             field_fn,
             fields_fn,
             list_fn,
+            mem_fns,
+            build_plans: Vec::new(),
             known_types: Vec::new(),
             bailed: false,
             len_sym: crate::intern::Symbol(u32::MAX),
@@ -883,7 +1077,7 @@ impl Jit {
                 continue;
             }
             match self.define_entry(key) {
-                Ok(e) => entries.push((p.clone(), e, plan.callees)),
+                Ok(e) => entries.push((p.clone(), e, [plan.callees, plan.ctors].concat())),
                 Err(_) => *p.jit.borrow_mut() = JitState::Rejected,
             }
         }
@@ -930,6 +1124,10 @@ impl Jit {
             .push(AbiParam::new(self.module.target_config().pointer_type()));
         for p in params {
             sig.params.push(AbiParam::new(clif(*p)));
+        }
+        // Objet ou liste renvoyé : écrit dans une case fournie par l'appelant.
+        if ret == RegTy::Value {
+            sig.params.push(AbiParam::new(types::I64));
         }
         sig.returns.push(AbiParam::new(types::I32));
         sig.returns.push(AbiParam::new(clif(ret)));
@@ -998,6 +1196,86 @@ impl Jit {
                 }
             }
         }
+        // Registres d'objets, de listes et d'itérateurs : « empruntés » s'ils désignent
+        // toujours une valeur qui vit pendant tout l'appel (paramètre, élément d'une liste
+        // empruntée) ; sinon « possédants » : une case du cadre natif, libérée à la sortie.
+        let is_ref = |t: Option<JTy>| matches!(t, Some(JTy::Obj(_) | JTy::List(_) | JTy::Iter(_)));
+        let nregs = p.regs.len();
+        // Couples (registre, type) : paramètres, écritures, types connus à l'entrée des blocs.
+        let mut pairs: Vec<(Reg, JTy)> = Vec::new();
+        for m in &plan.entry {
+            for (r, l) in m.iter().enumerate() {
+                if let Some(t) = l.get() {
+                    pairs.push((r as Reg, t));
+                }
+            }
+        }
+        for (b, defs) in p.blocks.iter().zip(&plan.defs) {
+            for (ins, t) in b.instrs.iter().zip(defs) {
+                if let (Some((_, Some(d))), Some(t)) = (reads_writes(p, ins), t) {
+                    pairs.push((d, *t));
+                }
+            }
+        }
+        for (b, t) in p.blocks.iter().zip(&plan.term_defs) {
+            if let (Term::IterNext { dst, .. }, Some(t)) = (&b.term, t) {
+                pairs.push((*dst, *t));
+            }
+        }
+        pairs.sort();
+        pairs.dedup();
+        let mut borrowed = vec![false; nregs];
+        for (r, t) in &pairs {
+            if is_ref(Some(*t)) {
+                borrowed[*r as usize] = true;
+            }
+        }
+        let reg_ref = borrowed.clone();
+        let mut written = vec![false; nregs];
+        loop {
+            let mut changed = false;
+            for b in &p.blocks {
+                for ins in &b.instrs {
+                    let (w, from_borrowed) = match ins {
+                        Instr::Move(d, a) | Instr::Index(d, a, _) => {
+                            (Some(*d), borrowed[*a as usize])
+                        }
+                        Instr::IterNew { dst, src, .. } => (Some(*dst), borrowed[*src as usize]),
+                        other => (reads_writes(p, other).and_then(|(_, w)| w), false),
+                    };
+                    if let Some(w) = w {
+                        written[w as usize] = true;
+                        if borrowed[w as usize] && !from_borrowed {
+                            borrowed[w as usize] = false;
+                            changed = true;
+                        }
+                    }
+                }
+                if let Term::IterNext { iter, dst, .. } = &b.term {
+                    written[*dst as usize] = true;
+                    if borrowed[*dst as usize] && !borrowed[*iter as usize] {
+                        borrowed[*dst as usize] = false;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut slot_of: FxHashMap<Reg, i32> = FxHashMap::default();
+        for r in 0..nregs {
+            if reg_ref[r] && !borrowed[r] {
+                let off = slot_of.len() as i32 * crate::value::layout::SIZE;
+                slot_of.insert(r as Reg, off);
+            }
+        }
+        let nslots = slot_of.len();
+        let [build_fn, clone_fn, move_fn, drop_fn] = self.mem_fns;
+        let build_ref = self.module.declare_func_in_func(build_fn, &mut ctx.func);
+        let clone_ref = self.module.declare_func_in_func(clone_fn, &mut ctx.func);
+        let move_ref = self.module.declare_func_in_func(move_fn, &mut ctx.func);
+        let drop_ref = self.module.declare_func_in_func(drop_fn, &mut ctx.func);
         // Erreurs et appels de cette fonction, numérotés à la suite des tables.
         let (err_base, trace_base) = (self.errors.len() as i64, self.traces.len() as i64);
         let mut err_sites: Vec<(ErrKind, Span)> = Vec::new();
@@ -1006,26 +1284,24 @@ impl Jit {
         let tc = self.module.target_config();
         let mut fctx = FunctionBuilderContext::new();
         let mut bx = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-        let vars: Vec<Option<Variable>> = plan
-            .tys
-            .iter()
-            .map(|t| match t {
-                Some(JTy::Int) => Some(bx.declare_var(types::I64)),
-                Some(JTy::Float) => Some(bx.declare_var(types::F64)),
-                Some(JTy::Bool) => Some(bx.declare_var(types::I8)),
-                Some(JTy::Obj(_) | JTy::List(_)) => Some(bx.declare_var(types::I64)),
-                _ => None,
-            })
-            .collect();
+        // Une variable par registre et par type qu'il prend.
+        let mut vars: FxHashMap<(Reg, JTy), Variable> = FxHashMap::default();
+        for (r, t) in &pairs {
+            let ty = match t {
+                JTy::Float => types::F64,
+                JTy::Bool => types::I8,
+                JTy::Int | JTy::Obj(_) | JTy::List(_) => types::I64,
+                _ => continue,
+            };
+            vars.insert((*r, *t), bx.declare_var(ty));
+        }
         // Itérateurs : adresse des éléments, nombre, position.
-        let iter_vars: FxHashMap<Reg, [Variable; 3]> = plan
-            .tys
+        let iter_vars: FxHashMap<Reg, [Variable; 3]> = pairs
             .iter()
-            .enumerate()
-            .filter(|(_, t)| matches!(t, Some(JTy::Iter(_))))
+            .filter(|(_, t)| matches!(t, JTy::Iter(_)))
             .map(|(r, _)| {
                 let v = [0; 3].map(|_| bx.declare_var(types::I64));
-                (r as Reg, v)
+                (*r, v)
             })
             .collect();
         let entry = bx.create_block();
@@ -1041,39 +1317,55 @@ impl Jit {
             16,
             3,
         ));
+        // Cases des valeurs possédées, `nil` (octets nuls) à l'entrée.
+        let vals = bx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            (nslots.max(1) as i32 * crate::value::layout::SIZE) as u32,
+            3,
+        ));
+        let vals_base = bx.ins().stack_addr(types::I64, vals, 0);
+        for k in 0..nslots as i32 * crate::value::layout::SIZE / 8 {
+            let z = bx.ins().iconst(types::I64, 0);
+            bx.ins().store(MemFlagsData::trusted(), z, vals_base, k * 8);
+        }
+        let out_param = (ret == RegTy::Value).then(|| bx.block_params(entry)[1 + p.params.len()]);
         // Tous les registres sont définis dès l'entrée (valeur nulle).
         for v in iter_vars.values().flatten() {
             let z = bx.ins().iconst(types::I64, 0);
             bx.def_var(*v, z);
         }
-        for (k, v) in vars.iter().enumerate() {
-            if let Some(v) = v {
-                let z = match plan.tys[k] {
-                    Some(JTy::Float) => bx.ins().f64const(0.0),
-                    Some(JTy::Bool) => bx.ins().iconst(types::I8, 0),
-                    _ => bx.ins().iconst(types::I64, 0),
-                };
-                bx.def_var(*v, z);
-            }
+        for ((_, t), v) in &vars {
+            let z = match t {
+                JTy::Float => bx.ins().f64const(0.0),
+                JTy::Bool => bx.ins().iconst(types::I8, 0),
+                _ => bx.ins().iconst(types::I64, 0),
+            };
+            bx.def_var(*v, z);
         }
         for (k, prm) in p.params.iter().enumerate() {
             let a = bx.block_params(entry)[k + 1];
-            bx.def_var(vars[prm.reg as usize].unwrap(), a);
+            let t = plan.entry[0][prm.reg as usize].get().ok_or(())?;
+            bx.def_var(vars[&(prm.reg, t)], a);
         }
         // Adresse des champs de chaque objet de type connu (vérifié une fois ici).
-        let reads_fields = |a: u32| {
-            p.blocks.iter().flat_map(|b| &b.instrs).any(|i| {
-                matches!(i, Instr::FieldAs(_, r, ..) if plan.tys[*r as usize] == Some(JTy::Obj(a)))
-            })
+        // Paramètre objet jamais réaffecté dont des champs sont lus : type vérifié et
+        // adresse des champs prise ici, une fois.
+        let reads_fields = |reg: Reg| {
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.instrs)
+                .any(|i| matches!(i, Instr::FieldAs(_, r, ..) if *r == reg))
         };
-        let mut fields_ptr: Vec<Option<cranelift_codegen::ir::Value>> = vec![None; plan.anns.len()];
+        let mut fields_ptr: FxHashMap<Reg, cranelift_codegen::ir::Value> = FxHashMap::default();
         let mut entry_checks = Vec::new();
-        for k in 0..p.params.len() {
-            let Some(a) = plan.param_ann[k] else { continue };
+        for (k, prm) in p.params.iter().enumerate() {
+            let Some(JTy::Obj(a)) = plan.entry[0][prm.reg as usize].get() else {
+                continue;
+            };
             let Some(info) = &obj_types[a as usize] else {
                 continue;
             };
-            if !reads_fields(a) {
+            if written[prm.reg as usize] || !reads_fields(prm.reg) {
                 continue;
             }
             let obj = bx.block_params(entry)[k + 1];
@@ -1081,7 +1373,7 @@ impl Jit {
             let call = bx.ins().call(fields_ref, &[obj, ip]);
             let fp = bx.inst_results(call)[0];
             entry_checks.push(fp);
-            fields_ptr[a as usize] = Some(fp);
+            fields_ptr.insert(prm.reg, fp);
         }
         let start = bx.create_block();
         for fp in entry_checks {
@@ -1097,8 +1389,24 @@ impl Jit {
         bx.switch_to_block(start);
         bx.ins().jump(blocks[0], &[]);
 
-        let var = |r: Reg| vars[r as usize].expect("registre typé");
-        let tyof = |r: Reg| plan.tys[r as usize];
+        // Types en cours (avant l'instruction) et type écrit par l'instruction.
+        let mut cur: Vec<Option<JTy>>;
+        let mut dty: Option<JTy>;
+        macro_rules! tyof {
+            ($r:expr) => {
+                cur[$r as usize]
+            };
+        }
+        macro_rules! uvar {
+            ($r:expr) => {
+                *vars.get(&($r, cur[$r as usize].ok_or(())?)).ok_or(())?
+            };
+        }
+        macro_rules! dvar {
+            ($r:expr) => {
+                *vars.get(&($r, dty.ok_or(())?)).ok_or(())?
+            };
+        }
         // Branche vers l'erreur `id` si `cond`.
         macro_rules! check {
             ($bx:expr, $cond:expr, $kind:expr, $span:expr) => {{
@@ -1120,6 +1428,67 @@ impl Jit {
                 let data = $bx.ins().load(types::I64, MemFlagsData::trusted(), out, 0);
                 let len = $bx.ins().load(types::I64, MemFlagsData::trusted(), out, 8);
                 (data, len)
+            }};
+        }
+        // Adresse de la case du registre possédant `r`.
+        macro_rules! own {
+            ($bx:expr, $r:expr) => {{
+                let off = *slot_of.get(&$r).ok_or(())?;
+                $bx.ins().stack_addr(types::I64, vals, off)
+            }};
+        }
+        // Valeur de l'élément `v` (objet : adresse) vers le registre `d` : copiée dans sa
+        // case si `d` est possédant.
+        macro_rules! put_ref {
+            ($bx:expr, $d:expr, $v:expr) => {{
+                if borrowed[$d as usize] {
+                    $bx.def_var(dvar!($d), $v);
+                } else {
+                    let slot = own!($bx, $d);
+                    $bx.ins().call(clone_ref, &[slot, $v]);
+                    $bx.def_var(dvar!($d), slot);
+                }
+            }};
+        }
+        // Libère les cases (avant chaque sortie).
+        macro_rules! drop_slots {
+            ($bx:expr) => {{
+                if nslots > 0 {
+                    let base = $bx.ins().stack_addr(types::I64, vals, 0);
+                    let n = $bx.ins().iconst(types::I64, nslots as i64);
+                    $bx.ins().call(drop_ref, &[base, n]);
+                }
+            }};
+        }
+        // Construit dans la case de `d` l'objet ou la liste décrit par `items` (valeurs
+        // natives des registres `regs`).
+        macro_rules! build {
+            ($bx:expr, $d:expr, $info:expr, $items:expr, $regs:expr) => {{
+                let items: Vec<(usize, Kind)> = $items;
+                let regs: Vec<Reg> = $regs;
+                let args = $bx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    (regs.len().max(1) * 8) as u32,
+                    3,
+                ));
+                let base = $bx.ins().stack_addr(types::I64, args, 0);
+                for (k, r) in regs.iter().enumerate() {
+                    let v = $bx.use_var(uvar!(*r));
+                    let bits = match tyof!(*r) {
+                        Some(JTy::Float) => $bx.ins().bitcast(types::I64, MemFlagsData::new(), v),
+                        Some(JTy::Bool) => $bx.ins().uextend(types::I64, v),
+                        _ => v,
+                    };
+                    $bx.ins()
+                        .store(MemFlagsData::trusted(), bits, base, (k * 8) as i32);
+                }
+                self.build_plans
+                    .push(Box::new(BuildPlan { info: $info, items }));
+                let plan = &**self.build_plans.last().unwrap() as *const BuildPlan;
+                let plan = $bx.ins().iconst(types::I64, plan as i64);
+                let slot = own!($bx, $d);
+                $bx.ins().call(build_ref, &[slot, base, plan]);
+                $bx.def_var(dvar!($d), slot);
             }};
         }
         // Valeur de l'élément à l'adresse `addr`, du type `anns[a]` : l'adresse pour un
@@ -1162,50 +1531,60 @@ impl Jit {
         }
         for (bi, b) in p.blocks.iter().enumerate() {
             bx.switch_to_block(blocks[bi]);
-            for (ins, &span) in b.instrs.iter().zip(&b.spans) {
+            cur = plan.entry[bi].iter().map(|l| l.get()).collect();
+            for (k, (ins, &span)) in b.instrs.iter().zip(&b.spans).enumerate() {
                 use Instr::*;
+                dty = plan.defs[bi][k];
                 match ins {
                     Int(d, n) => {
                         let v = bx.ins().iconst(types::I64, *n);
-                        bx.def_var(var(*d), v);
+                        bx.def_var(dvar!(*d), v);
                     }
                     Float(d, f) => {
                         let v = bx.ins().f64const(*f);
-                        bx.def_var(var(*d), v);
+                        bx.def_var(dvar!(*d), v);
                     }
                     Bool(d, v) => {
                         let v = bx.ins().iconst(types::I8, *v as i64);
-                        bx.def_var(var(*d), v);
+                        bx.def_var(dvar!(*d), v);
                     }
                     Nil(_) | GetGlobal(..) => {}
+                    Move(_, a) if is_ref(dty) => {
+                        let d = match ins {
+                            Move(d, _) => d,
+                            _ => unreachable!(),
+                        };
+                        let v = bx.use_var(uvar!(*a));
+                        put_ref!(bx, *d, v);
+                    }
                     Move(d, a) | Guard(d, a, _) => {
-                        let v = bx.use_var(var(*a));
-                        let v = match (tyof(*d), tyof(*a)) {
+                        let v = bx.use_var(uvar!(*a));
+                        let v = match (dty, tyof!(*a)) {
                             (Some(JTy::Float), Some(JTy::Int)) => {
                                 bx.ins().fcvt_from_sint(types::F64, v)
                             }
                             _ => v,
                         };
-                        bx.def_var(var(*d), v);
+                        bx.def_var(dvar!(*d), v);
                     }
                     IBin(op, d, a, b2) => {
-                        let (x, y) = (bx.use_var(var(*a)), bx.use_var(var(*b2)));
+                        let (x, y) = (bx.use_var(uvar!(*a)), bx.use_var(uvar!(*b2)));
                         let v = int_bin(&mut bx, *op, x, y, &mut |bx, c, k| check!(bx, c, k, span));
-                        bx.def_var(var(*d), v);
+                        bx.def_var(dvar!(*d), v);
                     }
                     // Champ d'un objet de type connu : lecture directe et vérification de
                     // l'étiquette.
                     FieldAs(d, a, name, t)
-                        if let Some(JTy::Obj(k)) = tyof(*a)
+                        if let Some(JTy::Obj(k)) = tyof!(*a)
                             && let Some(info) = &obj_types[k as usize]
                             && let Some(idx) = info.field_index(*name) =>
                     {
                         // Paramètre : adresse des champs prise à l'entrée ; élément d'une
                         // liste : vérifiée à chaque lecture.
-                        let fp = match fields_ptr[k as usize] {
+                        let fp = match fields_ptr.get(a).copied() {
                             Some(fp) => fp,
                             None => {
-                                let obj = bx.use_var(var(*a));
+                                let obj = bx.use_var(uvar!(*a));
                                 let ip = bx.ins().iconst(types::I64, Rc::as_ptr(info) as i64);
                                 let call = bx.ins().call(fields_ref, &[obj, ip]);
                                 let fp = bx.inst_results(call)[0];
@@ -1229,7 +1608,7 @@ impl Jit {
                             fp,
                             off + crate::value::layout::PAYLOAD,
                         );
-                        bx.def_var(var(*d), v);
+                        bx.def_var(dvar!(*d), v);
                     }
                     FieldAs(d, a, name, t) => {
                         self.field_caches.push(Box::new(FieldCache {
@@ -1239,7 +1618,7 @@ impl Jit {
                             want: *t,
                         }));
                         let cache = &**self.field_caches.last().unwrap() as *const FieldCache;
-                        let obj = bx.use_var(var(*a));
+                        let obj = bx.use_var(uvar!(*a));
                         let cache = bx.ins().iconst(types::I64, cache as i64);
                         let out = bx.ins().stack_addr(types::I64, out_slot, 0);
                         let call = bx.ins().call(field_ref, &[obj, cache, out]);
@@ -1251,22 +1630,22 @@ impl Jit {
                             RegTy::Bool => bx.ins().ireduce(types::I8, bits),
                             _ => bits,
                         };
-                        bx.def_var(var(*d), v);
+                        bx.def_var(dvar!(*d), v);
                     }
                     IBinK(op, d, a, k) => {
-                        let x = bx.use_var(var(*a));
+                        let x = bx.use_var(uvar!(*a));
                         let y = bx.ins().iconst(types::I64, *k);
                         let v = int_bin(&mut bx, *op, x, y, &mut |bx, c, k| check!(bx, c, k, span));
-                        bx.def_var(var(*d), v);
+                        bx.def_var(dvar!(*d), v);
                     }
                     FBin(op, d, a, b2) => {
-                        let (x, y) = (bx.use_var(var(*a)), bx.use_var(var(*b2)));
+                        let (x, y) = (bx.use_var(uvar!(*a)), bx.use_var(uvar!(*b2)));
                         let v = float_bin(&mut bx, *op, x, y, frem_ref);
-                        bx.def_var(var(*d), v);
+                        bx.def_var(dvar!(*d), v);
                     }
                     Bin(op, d, a, b2) => {
-                        let (ta, tb) = (tyof(*a), tyof(*b2));
-                        let (x, y) = (bx.use_var(var(*a)), bx.use_var(var(*b2)));
+                        let (ta, tb) = (tyof!(*a), tyof!(*b2));
+                        let (x, y) = (bx.use_var(uvar!(*a)), bx.use_var(uvar!(*b2)));
                         let v = match (ta, tb) {
                             (Some(JTy::Int), Some(JTy::Int)) => {
                                 int_bin(&mut bx, *op, x, y, &mut |bx, c, k| check!(bx, c, k, span))
@@ -1286,48 +1665,70 @@ impl Jit {
                                 float_bin(&mut bx, *op, x, y, frem_ref)
                             }
                         };
-                        bx.def_var(var(*d), v);
+                        bx.def_var(dvar!(*d), v);
                     }
                     INeg(d, a) => {
-                        let x = bx.use_var(var(*a));
+                        let x = bx.use_var(uvar!(*a));
                         let c = bx.ins().icmp_imm_s(IntCC::Equal, x, i64::MIN);
                         check!(bx, c, ErrKind::Overflow, span);
                         let v = bx.ins().ineg(x);
-                        bx.def_var(var(*d), v);
+                        bx.def_var(dvar!(*d), v);
                     }
                     FNeg(d, a) => {
-                        let x = bx.use_var(var(*a));
+                        let x = bx.use_var(uvar!(*a));
                         let v = bx.ins().fneg(x);
-                        bx.def_var(var(*d), v);
+                        bx.def_var(dvar!(*d), v);
                     }
                     IToF(d, a) => {
-                        let x = bx.use_var(var(*a));
+                        let x = bx.use_var(uvar!(*a));
                         let v = bx.ins().fcvt_from_sint(types::F64, x);
-                        bx.def_var(var(*d), v);
+                        bx.def_var(dvar!(*d), v);
                     }
                     Not(d, a) => {
-                        let v = match tyof(*a) {
+                        let v = match tyof!(*a) {
                             Some(JTy::Bool) => {
-                                let x = bx.use_var(var(*a));
+                                let x = bx.use_var(uvar!(*a));
                                 bx.ins().icmp_imm_s(IntCC::Equal, x, 0)
                             }
                             // Un nombre est toujours vrai.
                             _ => bx.ins().iconst(types::I8, 0),
                         };
-                        bx.def_var(var(*d), v);
+                        bx.def_var(dvar!(*d), v);
+                    }
+                    Call { dst, f, site } if let Some(JTy::Ctor(slot)) = tyof!(*f) => {
+                        let site = &p.calls[*site as usize];
+                        let info = global_type(globals, slot).ok_or(())?;
+                        let items = ctor_plan(&info, site, &cur, &plan.anns).ok_or(())?;
+                        let n = items.len() as u32;
+                        build!(
+                            bx,
+                            *dst,
+                            Some(info),
+                            items,
+                            (site.start..site.start + n).collect()
+                        );
+                    }
+                    List(d, start, n) => {
+                        let items = (0..*n)
+                            .map(|k| {
+                                let t = tyof!(*start + k).ok_or(())?;
+                                Ok((k as usize, kind_for(&plan.anns, t, None).ok_or(())?))
+                            })
+                            .collect::<Result<Vec<_>, ()>>()?;
+                        build!(bx, *d, None, items, (*start..*start + *n).collect());
                     }
                     Call { dst, f, site } => {
-                        let Some(JTy::Callee(slot)) = tyof(*f) else {
+                        let Some(JTy::Callee(slot)) = tyof!(*f) else {
                             return Err(());
                         };
                         let (fref, q) = callee_refs[&slot].clone();
-                        let (cparams, _) = native_sig(&q).ok_or(())?;
+                        let (cparams, cret) = native_sig(&q).ok_or(())?;
                         let site = &p.calls[*site as usize];
                         let mut args = vec![ctxv];
                         for (k, pt) in cparams.iter().enumerate() {
                             let r = site.start + k as u32;
-                            let v = bx.use_var(var(r));
-                            let v = match (pt, tyof(r)) {
+                            let v = bx.use_var(uvar!(r));
+                            let v = match (pt, tyof!(r)) {
                                 (RegTy::Float, Some(JTy::Int)) => {
                                     bx.ins().fcvt_from_sint(types::F64, v)
                                 }
@@ -1335,6 +1736,14 @@ impl Jit {
                             };
                             args.push(v);
                         }
+                        // Objet ou liste renvoyé : dans la case de `dst`.
+                        let out = if cret == RegTy::Value {
+                            let slot = own!(bx, *dst);
+                            args.push(slot);
+                            Some(slot)
+                        } else {
+                            None
+                        };
                         // Profondeur d'appels.
                         let depth =
                             bx.ins()
@@ -1369,10 +1778,17 @@ impl Jit {
                         let none = bx.ins().iconst(types::I64, -1);
                         bx.ins().jump(fail, &[none.into()]);
                         bx.switch_to_block(cont);
-                        bx.def_var(var(*dst), result);
+                        bx.def_var(dvar!(*dst), out.unwrap_or(result));
                     }
                     IterNew { dst, src, .. } => {
-                        let list = bx.use_var(var(*src));
+                        let mut list = bx.use_var(uvar!(*src));
+                        // Liste possédée : l'itérateur en garde une copie (elle reste
+                        // vivante même si son registre change pendant la boucle).
+                        if !borrowed[*dst as usize] {
+                            let slot = own!(bx, *dst);
+                            bx.ins().call(clone_ref, &[slot, list]);
+                            list = slot;
+                        }
                         let (data, len) = view!(bx, list, span);
                         let [dv, lv, iv] = iter_vars[dst];
                         let zero = bx.ins().iconst(types::I64, 0);
@@ -1381,14 +1797,14 @@ impl Jit {
                         bx.def_var(iv, zero);
                     }
                     Index(d, a, i) => {
-                        let Some(JTy::List(e)) = tyof(*a) else {
+                        let Some(JTy::List(e)) = tyof!(*a) else {
                             return Err(());
                         };
-                        let list = bx.use_var(var(*a));
+                        let list = bx.use_var(uvar!(*a));
                         let (data, len) = view!(bx, list, span);
                         // Index négatif : depuis la fin ; hors limites : l'interpréteur
                         // produit l'erreur.
-                        let i = bx.use_var(var(*i));
+                        let i = bx.use_var(uvar!(*i));
                         let neg = bx.ins().icmp_imm_s(IntCC::SignedLessThan, i, 0);
                         let from_end = bx.ins().iadd(i, len);
                         let pos = bx.ins().select(neg, from_end, i);
@@ -1397,25 +1813,33 @@ impl Jit {
                         let off = bx.ins().imul_imm_s(pos, crate::value::layout::SIZE as i64);
                         let addr = bx.ins().iadd(data, off);
                         let v = elem!(bx, addr, e, span);
-                        bx.def_var(var(*d), v);
+                        if is_ref(dty) {
+                            put_ref!(bx, *d, v);
+                        } else {
+                            bx.def_var(dvar!(*d), v);
+                        }
                     }
                     CallMethod { dst, recv, .. } => {
-                        let list = bx.use_var(var(*recv));
+                        let list = bx.use_var(uvar!(*recv));
                         let (_, len) = view!(bx, list, span);
-                        bx.def_var(var(*dst), len);
+                        bx.def_var(dvar!(*dst), len);
                     }
                     _ => return Err(()),
                 }
+                if let (Some((_, Some(d))), Some(t)) = (reads_writes(p, ins), dty) {
+                    cur[d as usize] = Some(t);
+                }
             }
+            dty = plan.term_defs[bi];
             match &b.term {
                 Term::Jump(t) => {
                     bx.ins().jump(blocks[*t as usize], &[]);
                 }
                 Term::Branch { cond, then, else_ } => {
                     let (t, e) = (blocks[*then as usize], blocks[*else_ as usize]);
-                    match tyof(*cond) {
+                    match tyof!(*cond) {
                         Some(JTy::Bool) => {
-                            let c = bx.use_var(var(*cond));
+                            let c = bx.use_var(uvar!(*cond));
                             bx.ins().brif(c, t, &[], e, &[]);
                         }
                         Some(JTy::Nil) => {
@@ -1433,7 +1857,7 @@ impl Jit {
                     then,
                     else_,
                 } => {
-                    let (x, y) = (bx.use_var(var(*a)), bx.use_var(var(*y)));
+                    let (x, y) = (bx.use_var(uvar!(*a)), bx.use_var(uvar!(*y)));
                     let c = bx.ins().icmp(int_cc(*op), x, y);
                     bx.ins()
                         .brif(c, blocks[*then as usize], &[], blocks[*else_ as usize], &[]);
@@ -1445,17 +1869,32 @@ impl Jit {
                     then,
                     else_,
                 } => {
-                    let x = bx.use_var(var(*a));
+                    let x = bx.use_var(uvar!(*a));
                     let c = bx.ins().icmp_imm_s(int_cc(*op), x, *k);
                     bx.ins()
                         .brif(c, blocks[*then as usize], &[], blocks[*else_ as usize], &[]);
                 }
                 Term::Return { reg, .. } => {
-                    let v = bx.use_var(var(*reg));
-                    let v = match (ret, tyof(*reg)) {
+                    let mut v = bx.use_var(uvar!(*reg));
+                    v = match (ret, tyof!(*reg)) {
                         (RegTy::Float, Some(JTy::Int)) => bx.ins().fcvt_from_sint(types::F64, v),
                         _ => v,
                     };
+                    if let Some(out) = out_param {
+                        // Déplacé si la valeur est dans la case du registre (possédée),
+                        // copié sinon (paramètre…).
+                        let owned = match slot_of.get(reg) {
+                            Some(&off) => {
+                                let slot = bx.ins().stack_addr(types::I64, vals, off);
+                                let same = bx.ins().icmp(IntCC::Equal, v, slot);
+                                bx.ins().uextend(types::I32, same)
+                            }
+                            None => bx.ins().iconst(types::I32, 0),
+                        };
+                        bx.ins().call(move_ref, &[out, v, owned]);
+                        v = bx.ins().iconst(types::I64, 0);
+                    }
+                    drop_slots!(bx);
                     let ok = bx.ins().iconst(types::I32, 0);
                     bx.ins().return_(&[ok, v]);
                 }
@@ -1465,7 +1904,7 @@ impl Jit {
                     body,
                     done,
                 } => {
-                    let Some(JTy::Iter(a)) = tyof(*iter) else {
+                    let Some(JTy::Iter(a)) = tyof!(*iter) else {
                         return Err(());
                     };
                     let [dv, lv, iv] = iter_vars[iter];
@@ -1481,7 +1920,11 @@ impl Jit {
                     bx.def_var(iv, i1);
                     let span = b.term_span;
                     let v = elem!(bx, addr, a, span);
-                    bx.def_var(var(*dst), v);
+                    if is_ref(dty) {
+                        put_ref!(bx, *dst, v);
+                    } else {
+                        bx.def_var(dvar!(*dst), v);
+                    }
                     bx.ins().jump(blocks[*body as usize], &[]);
                 }
             }
@@ -1499,6 +1942,7 @@ impl Jit {
             .store(MemFlagsData::trusted(), eid, ctxv, ERR_OFFSET);
         bx.ins().jump(done, &[]);
         bx.switch_to_block(done);
+        drop_slots!(bx);
         let one = bx.ins().iconst(types::I32, 1);
         let zero = match ret {
             RegTy::Float => bx.ins().f64const(0.0),
@@ -1558,17 +2002,23 @@ impl Jit {
                 .load(clif(*t), MemFlagsData::trusted(), args, (k * 8) as i32);
             call_args.push(v);
         }
+        // Objet ou liste : `out` désigne la valeur qui recevra le résultat.
+        if ret == RegTy::Value {
+            call_args.push(out);
+        }
         let call = bx.ins().call(target, &call_args);
         let (status, result) = {
             let r = bx.inst_results(call);
             (r[0], r[1])
         };
-        let result = if ret == RegTy::Bool {
-            bx.ins().uextend(types::I64, result)
-        } else {
-            result
-        };
-        bx.ins().store(MemFlagsData::trusted(), result, out, 0);
+        if ret != RegTy::Value {
+            let result = if ret == RegTy::Bool {
+                bx.ins().uextend(types::I64, result)
+            } else {
+                result
+            };
+            bx.ins().store(MemFlagsData::trusted(), result, out, 0);
+        }
         bx.ins().return_(&[status]);
         bx.seal_all_blocks();
         bx.finalize(tc);
@@ -1619,17 +2069,23 @@ impl Jit {
         self.ctx.traces.clear();
         self.bailed = false;
         let mut out = 0u64;
+        // Objet ou liste renvoyé : écrit directement dans `result`.
+        let mut result = Value::Nil;
+        let out_ptr = match code.ret {
+            RegTy::Value => &mut result as *mut Value as *mut u64,
+            _ => &mut out as *mut u64,
+        };
         // SAFETY : `entry` est un point d'entrée généré par `define_entry` avec cette
         // signature ; les arguments ont le nombre et le type attendus.
         let f: extern "C" fn(*mut JitCtx, *const u64, *mut u64) -> i32 =
             unsafe { std::mem::transmute(code.entry) };
-        let status = f(&mut *self.ctx, buf.as_ptr(), &mut out);
+        let status = f(&mut *self.ctx, buf.as_ptr(), out_ptr);
         if status == 0 {
             return Some(Ok(match code.ret {
                 RegTy::Int => Value::Int(out as i64),
                 RegTy::Float => Value::Float(f64::from_bits(out)),
                 RegTy::Bool => Value::Bool(out & 1 == 1),
-                RegTy::Value => unreachable!(),
+                RegTy::Value => result,
             }));
         }
         let info = &self.errors[self.ctx.err as usize];

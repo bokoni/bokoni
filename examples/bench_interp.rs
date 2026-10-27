@@ -43,6 +43,10 @@ const PROGRAMS: &[(&str, &str)] = &[
         "type P\n  x: int = 0\n  w: float = 1.0\nend\ndef wsum(ps: [P]): float\n  let t = 0.0\n  for p in ps\n    t += p.x * p.w\n  end\n  t\nend\nlet ps = (0...100000).map(|i| P(x: i, w: 0.5))\nlet t = 0.0\nfor k in 0...10\n  t += wsum(ps)\nend\nt",
     ),
     (
+        "objets créés en code typé : vecteurs (1 M)",
+        "type V\n  x: float = 0.0\n  y: float = 0.0\nend\ndef add(a: V, b: V): V = V(x: a.x + b.x, y: a.y + b.y)\ndef scale(v: V, k: float): V = V(x: v.x * k, y: v.y * k)\ndef run(n: int): float\n  let p = V(x: 0.0, y: 0.0)\n  let d = V(x: 1.0, y: 0.5)\n  let i = 0\n  while i < n\n    p = add(p, scale(d, 0.001))\n    i += 1\n  end\n  p.x + p.y\nend\nrun(1000000)",
+    ),
+    (
         "chaînes : interpolation (100 k)",
         "let n = 0\nfor i in 0...100000\n  let s = \"item #{i}\"\n  n += s.len()\nend\nn",
     ),

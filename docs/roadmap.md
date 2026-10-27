@@ -139,18 +139,29 @@ Temps compilation comprise.
       `xs[i]` (index négatif compris), `xs.len()`, transmission aux fonctions natives ;
       cas limite (index hors limites…) : l'interpréteur reprend l'appel et produit
       l'erreur exacte
+- [x] JIT typé : création d'objets (`V(x: …, y: …)`) et de listes littérales, objets et
+      listes renvoyés (`def add(a: V, b: V): V`). Registres possédants : une case du cadre
+      natif, libérée à toutes les sorties (retour, erreur, abandon) ; registres
+      empruntés (paramètres, éléments d'une liste reçue) : simple pointeur. Testé par
+      les compteurs de références après des milliers d'appels
+- [x] Typage des registres selon le flot du programme (un type par registre et par point,
+      une variable native par couple) : la réutilisation d'un temporaire pour des types
+      différents n'empêche plus la compilation (remplace l'analyse des `nil` morts)
+- [x] Appel direct d'une fonction déjà compilée en code de base ; interpolation de
+      chaînes avec un tampon réutilisé ; méthodes intégrées appelées directement
 - Non fait, volontairement : typer les paramètres des lambdas d'après la liste
   (`xs.map(|x| …)`) — une liste `[int]` peut recevoir une autre valeur depuis du code
   non typé, et le coût restant est celui de l'appel, pas du calcul
 
 | Programme                               | v0.4    | maintenant | gain |
 |-----------------------------------------|--------:|-----------:|-----:|
-| listes : map / filter / sum (100 k)     | 16,9 ms | 8,6 ms     | ×2,0 |
-| closures et compteur (300 k appels)     | 27,4 ms | 14,6 ms    | ×1,9 |
+| listes : map / filter / sum (100 k)     | 16,9 ms | 8,0 ms     | ×2,1 |
+| closures et compteur (300 k appels)     | 27,4 ms | 13,6 ms    | ×2,0 |
 | objets : construction et champs (100 k) | 17,9 ms | 9,2 ms     | ×1,9 |
-| chaînes : interpolation (100 k)         | 11,2 ms | 8,7 ms     | ×1,3 |
+| chaînes : interpolation (100 k)         | 11,2 ms | 6,0 ms     | ×1,9 |
 | objets typés : produit scalaire (1 M)   | 172 ms  | 3,2 ms     | ×54  |
 | boucle typée sur 100 k objets (`wsum`)  | ~6,4 ms | 0,47 ms    | ×14  |
+| vecteurs créés en code typé (1 M)       | 409 ms  | 73 ms      | ×5,6 |
 | `fib(25)` interprété (`--no-jit`)       | 28 ms   | 18 ms      | ×1,6 |
 
 ### Ensuite
