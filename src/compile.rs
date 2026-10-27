@@ -733,6 +733,7 @@ impl Compiler<'_> {
             specs: Default::default(),
             class_params: f.class_params,
             spec: None,
+            deopted: Default::default(),
         })
     }
 

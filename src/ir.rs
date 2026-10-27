@@ -98,6 +98,9 @@ pub struct Proto {
     pub class_params: Vec<Symbol>,
     /// Typed copy (`specialize`): the type parameters replaced, and by what.
     pub spec: Option<Rc<Spec>>,
+    /// Instructions (block, index) where its native code resumed in the interpreter:
+    /// done by the interpreter when it is recompiled.
+    pub deopted: std::cell::RefCell<Vec<(u32, u32)>>,
 }
 
 /// Type parameters of a typed copy of a function, and their types.
@@ -706,6 +709,7 @@ impl Proto {
             nslots: self.nslots,
             specs: Default::default(),
             class_params: self.class_params.clone(),
+            deopted: Default::default(),
             spec: Some(Rc::new(Spec {
                 names: names.to_vec(),
                 tys: tys.to_vec(),

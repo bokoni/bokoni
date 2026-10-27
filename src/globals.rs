@@ -79,7 +79,9 @@ impl Globals {
         }
         for w in std::mem::take(ws) {
             if let Some(p) = w.upgrade() {
+                // What it depends on changed: its past resumptions no longer count.
                 *p.jit.borrow_mut() = JitState::Untried;
+                p.deopted.borrow_mut().clear();
             }
         }
     }

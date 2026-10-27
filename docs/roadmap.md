@@ -316,6 +316,10 @@ namespaces, `trait` for shared behavior.
       value; its result is a value of any type (`JTy::Boxed`) on which operations are
       the interpreter's (`Guard` to a simple type checks its tag); a callee that cannot
       be compiled no longer prevents its callers from being compiled
+- [x] Recompiled after a resumption, rather than interpreted for good: the place is
+      remembered and done by the interpreter in the new code (a call that turned out
+      polymorphic, an inlined method redefined…); interpreted after 4 places; a
+      redefinition of what the code depends on forgets them
 - [x] Strings in native code: `str` parameters, results, fields, list elements,
       literals (the function's constants, not copied), `+`, comparisons, interpolation
       of strings and simple values, `len()` — the interpreter's operations, called by

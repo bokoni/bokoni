@@ -530,7 +530,7 @@ end
     // interpreter redoes nothing).
     assert!(e.is_native("bump"));
     // `total` and `scaled` call `norm2` directly; on a `Vec3` (which redefines it) the
-    // native code is abandoned, and they stay interpreted from then on.
+    // interpreter resumes, and they are recompiled on their next call.
     let mut e = Engine::new();
     e.eval(&format!(
         "{SHAPES}Vec2(1.0, 2.0).scaled() + total([Vec2(1.0, 1.0)])"
@@ -937,4 +937,35 @@ def inc(x: int): int = x + 1
     same(
         "def any(x) = if x > 1 then 1.5 else x end\ndef g(n: int): int\n  let t = 0\n  for i in 0...n\n    t += any(i)\n  end\n  t\nend\ng(3)",
     );
+}
+
+#[test]
+fn recompiled_after_a_resumption() {
+    // `total` resumes in the interpreter on a `B` (it redefines `f`), then is recompiled
+    // with that call done by the interpreter: native again, and right for both.
+    let src = "class A
+  def init(@v: int)
+  end
+  def f(): int = @v
+end
+class B < A
+  def f(): int = @v * 100
+end
+def total(xs: [A]): int
+  let t = 0
+  for x in xs
+    t += x.f()
+  end
+  t
+end
+";
+    let mut e = Engine::new();
+    e.eval(&format!("{src}total([A(1)])")).unwrap();
+    assert!(e.is_native("total"));
+    assert_eq!(e.eval_as::<i64>("total([A(1), B(2)])").unwrap(), 201);
+    assert!(!e.is_native("total"));
+    assert_eq!(e.eval_as::<i64>("total([B(1), A(2), B(3)])").unwrap(), 402);
+    assert!(e.is_native("total"));
+    assert_eq!(e.eval_as::<i64>("total([A(5), B(1)])").unwrap(), 105);
+    assert!(e.is_native("total"));
 }

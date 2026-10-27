@@ -23,7 +23,9 @@
 //! - When an assumption does not hold (value of another type, index out of bounds,
 //!   method redefined, native stack nearly full), the native code is not abandoned: the
 //!   interpreter resumes at that instruction, with the registers rebuilt (`DeoptSite`,
-//!   `bk_resume`), and its result is the function's. Nothing is redone.
+//!   `bk_resume`), and its result is the function's. Nothing is redone. The function is
+//!   then recompiled with that instruction done by the interpreter (`Proto::deopted`);
+//!   after `MAX_DEOPTS` places, it stays interpreted.
 //! - A call to a global function is direct (native code → native code). If the global is
 //!   redefined, the calling code is invalidated, then recompiled when needed.
 //! - A method is compiled for the class that declares it: `self` is a pointer, its
@@ -84,6 +86,10 @@ pub struct JitCtx {
     pub returned: Option<Value>,
 }
 
+/// Resumptions in the interpreter (at distinct places) after which a function stays
+/// interpreted.
+const MAX_DEOPTS: usize = 4;
+
 /// `JitCtx::err`: the error is in `JitCtx::pending`.
 const PENDING: i64 = -2;
 
@@ -127,6 +133,9 @@ struct DeoptSite {
     /// Register, how to rebuild it, offset of its words in the buffer.
     regs: Vec<(Reg, DKind, u32)>,
     ret: RegTy,
+    /// A check on entry (the type of an object): no instruction to give the
+    /// interpreter when recompiling.
+    entry: bool,
 }
 
 /// Registers live before each instruction (`[block][k]`, `k` = number of instructions:
@@ -238,8 +247,24 @@ extern "C" fn bk_resume(
                 DKind::Returned => (*ctx).returned.take().unwrap_or(Value::Nil),
             };
         }
-        // The assumption did not hold: interpreted from now on.
-        *p.jit.borrow_mut() = JitState::Rejected;
+        // The assumption did not hold: recompiled with that instruction done by the
+        // interpreter; interpreted after a few times.
+        {
+            let mut d = p.deopted.borrow_mut();
+            let at = if site.entry {
+                (u32::MAX, d.len() as u32)
+            } else {
+                (site.block, site.instr)
+            };
+            if !d.contains(&at) {
+                d.push(at);
+            }
+            *p.jit.borrow_mut() = if d.len() >= MAX_DEOPTS {
+                JitState::Rejected
+            } else {
+                JitState::Untried
+            };
+        }
         // A typed copy: the function as written runs (same code, its annotations `T`).
         let origin = p.spec.as_ref().and_then(|s| s.origin.upgrade());
         let p = origin.as_ref().unwrap_or(p);
@@ -1928,6 +1953,13 @@ fn analyze(
     if method != this.is_some() {
         return None;
     }
+    let deopted: crate::intern::FxHashSet<usize> = p
+        .deopted
+        .borrow()
+        .iter()
+        .filter_map(|&(b, k)| p.blocks.get(b as usize)?.instrs.get(k as usize))
+        .map(|i| i as *const Instr as usize)
+        .collect();
     let mut an = Analysis {
         p,
         globals,
@@ -1969,7 +2001,10 @@ fn analyze(
                 continue;
             };
             for (k, ins) in b.instrs.iter().enumerate() {
-                let t = match an.instr(ins, &cur) {
+                // Resumed in the interpreter there before: done by it.
+                let forced = deopted.contains(&(ins as *const Instr as usize));
+                let native = if forced { None } else { an.instr(ins, &cur) };
+                let t = match native {
                     Some(t) => t,
                     // Not compiled natively: done by the interpreter, if possible.
                     None => an.boxed(ins, &cur)?,
@@ -2770,6 +2805,8 @@ impl Jit {
         ));
         let resume_ref = self.module.declare_func_in_func(self.resume_fn, bx.func);
         let live = liveness(p);
+        // Checks on entry (until the first block): see `DeoptSite::entry`.
+        let mut in_entry = true;
         macro_rules! deopt {
             ($bx:expr, $cond:expr, $types:expr, $b:expr, $k:expr) => {
                 deopt!($bx, $cond, $types, $b, $k, None)
@@ -2852,6 +2889,7 @@ impl Jit {
                     instr: $k as u32,
                     regs: saved,
                     ret,
+                    entry: in_entry,
                 }));
                 let site = &**self.deopt_sites.last().unwrap() as *const DeoptSite;
                 let sp = $bx.ins().iconst(types::I64, site as i64);
@@ -2966,6 +3004,7 @@ impl Jit {
         bx.ins().jump(start, &[]);
         bx.switch_to_block(start);
         bx.ins().jump(blocks[0], &[]);
+        in_entry = false;
 
         // Current types (before the instruction) and type written by the instruction.
         let mut cur: Vec<Option<JTy>>;
