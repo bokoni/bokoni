@@ -221,6 +221,8 @@ const CORPUS: &[&str] = &[
     "def m(xs: [int]): int\n  let t = 0\n  for x in xs\n    t += x * x\n  end\n  t\nend\nm([1, 2, 3])",
     "type V\n  x: float = 0.0\nend\ndef add(a: V, b: V): V = V(x: a.x + b.x)\nadd(V(x: 1.0), V(x: 2.0)).x",
     "annotation A\n  n: int = 0\nend\n@[A(n: 2)]\ndef f() = \"#{1 + 1} et #{[1, 2]}\"\nf()",
+    "let l: [any] = [1]\nl << l\nlet m: [any] = [1]\nm << m\n[l == m, l.len(), \"#{l}\"]",
+    "let h: {str => any} = {\"a\" => 1}\nh[\"self\"] = h\n[h == h, h.keys(), h]",
     "let n = 9223372036854775807\n[n - 1, n / 2, -n, 7 % -3, -7 / 2, 2.0 / 3]",
 ];
 
