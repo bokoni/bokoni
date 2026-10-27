@@ -748,7 +748,8 @@ unsafe fn word_value(rt: *mut Runtime, kind: DKind, w: u64) -> Value {
 }
 
 /// Runs `f` (an interpreter operation) with the native context saved around it (the
-/// interpreter may run native code again), at the native call depth.
+/// interpreter may run native code again), at the native call depth, with stack enough
+/// (deep recursion through native code and the interpreter grows it on the heap).
 ///
 /// # Safety
 /// `ctx` is the context of the running native code, `ctx.rt` its runtime.
@@ -763,7 +764,7 @@ unsafe fn with_interpreter<T>(ctx: *mut JitCtx, f: impl FnOnce(&mut Runtime) -> 
         );
         let depth = (*rt).depth;
         (*rt).depth = saved.0 as usize;
-        let r = f(&mut *rt);
+        let r = stacker::maybe_grow(crate::vm::RED_ZONE, crate::vm::STACK_GROW, || f(&mut *rt));
         (*rt).depth = depth;
         (*ctx).depth = saved.0;
         (*ctx).max_depth = saved.1;
@@ -790,6 +791,89 @@ struct BoxedStep {
     scratch: std::cell::RefCell<Vec<Value>>,
 }
 
+/// An instruction the interpreter has a function for, called directly on the values
+/// rebuilt (no registers, no `Runtime::step`): indexing, a field, a hash or a record.
+fn direct_op(ins: &Instr) -> bool {
+    matches!(
+        ins,
+        Instr::Index(..)
+            | Instr::IndexOpt(..)
+            | Instr::SetIndex(..)
+            | Instr::Field(..)
+            | Instr::SetField { .. }
+            | Instr::Hash(..)
+            | Instr::Record(..)
+    )
+}
+
+/// Runs a `direct_op` instruction on its values: its result, if any.
+///
+/// # Safety
+/// As `bk_step_boxed`.
+unsafe fn run_direct(
+    rt: &mut Runtime,
+    s: &BoxedStep,
+    buf: *const u64,
+) -> Result<Option<Value>, Error> {
+    let rtp: *mut Runtime = rt;
+    // (A value in a slot is borrowed, not copied.)
+    let w = |k: usize| -> std::borrow::Cow<'_, Value> {
+        let b = unsafe { *buf.add(k) };
+        match s.reads[k].1 {
+            DKind::Ref if b != 0 => std::borrow::Cow::Borrowed(unsafe { &*(b as *const Value) }),
+            kind => std::borrow::Cow::Owned(unsafe { word_value(rtp, kind, b) }),
+        }
+    };
+    let span = s.span;
+    Ok(Some(match &s.ins {
+        Instr::Index(..) => rt.index(&w(0), &w(1), span)?,
+        Instr::IndexOpt(..) => rt.index_opt(&w(0), &w(1), span)?,
+        Instr::SetIndex(..) => {
+            let (r, i, v) = (w(0), w(1), w(2).into_owned());
+            rt.set_index(&r, &i, v, span)?;
+            return Ok(None);
+        }
+        Instr::Field(_, _, name, access) => {
+            let r = w(0);
+            rt.field(&r, *name, *access, span)?
+        }
+        Instr::SetField {
+            name,
+            shape,
+            access,
+            ..
+        } => {
+            let (o, v) = (w(0), w(1).into_owned());
+            let shape = shape.map(|k| s.proto.shapes[k as usize].clone());
+            rt.set_field(&o, *name, v, shape.as_deref(), *access, span)?;
+            return Ok(None);
+        }
+        Instr::Hash(_, _, n) => {
+            let mut h = crate::value::HashMap::new();
+            for k in 0..*n as usize {
+                let key = rt.hash_key(&w(2 * k), span)?;
+                h.insert(key, w(2 * k + 1).into_owned());
+            }
+            let v = Value::Hash(Rc::new(std::cell::RefCell::new(h)));
+            crate::gc::track(&v);
+            v
+        }
+        Instr::Record(_, _, r) => {
+            let fields = s.proto.records[*r as usize]
+                .iter()
+                .enumerate()
+                .map(|(k, n)| (*n, w(k).into_owned()))
+                .collect();
+            let v = Value::Record(Rc::new(std::cell::RefCell::new(crate::value::Record {
+                fields,
+            })));
+            crate::gc::track(&v);
+            v
+        }
+        _ => unreachable!("not a direct operation"),
+    }))
+}
+
 /// Runs a `BoxedStep` (`buf`: the words of its registers read; `env` / `cells`: the
 /// function's captured variables and cells): 0, or 1 (its error, `JitCtx::pending`).
 extern "C" fn bk_step_boxed(
@@ -807,6 +891,28 @@ extern "C" fn bk_step_boxed(
         let s = &*step;
         let p = &*s.proto;
         let rt = (*ctx).rt;
+        if direct_op(&s.ins) {
+            // (Indexing, a hash or a record built run no script code: no context saved.)
+            let r = match &s.ins {
+                Instr::Index(..) | Instr::IndexOpt(..) | Instr::Hash(..) | Instr::Record(..) => {
+                    run_direct(&mut *rt, s, buf)
+                }
+                _ => with_interpreter(ctx, |rt| run_direct(rt, s, buf)),
+            };
+            return match r {
+                Ok(v) => {
+                    if let Some(v) = v {
+                        **outs = v;
+                    }
+                    0
+                }
+                Err(e) => {
+                    (*ctx).pending = Some(e);
+                    (*ctx).err = PENDING;
+                    1
+                }
+            };
+        }
         // (Taken: a recursive call running the same instruction gets its own.)
         let mut regs = std::mem::take(&mut *s.scratch.borrow_mut());
         if regs.len() != p.regs.len() {
@@ -1910,6 +2016,17 @@ struct Plan {
     steps: crate::intern::FxHashSet<usize>,
 }
 
+/// Types of the operands of a `Bin` with a value of any type as a number (`JTy::Boxed`
+/// speculated: `int`, or `float` with a `float`); the others unchanged.
+fn spec_operands(ta: JTy, tb: JTy) -> (JTy, JTy) {
+    let spec = |t: JTy, other: JTy| match (t, other) {
+        (JTy::Boxed, JTy::Float) => JTy::Float,
+        (JTy::Boxed, JTy::Int | JTy::Boxed) => JTy::Int,
+        _ => t,
+    };
+    (spec(ta, tb), spec(tb, ta))
+}
+
 /// Type of an element of type `anns[a]`.
 fn elem_jty(anns: &[RtType], a: u32) -> JTy {
     match &anns[a as usize] {
@@ -2441,6 +2558,10 @@ impl Analysis<'_> {
             },
             Bin(op, _, a, b) => {
                 let (ta, tb) = (g(*a)?, g(*b)?);
+                // A value of any type (an element of a hash…) with a number: speculated
+                // to be a number too (its tag checked; otherwise resumed in the
+                // interpreter, and this instruction done by it after).
+                let (ta, tb) = spec_operands(ta, tb);
                 match (*op, ta, tb) {
                     (op, JTy::Int, JTy::Int) if is_arith(op) => JTy::Int,
                     (op, _, _) if is_arith(op) && numeric(ta) && numeric(tb) => JTy::Float,
@@ -2800,15 +2921,15 @@ fn analyze(
             break;
         }
     }
-    // An instruction done by the interpreter's code in a loop: the baseline code (values
-    // kept as they are) does better than rebuilding them every time.
+    // An instruction done by `Runtime::step` in a loop (not a `direct_op`): the baseline
+    // code (values kept as they are) does better than rebuilding them every time.
     if !an.steps.is_empty() {
         for scc in crate::outline::loops(p) {
             let in_loop = scc.iter().any(|&b| {
                 p.blocks[b as usize]
                     .instrs
                     .iter()
-                    .any(|i| an.steps.contains(&(i as *const Instr as usize)))
+                    .any(|i| !direct_op(i) && an.steps.contains(&(i as *const Instr as usize)))
             });
             if in_loop {
                 return None;
@@ -5176,6 +5297,36 @@ impl Jit {
                     Bin(op, d, a, b2) => {
                         let (ta, tb) = (tyof!(*a), tyof!(*b2));
                         let (x, y) = (bx.use_var(uvar!(*a)), bx.use_var(uvar!(*b2)));
+                        // A value of any type speculated to be a number: its payload.
+                        let (sa, sb) = spec_operands(ta.ok_or(())?, tb.ok_or(())?);
+                        let mut unbox = |bx: &mut FunctionBuilder, v, from, to: JTy| {
+                            use crate::value::layout::{PAYLOAD, TAG_FLOAT, TAG_INT};
+                            if from != Some(JTy::Boxed) {
+                                return v;
+                            }
+                            let tag = bx.ins().load(types::I8, MemFlagsData::trusted(), v, 0);
+                            let raw =
+                                bx.ins()
+                                    .load(types::I64, MemFlagsData::trusted(), v, PAYLOAD);
+                            if to == JTy::Int {
+                                let bad = bx.ins().icmp_imm_s(IntCC::NotEqual, tag, TAG_INT as i64);
+                                bail!(bx, bad);
+                                raw
+                            } else {
+                                let isf = bx.ins().icmp_imm_s(IntCC::Equal, tag, TAG_FLOAT as i64);
+                                let isi = bx.ins().icmp_imm_s(IntCC::Equal, tag, TAG_INT as i64);
+                                let ok = bx.ins().bor(isf, isi);
+                                let bad = bx.ins().icmp_imm_s(IntCC::Equal, ok, 0);
+                                bail!(bx, bad);
+                                let f = bx.ins().bitcast(types::F64, MemFlagsData::new(), raw);
+                                let i = bx.ins().fcvt_from_sint(types::F64, raw);
+                                bx.ins().select(isf, f, i)
+                            }
+                        };
+                        let x = unbox(&mut bx, x, ta, sa);
+                        let y = unbox(&mut bx, y, tb, sb);
+                        let ta = if ta == Some(JTy::Boxed) { Some(sa) } else { ta };
+                        let tb = if tb == Some(JTy::Boxed) { Some(sb) } else { tb };
                         let v = match (ta, tb) {
                             (Some(JTy::Int), Some(JTy::Int)) => {
                                 int_bin(&mut bx, *op, x, y, &mut |bx, c, k| check!(bx, c, k, span))

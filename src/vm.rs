@@ -113,8 +113,8 @@ pub(crate) fn before_list_write(l: &Rc<RefCell<Vec<Value>>>) {
 /// Calls between two checks of whether a collection of cycles is due.
 const GC_CALLS: u32 = 1024;
 
-const RED_ZONE: usize = 256 * 1024;
-const STACK_GROW: usize = 2 * 1024 * 1024;
+pub(crate) const RED_ZONE: usize = 256 * 1024;
+pub(crate) const STACK_GROW: usize = 2 * 1024 * 1024;
 /// The stack is only checked once every `STACK_CHECK` call levels: the red zone easily
 /// covers those calls (under 32 KiB each).
 const STACK_CHECK: usize = 8;
@@ -1699,7 +1699,7 @@ impl Runtime {
         }
     }
 
-    fn set_index(&mut self, r: &Value, i: &Value, v: Value, span: Span) -> R<()> {
+    pub(crate) fn set_index(&mut self, r: &Value, i: &Value, v: Value, span: Span) -> R<()> {
         match r {
             Value::List(l) => {
                 before_list_write(l);
@@ -1721,7 +1721,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn set_field(
+    pub(crate) fn set_field(
         &mut self,
         obj: &Value,
         name: Symbol,

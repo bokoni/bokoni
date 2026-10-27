@@ -1185,11 +1185,15 @@ fn hashes_records_tuples_in_native_code() {
         "def bad(h: {int => int}, k: int): int = h[k] + 1\nbad({1 => 2}, 3)",
         "def bad(): int\n  let (a, b) = (1, 2, 3)\n  a\nend\nbad()",
         "def bad(x: int): int\n  let h = {}\n  h[[x]] = 1\n  0\nend\nbad(1)",
+        // A value of any type speculated to be a number: an `int`, a `float`, then not.
+        "def sum(h): float\n  let t = 0.0\n  for k, v in h\n    t += v\n  end\n  t\nend\n[sum({1 => 2, 2 => 3.5}), sum({\"a\" => 1.5})]",
+        "def f(n: int): int\n  let h = {0 => 1, 1 => 2, 2 => \"x\"}\n  let t = 0\n  for i in 0...n\n    t += h[i] * 2\n  end\n  t\nend\n[f(2), f(3)]",
+        "def f(n: int): int\n  let h = {0 => 1, 1 => 2.5}\n  let t = 0\n  for i in 0...n\n    if h[i] < 2\n      t += 1\n    end\n  end\n  t\nend\n[f(1), f(2)]",
+        "def f(n: int): [int]\n  let h = {0 => 1, 1 => \"a\"}\n  let out: [int] = []\n  for i in 0...n\n    out << (h[i] + h[0]).len()\n  end\n  out\nend\nf(2)",
     ] {
         same(src);
     }
-    // Compiled when such instructions are outside its loops (in a loop, the baseline code
-    // does them better).
+    // Compiled, with such instructions in its loops too.
     let mut e = Engine::new();
     e.set_output(|_| {});
     e.eval("def area(w: float, h: float): float\n  let r = {w: w, h: h}\n  let t = 0.0\n  for i in 0...10\n    t += w * h\n  end\n  t + r.w\nend\ndef tally(xs: [int]): int\n  let h = {}\n  for x in xs\n    h[x % 3] = 1\n  end\n  h.len()\nend")
@@ -1197,7 +1201,7 @@ fn hashes_records_tuples_in_native_code() {
     assert_eq!(e.eval_as::<f64>("area(2.0, 3.0)").unwrap(), 62.0);
     assert!(e.is_native("area"));
     assert_eq!(e.eval_as::<i64>("tally([1, 2, 3])").unwrap(), 3);
-    assert!(!e.is_native("tally"));
+    assert!(e.is_native("tally"));
 }
 
 #[test]
