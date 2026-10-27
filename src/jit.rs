@@ -19,7 +19,9 @@
 //!   pointed to, and a `for` goes over a copy of the list.
 //! - What is not compiled natively is done by the interpreter (`bk_call_boxed`,
 //!   `bk_binary`…): a call of a function that is not compiled or of a built-in, any
-//!   method, an operation on such a result (`JTy::Boxed`, a value of any type).
+//!   method, an operation on such a result (`JTy::Boxed`, a value of any type); any
+//!   other instruction (hash, record, tuple…) by its code on rebuilt values
+//!   (`bk_step_boxed`), unless it is in a loop (the function is then not compiled).
 //! - When an assumption does not hold (value of another type, index out of bounds,
 //!   method redefined, native stack nearly full), the native code is not abandoned: the
 //!   interpreter resumes at that instruction, with the registers rebuilt (`DeoptSite`,
@@ -200,6 +202,9 @@ fn liveness(p: &Proto) -> Vec<Vec<Vec<bool>>> {
                 match reads_writes(p, ins) {
                     Some((reads, write)) => {
                         if let Some(w) = write {
+                            cur[w as usize] = false;
+                        }
+                        for w in extra_writes(ins) {
                             cur[w as usize] = false;
                         }
                         for r in reads {
@@ -732,6 +737,103 @@ unsafe fn with_interpreter<T>(ctx: *mut JitCtx, f: impl FnOnce(&mut Runtime) -> 
         (*ctx).traces = saved.3;
         (*ctx).rt = rt;
         r
+    }
+}
+
+/// An instruction the native code does not do (an operation on a hash, a record, a
+/// tuple…), done by the interpreter's code (`Runtime::step`) on values rebuilt from the
+/// native ones; its result (any value) into the slot of the register written.
+struct BoxedStep {
+    /// The function compiled (its constants, call sites… are those of the instruction).
+    proto: Rc<Proto>,
+    ins: Instr,
+    /// Registers read, and how to rebuild each from its word.
+    reads: Vec<(Reg, DKind)>,
+    /// Registers written (several: `destructure`), each into its slot (`outs`).
+    dsts: Vec<Reg>,
+    span: Span,
+    /// Registers of the interpreter (all `nil` between two runs), reused.
+    scratch: std::cell::RefCell<Vec<Value>>,
+}
+
+/// Runs a `BoxedStep` (`buf`: the words of its registers read; `env` / `cells`: the
+/// function's captured variables and cells): 0, or 1 (its error, `JitCtx::pending`).
+extern "C" fn bk_step_boxed(
+    ctx: *mut JitCtx,
+    step: *const BoxedStep,
+    buf: *const u64,
+    env: *const crate::vm::Cell,
+    cells: *mut crate::vm::Cell,
+    outs: *const *mut Value,
+) -> i32 {
+    // SAFETY: `step` is kept alive by the `Jit`; `buf` holds its words, written just
+    // before; `env` / `cells` are those of the native frame running it; `outs` the slots
+    // of its registers written.
+    unsafe {
+        let s = &*step;
+        let p = &*s.proto;
+        let rt = (*ctx).rt;
+        // (Taken: a recursive call running the same instruction gets its own.)
+        let mut regs = std::mem::take(&mut *s.scratch.borrow_mut());
+        if regs.len() != p.regs.len() {
+            regs = vec![Value::Nil; p.regs.len()];
+        }
+        for (k, (r, kind)) in s.reads.iter().enumerate() {
+            regs[*r as usize] = word_value(rt, *kind, *buf.add(k));
+        }
+        let env: &[crate::vm::Cell] = if p.captures.is_empty() {
+            &[]
+        } else {
+            std::slice::from_raw_parts(env, p.captures.len())
+        };
+        let cells: &mut [crate::vm::Cell] = if p.ncells == 0 {
+            &mut []
+        } else {
+            std::slice::from_raw_parts_mut(cells, p.ncells as usize)
+        };
+        let r = with_interpreter(ctx, |rt| {
+            let no = rt.no_ctx.clone();
+            rt.step(p, env, &no, &mut regs, cells, &s.ins, s.span)
+        });
+        let status = match r {
+            Ok(()) => {
+                for (k, d) in s.dsts.iter().enumerate() {
+                    **outs.add(k) = std::mem::replace(&mut regs[*d as usize], Value::Nil);
+                }
+                0
+            }
+            Err(e) => {
+                (*ctx).pending = Some(e);
+                (*ctx).err = PENDING;
+                1
+            }
+        };
+        for (r, _) in &s.reads {
+            regs[*r as usize] = Value::Nil;
+        }
+        for d in &s.dsts {
+            regs[*d as usize] = Value::Nil;
+        }
+        *s.scratch.borrow_mut() = regs;
+        status
+    }
+}
+
+/// Next element of the iterator `it` (any `for`: a hash, a range value…) into `out`: 1,
+/// or 0 when it is exhausted.
+extern "C" fn bk_iter_step(it: *const Value, out: *mut Value) -> i32 {
+    // SAFETY: `it` is a slot of the native frame holding an iterator; `out` another.
+    unsafe {
+        let Value::Iter(st) = &*it else {
+            return 0;
+        };
+        match crate::vm::iter_advance(st) {
+            Some(v) => {
+                *out = v;
+                1
+            }
+            None => 0,
+        }
     }
 }
 
@@ -1416,10 +1518,13 @@ pub struct Jit {
     str_fns: [FuncId; 4],
     /// `bk_call_boxed`, `bk_binary`, `bk_truthy`, `bk_global`, `bk_box_into`,
     /// `bk_new_object`, `bk_init_done`.
-    boxed_fns: [FuncId; 18],
+    boxed_fns: [FuncId; 20],
     /// Calls through the interpreter (addresses held by native code).
     #[allow(clippy::vec_box)]
     boxed_calls: Vec<Box<BoxedCall>>,
+    /// Instructions done by the interpreter (addresses held by native code).
+    #[allow(clippy::vec_box)]
+    boxed_steps: Vec<Box<BoxedStep>>,
     /// `bk_build`, `bk_clone_into`, `bk_move_out`, `bk_drop_slots`.
     mem_fns: [FuncId; 4],
     /// Construction plans (addresses held by native code).
@@ -1744,6 +1849,8 @@ struct Plan {
     /// Globals read as objects of the class of their value at compile time (key: address
     /// of the `GetGlobal`): that class, checked on every read.
     global_objs: FxHashMap<usize, Rc<crate::objects::TypeInfo>>,
+    /// Instructions done by the interpreter's code (`BoxedStep`; key: address).
+    steps: crate::intern::FxHashSet<usize>,
 }
 
 /// Type of an element of type `anns[a]`.
@@ -1772,6 +1879,7 @@ struct Analysis<'a> {
     global_objs: FxHashMap<usize, Rc<crate::objects::TypeInfo>>,
     /// Values of the captured variables when compiled (empty: unknown).
     env: Vec<Value>,
+    steps: crate::intern::FxHashSet<usize>,
 }
 
 /// Function compiled and called directly; for a method, the type of `self` it is
@@ -1926,6 +2034,30 @@ impl Analysis<'_> {
             GetCell(..) => JTy::Boxed,
             NewCell(_) => return Some(None),
             Closure(..) => JTy::Boxed,
+            // Anything else the interpreter's code can do on values (`Runtime::step`): an
+            // operation on a hash, a record, a tuple…; its result any value.
+            _ if !matches!(
+                ins,
+                GetUp(..)
+                    | SetUp(..)
+                    | SetCell(..)
+                    | GetNamed { .. }
+                    | SetNamed { .. }
+                    | CtxField(..)
+                    | DefType { .. }
+                    | DefEnum { .. }
+            ) =>
+            {
+                let (reads, writes, _) = crate::outline::regs_of(p, ins);
+                if !reads.iter().all(|r| g(*r).is_some_and(word)) {
+                    return None;
+                }
+                self.steps.insert(ins as *const Instr as usize);
+                if writes.is_empty() {
+                    return Some(None);
+                }
+                JTy::Boxed
+            }
             _ => return None,
         };
         self.boxed.insert(ins as *const Instr as usize);
@@ -2458,6 +2590,7 @@ fn analyze(
         news: FxHashMap::default(),
         global_objs: FxHashMap::default(),
         env,
+        steps: Default::default(),
         this: this.clone(),
     };
     // Typed IR registers: their type does not change.
@@ -2508,6 +2641,12 @@ fn analyze(
                     };
                     defs[bi][k] = Some(t);
                     cur[d as usize] = Lat::T(t);
+                    for w in extra_writes(ins) {
+                        if fixed[w as usize].is_some_and(|f| f != t) {
+                            return None;
+                        }
+                        cur[w as usize] = Lat::T(t);
+                    }
                 }
             }
             let g = |r: Reg| cur[r as usize].get();
@@ -2551,6 +2690,12 @@ fn analyze(
                         cur[*dst as usize] = Lat::T(t);
                         true
                     }
+                    // Any iterator (a hash, a range value…): its elements any values.
+                    Some(JTy::Boxed) if fixed[*dst as usize].is_none() => {
+                        term_defs[bi] = Some(JTy::Boxed);
+                        cur[*dst as usize] = Lat::T(JTy::Boxed);
+                        true
+                    }
                     _ => false,
                 },
                 Term::Reraise(_) => false,
@@ -2575,6 +2720,21 @@ fn analyze(
             break;
         }
     }
+    // An instruction done by the interpreter's code in a loop: the baseline code (values
+    // kept as they are) does better than rebuilding them every time.
+    if !an.steps.is_empty() {
+        for scc in crate::outline::loops(p) {
+            let in_loop = scc.iter().any(|&b| {
+                p.blocks[b as usize]
+                    .instrs
+                    .iter()
+                    .any(|i| an.steps.contains(&(i as *const Instr as usize)))
+            });
+            if in_loop {
+                return None;
+            }
+        }
+    }
     let n = p.regs.len();
     Some(Plan {
         entry: entry
@@ -2588,6 +2748,7 @@ fn analyze(
         boxed: an.boxed,
         news: an.news,
         global_objs: an.global_objs,
+        steps: an.steps,
         anns: an.anns,
         targets: an.targets,
         this,
@@ -2596,6 +2757,14 @@ fn analyze(
 
 /// Registers read and written by an instruction accepted by the typed JIT; `None` for
 /// the others.
+/// Registers written by `ins` besides the one `reads_writes` gives (`destructure`).
+fn extra_writes(ins: &Instr) -> std::ops::Range<Reg> {
+    match ins {
+        Instr::Unpack { dst, n, rest, .. } => dst + 1..dst + n + *rest as Reg,
+        _ => 0..0,
+    }
+}
+
 fn reads_writes(p: &Proto, ins: &Instr) -> Option<(Vec<Reg>, Option<Reg>)> {
     use Instr::*;
     Some(match ins {
@@ -2638,7 +2807,12 @@ fn reads_writes(p: &Proto, ins: &Instr) -> Option<(Vec<Reg>, Option<Reg>)> {
             r.push(*f);
             (r, Some(*dst))
         }
-        _ => return None,
+        // The others (done by the interpreter); `destructure`: the first register written
+        // (see `extra_writes`).
+        _ => {
+            let (r, w, _) = crate::outline::regs_of(p, ins);
+            (r, w.first().copied())
+        }
     })
 }
 
@@ -2714,6 +2888,8 @@ impl Jit {
         builder.symbol("bk_cells_drop", bk_cells_drop as *const u8);
         builder.symbol("bk_cell_new", bk_cell_new as *const u8);
         builder.symbol("bk_closure", bk_closure as *const u8);
+        builder.symbol("bk_step_boxed", bk_step_boxed as *const u8);
+        builder.symbol("bk_iter_step", bk_iter_step as *const u8);
         builder.symbol("bk_assign_global", bk_assign_global as *const u8);
         builder.symbol("bk_box_into", bk_box_into as *const u8);
         builder.symbol("bk_new_object", bk_new_object as *const u8);
@@ -2881,6 +3057,12 @@ impl Jit {
             ("bk_cell_new", &[ptr, types::I32][..], types::INVALID),
             ("bk_closure", &[ptr, ptr, ptr, ptr, ptr][..], types::INVALID),
             (
+                "bk_step_boxed",
+                &[ptr, ptr, ptr, ptr, ptr, ptr][..],
+                types::I32,
+            ),
+            ("bk_iter_step", &[ptr, ptr][..], types::I32),
+            (
                 "bk_assign_global",
                 &[ptr, types::I32, types::I64, types::I32, types::I64][..],
                 types::I32,
@@ -2895,7 +3077,7 @@ impl Jit {
             }
             boxed_fns.push(module.declare_function(name, Linkage::Import, &sig).ok()?);
         }
-        let boxed_fns: [FuncId; 18] = boxed_fns.try_into().ok()?;
+        let boxed_fns: [FuncId; 20] = boxed_fns.try_into().ok()?;
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr));
         sig.params.push(AbiParam::new(ptr));
@@ -2952,6 +3134,7 @@ impl Jit {
             str_fns,
             boxed_fns,
             boxed_calls: Vec::new(),
+            boxed_steps: Vec::new(),
             mem_fns,
             build_plans: Vec::new(),
             known_types: Vec::new(),
@@ -3174,6 +3357,8 @@ impl Jit {
             cells_drop_ref,
             cell_new_ref,
             closure_ref,
+            step_ref,
+            iter_step_ref,
             set_global_ref,
         ] = self
             .boxed_fns
@@ -3236,6 +3421,7 @@ impl Jit {
             for (ins, t) in b.instrs.iter().zip(defs) {
                 if let (Some((_, Some(d))), Some(t)) = (reads_writes(p, ins), t) {
                     pairs.push((d, *t));
+                    pairs.extend(extra_writes(ins).map(|w| (w, *t)));
                 }
             }
         }
@@ -3300,7 +3486,7 @@ impl Jit {
                         }
                         other => (reads_writes(p, other).and_then(|(_, w)| w), false),
                     };
-                    if let Some(w) = w {
+                    for w in w.into_iter().chain(extra_writes(ins)) {
                         written[w as usize] = true;
                         if borrowed[w as usize] && !from_borrowed {
                             borrowed[w as usize] = false;
@@ -3868,6 +4054,68 @@ impl Jit {
                             .get(&key)
                             .is_some_and(|t| !self.compiled.contains_key(&t.key())));
                 match ins {
+                    // Done by the interpreter's code on rebuilt values.
+                    _ if plan.steps.contains(&key) => {
+                        let (reads, writes, _) = crate::outline::regs_of(p, ins);
+                        let mut words: Vec<(CValue, DKind)> = Vec::new();
+                        for r in &reads {
+                            words.push(boxed_word!(bx, *r));
+                        }
+                        let buf =
+                            bx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                (words.len().max(1) * 8) as u32,
+                                3,
+                            ));
+                        let base = bx.ins().stack_addr(types::I64, buf, 0);
+                        for (j, (w, _)) in words.iter().enumerate() {
+                            bx.ins()
+                                .store(MemFlagsData::trusted(), *w, base, (j * 8) as i32);
+                        }
+                        // The slots of the registers written.
+                        let obuf =
+                            bx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                (writes.len().max(1) * 8) as u32,
+                                3,
+                            ));
+                        let outs = bx.ins().stack_addr(types::I64, obuf, 0);
+                        let mut slots = Vec::new();
+                        for (j, d) in writes.iter().enumerate() {
+                            let s = own!(bx, *d);
+                            bx.ins()
+                                .store(MemFlagsData::trusted(), s, outs, (j * 8) as i32);
+                            slots.push(s);
+                        }
+                        self.boxed_steps.push(Box::new(BoxedStep {
+                            proto: p.clone(),
+                            ins: ins.clone(),
+                            reads: reads
+                                .iter()
+                                .zip(&words)
+                                .map(|(r, (_, k))| (*r, *k))
+                                .collect(),
+                            dsts: writes.clone(),
+                            span,
+                            scratch: Default::default(),
+                        }));
+                        let desc = &**self.boxed_steps.last().unwrap() as *const BoxedStep;
+                        let dp = bx.ins().iconst(types::I64, desc as i64);
+                        let call = bx
+                            .ins()
+                            .call(step_ref, &[ctxv, dp, base, envv, cellsv, outs]);
+                        let status = bx.inst_results(call)[0];
+                        let failed = bx.create_block();
+                        let cont = bx.create_block();
+                        bx.ins().brif(status, failed, &[], cont, &[]);
+                        bx.switch_to_block(failed);
+                        let none = bx.ins().iconst(types::I64, -1);
+                        bx.ins().jump(fail, &[none.into()]);
+                        bx.switch_to_block(cont);
+                        for (d, s) in writes.iter().zip(slots) {
+                            bx.def_var(dvar!(*d), s);
+                        }
+                    }
                     // A class constructed natively: the object, its `init`, the check
                     // that every field is initialized.
                     Call { dst, site, .. } if !boxed_call && plan.news.contains_key(&key) => {
@@ -4339,11 +4587,9 @@ impl Jit {
                     }
                     Nil(_) | GetGlobal(..) => {}
                     Move(..) if dty == Some(JTy::Nil) => {}
-                    Move(_, a) if is_ref(dty) => {
-                        let d = match ins {
-                            Move(d, _) => d,
-                            _ => unreachable!(),
-                        };
+                    // (Copied into its slot if it owns one: the source register may be
+                    // written again while this one is alive.)
+                    Move(d, a) | Coerce { dst: d, src: a, .. } if is_ref(dty) => {
                         let v = bx.use_var(uvar!(*a));
                         put_ref!(bx, *d, v);
                     }
@@ -4972,6 +5218,9 @@ impl Jit {
                 }
                 if let (Some((_, Some(d))), Some(t)) = (reads_writes(p, ins), dty) {
                     cur[d as usize] = Some(t);
+                    for w in extra_writes(ins) {
+                        cur[w as usize] = Some(t);
+                    }
                 }
             }
             dty = plan.term_defs[bi];
@@ -5103,6 +5352,26 @@ impl Jit {
                     drop_slots!(bx);
                     let ok = bx.ins().iconst(types::I32, 0);
                     bx.ins().return_(&[ok, v]);
+                }
+                Term::IterNext {
+                    iter,
+                    dst,
+                    body,
+                    done,
+                } if tyof!(*iter) == Some(JTy::Boxed) => {
+                    // Any iterator: its next element (any value) by a helper.
+                    let it = bx.use_var(uvar!(*iter));
+                    let out = own!(bx, *dst);
+                    let call = bx.ins().call(iter_step_ref, &[it, out]);
+                    let more = bx.inst_results(call)[0];
+                    bx.def_var(dvar!(*dst), out);
+                    bx.ins().brif(
+                        more,
+                        blocks[*body as usize],
+                        &[],
+                        blocks[*done as usize],
+                        &[],
+                    );
                 }
                 Term::IterNext {
                     iter,

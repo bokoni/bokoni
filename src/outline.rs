@@ -16,7 +16,7 @@ use crate::ir::{Block, BlockId, CallSite, Instr, ParamProto, Proto, Reg, RegTy, 
 use std::rc::Rc;
 
 /// Registers read and written by `ins` (all of them), and whether it can be outlined.
-fn regs_of(p: &Proto, ins: &Instr) -> (Vec<Reg>, Vec<Reg>, bool) {
+pub(crate) fn regs_of(p: &Proto, ins: &Instr) -> (Vec<Reg>, Vec<Reg>, bool) {
     use Instr::*;
     let range = |s: Reg, n: u32| (s..s + n).collect::<Vec<_>>();
     let site_args = |site: u32| {
@@ -162,7 +162,7 @@ fn liveness(p: &Proto) -> Vec<Vec<bool>> {
 }
 
 /// Strongly connected components of the block graph (Tarjan), those that are loops.
-fn loops(p: &Proto) -> Vec<Vec<BlockId>> {
+pub(crate) fn loops(p: &Proto) -> Vec<Vec<BlockId>> {
     struct T<'a> {
         succ: &'a [Vec<BlockId>],
         index: Vec<Option<u32>>,

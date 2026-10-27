@@ -2360,7 +2360,19 @@ pub(crate) fn iter_next(regs: &mut [Value], iter: Reg, dst: Reg) -> bool {
     let Value::Iter(it) = &regs[iter as usize] else {
         unreachable!()
     };
-    let next = match &mut *it.borrow_mut() {
+    match iter_advance(it) {
+        Some(v) => {
+            regs[dst as usize] = v;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Next element of a `for` iterator.
+#[inline]
+pub(crate) fn iter_advance(it: &RefCell<IterState>) -> Option<Value> {
+    match &mut *it.borrow_mut() {
         IterState::Values(v) => v.next(),
         IterState::Range(r) => r.next().map(Value::Int),
         IterState::List(l, i) => {
@@ -2368,13 +2380,6 @@ pub(crate) fn iter_next(regs: &mut [Value], iter: Reg, dst: Reg) -> bool {
             *i += 1;
             v
         }
-    };
-    match next {
-        Some(v) => {
-            regs[dst as usize] = v;
-            true
-        }
-        None => false,
     }
 }
 

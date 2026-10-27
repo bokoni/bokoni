@@ -1170,3 +1170,32 @@ fn closures_with_captured_variables() {
     assert!(e.is_native("c"));
     assert_eq!(e.eval_as::<i64>("c()").unwrap(), 1001);
 }
+
+#[test]
+fn hashes_records_tuples_in_native_code() {
+    // Done by the interpreter's code from native code: same results and errors.
+    for src in [
+        "def tally(xs: [int]): int\n  let h = {}\n  for x in xs\n    let k = x % 3\n    if h.has(k)\n      h[k] = h[k] + 1\n    else\n      h[k] = 1\n    end\n  end\n  let t = 0\n  for k, v in h\n    t += k * 10 + v\n  end\n  t\nend\ntally([1, 2, 3, 4, 5, 6, 7])",
+        "def norm(x: float, y: float): float\n  let p = {x: x, y: y}\n  p.x * p.x + p.y * p.y\nend\nlet t = 0.0\nfor i in 0...100\n  t += norm(i * 1.0, 2.0)\nend\nt",
+        "def swap(a: int, b: int): int\n  let (x, y) = (b, a)\n  x * 10 + y\nend\nswap(1, 2)",
+        "def kind(n: int): str\n  case n % 4\n  when 0 then \"zero\"\n  when 1, 2 then \"low\"\n  else \"high\"\n  end\nend\n(0...6).map(|i| kind(i))",
+        "def over(r): int\n  let t = 0\n  for i in r\n    t += i\n  end\n  t\nend\n[over(0..10), over([1, 2]), over(\"ab\".chars().map(|c| c.len()))]",
+        "def keys(h: {str => int}): [str]\n  let out: [str] = []\n  for k in h.keys()\n    out << k.upper()\n  end\n  out\nend\nkeys({\"a\" => 1, \"b\" => 2})",
+        // Errors in such an instruction.
+        "def bad(h: {int => int}, k: int): int = h[k] + 1\nbad({1 => 2}, 3)",
+        "def bad(): int\n  let (a, b) = (1, 2, 3)\n  a\nend\nbad()",
+        "def bad(x: int): int\n  let h = {}\n  h[[x]] = 1\n  0\nend\nbad(1)",
+    ] {
+        same(src);
+    }
+    // Compiled when such instructions are outside its loops (in a loop, the baseline code
+    // does them better).
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    e.eval("def area(w: float, h: float): float\n  let r = {w: w, h: h}\n  let t = 0.0\n  for i in 0...10\n    t += w * h\n  end\n  t + r.w\nend\ndef tally(xs: [int]): int\n  let h = {}\n  for x in xs\n    h[x % 3] = 1\n  end\n  h.len()\nend")
+        .unwrap();
+    assert_eq!(e.eval_as::<f64>("area(2.0, 3.0)").unwrap(), 62.0);
+    assert!(e.is_native("area"));
+    assert_eq!(e.eval_as::<i64>("tally([1, 2, 3])").unwrap(), 3);
+    assert!(!e.is_native("tally"));
+}

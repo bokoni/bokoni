@@ -372,6 +372,13 @@ namespaces, `trait` for shared behavior.
       (otherwise resumed in the interpreter at the `return`)
 - [x] Fix: a function calling directly the typed copy of a function without
       annotations did not watch its global (stale code after a redefinition)
+- [x] Any instruction the native code does not do (hashes, records, tuples,
+      `destructure`, `case`, a `for` over a hash or a range value…) done by the
+      interpreter's code on values rebuilt from the native ones (`BoxedStep`): such a
+      function is compiled, unless one of these instructions is in a loop (the baseline
+      code, which keeps values as they are, does them better there)
+- [x] Fix: a `check` (annotated `let`) of a list or object shared the register it read
+      in native code, which could be written again
 
 ### Next
 
