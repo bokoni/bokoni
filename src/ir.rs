@@ -66,8 +66,31 @@ pub struct Proto {
     pub decls: Vec<Decl>,
     /// Déclaration source (signature pour le vérificateur, introspection).
     pub decl: Option<Rc<FnDecl>>,
-    /// Compilation native (JIT) de la fonction.
+    /// Compilation native (JIT) de la fonction, version typée.
     pub jit: std::cell::RefCell<JitState>,
+    /// Compilation native de base (code non typé) : 0 = pas encore, 1 = impossible,
+    /// sinon adresse du point d'entrée `extern "C" fn(*mut Runtime, *mut NativeFrame) -> i32`.
+    pub jit_dyn: std::cell::Cell<usize>,
+    /// Nombre d'appels (la compilation de base attend le deuxième, sauf s'il y a une boucle).
+    pub calls_seen: std::cell::Cell<u32>,
+    /// La fonction contient une boucle (saut vers un bloc précédent).
+    pub has_loop: bool,
+}
+
+/// Fenêtre d'exécution passée au code natif de base (positions fixes).
+#[repr(C)]
+pub struct NativeFrame {
+    pub regs: *mut Value,
+    pub nregs: usize,
+    pub cells: *mut crate::vm::Cell,
+    pub ncells: usize,
+    pub upvals: *const crate::vm::Cell,
+    pub nupvals: usize,
+    pub ctx: *const Rc<[u32]>,
+    pub proto: *const Proto,
+    /// Registre et forme littérale du résultat (`Return`), remplis par le code natif.
+    pub ret: u32,
+    pub ret_shape: u32,
 }
 
 /// État de la compilation native d'une fonction.

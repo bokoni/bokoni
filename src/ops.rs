@@ -6,7 +6,7 @@ use crate::ast::BinOp;
 use crate::diagnostic::Error;
 use crate::intern::Symbol;
 use crate::span::Span;
-use crate::value::{HashKey, Value};
+use crate::value::{Function, HashKey, Value};
 use crate::vm::{CallArgs, Runtime};
 use std::rc::Rc;
 
@@ -270,12 +270,29 @@ impl Runtime {
     // ─── Méthodes intégrées ──────────────────────────────────────────────────
 
     pub(crate) fn call1(&mut self, f: &Value, a: Value, span: Span) -> R {
-        self.call_value(f, CallArgs::plain(vec![a]), span)
+        self.call_pos(f, [a], span)
+    }
+
+    /// Appel avec des arguments positionnels : sans allocation ni liaison générique quand
+    /// `f` est une fonction du script qui a exactement ces paramètres.
+    pub(crate) fn call_pos<const N: usize>(
+        &mut self,
+        f: &Value,
+        args: [Value; N],
+        span: Span,
+    ) -> R {
+        if let Value::Function(func) = f
+            && let Function::Script(c) = &**func
+            && c.proto.params.len() == N
+        {
+            return self.invoke_regs(c, &args, span);
+        }
+        self.call_value(f, CallArgs::plain(args.into()), span)
     }
 
     pub(crate) fn method(&mut self, recv: Value, name: Symbol, args: Vec<Value>, span: Span) -> R {
         use Method as M;
-        let Some(&m) = self.methods.get(&name) else {
+        let Some(&(m, mname)) = self.methods.get(&name) else {
             return type_err(
                 format!(
                     "{} n'a pas de méthode `{}`",
@@ -285,8 +302,7 @@ impl Runtime {
                 span,
             );
         };
-        let mname = self.name(name).to_string();
-        let n = |k: usize| arity(&mname, &args, k, span);
+        let n = |k: usize| arity(mname, &args, k, span);
         match (m, &recv) {
             (M::ToS, _) => {
                 n(0)?;
@@ -369,7 +385,7 @@ impl Runtime {
             }
             (M::Contains | M::StartsWith | M::EndsWith, Value::Str(s)) => {
                 n(1)?;
-                let pat = expect_str(&args[0], &mname, span)?;
+                let pat = expect_str(&args[0], mname, span)?;
                 Ok(Value::Bool(match m {
                     M::Contains => s.contains(&*pat),
                     M::StartsWith => s.starts_with(&*pat),
@@ -380,7 +396,7 @@ impl Runtime {
                 let parts: Vec<Value> = match args.as_slice() {
                     [] => s.split_whitespace().map(Value::str).collect(),
                     [sep] => {
-                        let sep = expect_str(sep, &mname, span)?;
+                        let sep = expect_str(sep, mname, span)?;
                         s.split(&*sep).map(Value::str).collect()
                     }
                     _ => return rt_err("`split(séparateur?)` attend 0 ou 1 argument", span),
@@ -389,8 +405,8 @@ impl Runtime {
             }
             (M::Replace, Value::Str(s)) => {
                 n(2)?;
-                let from = expect_str(&args[0], &mname, span)?;
-                let to = expect_str(&args[1], &mname, span)?;
+                let from = expect_str(&args[0], mname, span)?;
+                let to = expect_str(&args[1], mname, span)?;
                 Ok(Value::Str(s.replace(&*from, &to).into()))
             }
             (M::Chars, Value::Str(s)) => {
@@ -449,7 +465,7 @@ impl Runtime {
             (M::Join, Value::List(l)) => {
                 let sep = match args.as_slice() {
                     [] => Rc::from(""),
-                    [s] => expect_str(s, &mname, span)?,
+                    [s] => expect_str(s, mname, span)?,
                     _ => return rt_err("`join(séparateur?)` attend 0 ou 1 argument", span),
                 };
                 let parts: Vec<String> = l
@@ -568,7 +584,7 @@ impl Runtime {
                 let f = args[1].clone();
                 let mut acc = args[0].clone();
                 for v in iter_values(&recv) {
-                    acc = self.call_value(&f, CallArgs::plain(vec![acc, v]), span)?;
+                    acc = self.call_pos(&f, [acc, v], span)?;
                 }
                 Ok(acc)
             }
@@ -637,7 +653,7 @@ impl Runtime {
                     .map(|(k, v)| (k.to_value(), v.clone()))
                     .collect();
                 for (k, v) in entries {
-                    self.call_value(&f, CallArgs::plain(vec![k, v]), span)?;
+                    self.call_pos(&f, [k, v], span)?;
                 }
                 Ok(recv.clone())
             }

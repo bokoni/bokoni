@@ -547,6 +547,13 @@ impl Compiler<'_> {
         merge_blocks(&mut f.blocks);
         let reachable = compact(&mut f.blocks);
         f.blocks = reachable;
+        // Boucle : un saut vers un bloc qui ne vient pas après.
+        let has_loop = f.blocks.iter().enumerate().any(|(i, b)| {
+            b.term.as_ref().is_some_and(|(t, _)| {
+                let mut t = t.clone();
+                t.targets_mut().into_iter().any(|x| (*x as usize) <= i)
+            })
+        });
         let blocks = f
             .blocks
             .into_iter()
@@ -579,6 +586,9 @@ impl Compiler<'_> {
             decls: f.decls,
             decl: f.decl,
             jit: Default::default(),
+            jit_dyn: Default::default(),
+            calls_seen: Default::default(),
+            has_loop,
         })
     }
 

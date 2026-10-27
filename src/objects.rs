@@ -108,6 +108,9 @@ impl Runtime {
         if info.kind == TypeDeclKind::Class {
             return self.instantiate_class(info, args, block, span);
         }
+        if block.is_none() && args.pos.len() + args.named.len() == info.fields.len() {
+            return self.construct_direct(info, args, span);
+        }
         let id = self.push_ctx(info);
         let r = self.construct_inner(id, info, args, block, span);
         let ctx = self.constructs.pop().expect("construction en cours");
@@ -121,6 +124,54 @@ impl Runtime {
             info: info.clone(),
             fields,
         }))))
+    }
+
+    /// Construction sans bloc où chaque champ est donné une fois : aucune valeur par
+    /// défaut à calculer, donc pas de construction en cours à suivre. Mêmes vérifications,
+    /// dans le même ordre, que le chemin général.
+    fn construct_direct(&mut self, info: &Rc<TypeInfo>, args: CallArgs, span: Span) -> R {
+        let CallArgs { pos, named, shapes } = args;
+        let mut fields: Vec<Option<Value>> = Vec::with_capacity(info.fields.len());
+        fields.resize(info.fields.len(), None);
+        let args = pos
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| (Some(i), None, v))
+            .chain(named.into_iter().map(|(n, v)| (None, Some(n), v)));
+        for (k, (i, name, v)) in args.enumerate() {
+            let i = match (i, name) {
+                (Some(i), _) => i,
+                (None, Some(name)) => match info.field_index(name) {
+                    Some(i) if fields[i].is_none() => i,
+                    _ => return self.construct_reported(info, span, name),
+                },
+                (None, None) => unreachable!(),
+            };
+            let v = match &info.fields[i].ty {
+                Some(ty) => {
+                    let shape = shapes.get(k).cloned().flatten();
+                    self.coerce(v, ty, shape.as_deref(), span)?
+                }
+                None => v,
+            };
+            fields[i] = Some(v);
+        }
+        let fields = fields
+            .into_iter()
+            .map(|v| v.expect("chaque champ est donné"))
+            .collect();
+        Ok(Value::Object(Rc::new(RefCell::new(Object {
+            info: info.clone(),
+            fields,
+        }))))
+    }
+
+    fn construct_reported(&mut self, info: &Rc<TypeInfo>, span: Span, name: Symbol) -> R {
+        let msg = match info.field_index(name) {
+            Some(_) => format!("champ `{}` donné deux fois", self.name(name)),
+            None => format!("`{}` n'a pas de champ `{}`", info.name, self.name(name)),
+        };
+        rt_err(msg, span)
     }
 
     fn push_ctx(&mut self, info: &Rc<TypeInfo>) -> u32 {

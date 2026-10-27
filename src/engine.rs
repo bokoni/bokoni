@@ -74,6 +74,13 @@ impl Engine {
         self.rt.jit_enabled = enabled && cfg!(feature = "jit");
     }
 
+    /// Compile chaque fonction dès son premier appel (au lieu du deuxième) : sert aux
+    /// tests d'équivalence entre code natif et interpréteur.
+    #[doc(hidden)]
+    pub fn set_jit_eager(&mut self, eager: bool) {
+        self.rt.jit_eager = eager;
+    }
+
     /// La fonction globale `name` a-t-elle été compilée en code natif (après au moins un
     /// appel) ?
     pub fn is_native(&self, name: &str) -> bool {

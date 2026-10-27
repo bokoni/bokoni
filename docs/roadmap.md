@@ -103,6 +103,30 @@ c'est le travail du JIT (appels directs, valeurs non boxées).
 
 Temps compilation comprise.
 
+### v0.5 — JIT pour le code non typé (en cours)
+
+- [x] Compilation de base de toute fonction (deuxième appel, ou premier s'il y a une
+      boucle) : registres `Value` en mémoire (disposition fixe `repr(C, u8)`), constantes,
+      copies, arithmétique et comparaisons `int` / `float`, branchements et `for` en
+      code natif ; le reste appelle l'instruction de l'interpréteur (`Runtime::step`),
+      donc même sémantique par construction
+- [x] Appels plus légers (interpréteur et JIT) : registres remis à zéro d'un coup,
+      `map` / `filter` / `each` / `reduce` sans allocation ni liaison générique, noms de
+      méthodes sans allocation, construction directe d'un `type` dont tous les champs
+      sont donnés
+- [x] Tests d'équivalence sur du code non typé (closures, listes, objets, erreurs), avec
+      compilation dès le premier appel
+- [ ] Accès aux champs et appels de closures en natif (caches en ligne), objets sans
+      allocations multiples
+
+| Programme                               | v0.4    | maintenant |
+|-----------------------------------------|--------:|-----------:|
+| listes : map / filter / sum (100 k)     | 16,9 ms | 9,0 ms     |
+| closures et compteur (300 k appels)     | 27,4 ms | 19,3 ms    |
+| objets : construction et champs (100 k) | 17,9 ms | 13,8 ms    |
+| chaînes : interpolation (100 k)         | 11,2 ms | 9,4 ms     |
+| `fib(25)` interprété (`--no-jit`)       | 28 ms   | 18 ms      |
+
 ### Ensuite
 
 - Annotations lisibles depuis Rust (v2 de `syntax.md`)

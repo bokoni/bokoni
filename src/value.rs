@@ -10,7 +10,12 @@ use std::cell::RefCell;
 use std::fmt::{self, Write};
 use std::rc::Rc;
 
+/// Disposition fixe (`repr(C, u8)`) : le code natif du JIT lit l'étiquette (octet 0) et la
+/// valeur des types de base (octet 8) directement. Les types de base (`nil`, `bool`, `int`,
+/// `float`) ont les étiquettes 0 à 3 et ne possèdent rien : les copier ou les écraser ne
+/// demande aucun comptage de références.
 #[derive(Clone)]
+#[repr(C, u8)]
 pub enum Value {
     Nil,
     Bool(bool),
@@ -458,5 +463,49 @@ impl fmt::Debug for Value {
 impl PartialEq for Value {
     fn eq(&self, other: &Value) -> bool {
         self.equals(other)
+    }
+}
+
+/// Étiquettes et positions utilisées par le code natif.
+pub mod layout {
+    pub const TAG_NIL: u8 = 0;
+    pub const TAG_BOOL: u8 = 1;
+    pub const TAG_INT: u8 = 2;
+    pub const TAG_FLOAT: u8 = 3;
+    /// Étiquettes supérieures : la valeur possède une ressource (comptage de références).
+    pub const FIRST_HEAP_TAG: u8 = 4;
+    pub const PAYLOAD: i32 = 8;
+    pub const SIZE: i32 = 24;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tag(v: &Value) -> u8 {
+        // SAFETY : `repr(C, u8)` place l'étiquette sur le premier octet.
+        unsafe { *(v as *const Value as *const u8) }
+    }
+
+    fn payload<T: Copy>(v: &Value) -> T {
+        // SAFETY : la valeur des variantes est à la position `PAYLOAD`.
+        unsafe { *((v as *const Value as *const u8).add(layout::PAYLOAD as usize) as *const T) }
+    }
+
+    #[test]
+    fn native_layout() {
+        assert_eq!(std::mem::size_of::<Value>(), layout::SIZE as usize);
+        assert_eq!(tag(&Value::Nil), layout::TAG_NIL);
+        assert_eq!(tag(&Value::Bool(true)), layout::TAG_BOOL);
+        assert_eq!(tag(&Value::Int(5)), layout::TAG_INT);
+        assert_eq!(tag(&Value::Float(1.5)), layout::TAG_FLOAT);
+        assert!(tag(&Value::str("x")) >= layout::FIRST_HEAP_TAG);
+        assert!(tag(&Value::Uninit) >= layout::FIRST_HEAP_TAG);
+        assert_eq!(payload::<i64>(&Value::Int(-42)), -42);
+        assert_eq!(payload::<f64>(&Value::Float(2.5)), 2.5);
+        assert!(payload::<bool>(&Value::Bool(true)));
+        // Des octets nuls forment `nil` (remise à zéro des registres).
+        let zero: Value = unsafe { std::mem::zeroed() };
+        assert!(matches!(zero, Value::Nil));
     }
 }

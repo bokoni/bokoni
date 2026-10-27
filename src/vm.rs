@@ -65,7 +65,7 @@ pub struct Runtime {
     /// Profondeur d'appels maximale (protège contre la récursion infinie).
     pub max_depth: usize,
     pub(crate) depth: usize,
-    pub(crate) methods: FxHashMap<Symbol, Method>,
+    pub(crate) methods: FxHashMap<Symbol, (Method, &'static str)>,
     /// Constructions de `type` en cours (blocs `Server do … end` imbriqués).
     pub(crate) constructs: Vec<ConstructCtx>,
     pub(crate) next_ctx: u32,
@@ -76,8 +76,13 @@ pub struct Runtime {
     no_ctx: Rc<[u32]>,
     /// Compilation native des fonctions typées (créée au premier besoin).
     pub jit_enabled: bool,
+    /// Compilation de base dès le premier appel (tests).
+    pub jit_eager: bool,
     #[cfg(feature = "jit")]
     jit: Option<crate::jit::Jit>,
+    /// Erreur levée pendant l'exécution de code natif de base, en attente de remontée.
+    #[cfg(feature = "jit")]
+    pending: Option<Error>,
 }
 
 impl Default for Runtime {
@@ -99,7 +104,7 @@ impl Runtime {
         let mut interner = Interner::new();
         let methods = METHODS
             .iter()
-            .map(|&(name, m)| (interner.intern(name), m))
+            .map(|&(name, m)| (interner.intern(name), (m, name)))
             .collect();
         let syms = Syms::new(&mut interner);
         let mut globals = Globals::default();
@@ -120,8 +125,11 @@ impl Runtime {
             frames: Vec::new(),
             no_ctx: Rc::from([]),
             jit_enabled: cfg!(feature = "jit"),
+            jit_eager: false,
             #[cfg(feature = "jit")]
             jit: None,
+            #[cfg(feature = "jit")]
+            pending: None,
         }
     }
 
@@ -201,7 +209,7 @@ impl Runtime {
 
     /// Appel rapide : arguments positionnels, autant que de paramètres, lus directement
     /// dans les registres de l'appelant.
-    fn invoke_regs(&mut self, c: &Closure, args: &[Value], span: Span) -> R {
+    pub(crate) fn invoke_regs(&mut self, c: &Closure, args: &[Value], span: Span) -> R {
         let proto = &c.proto;
         self.invoke_with(proto, &c.upvals, &c.ctx, span, |rt, regs| {
             for (p, v) in proto.params.iter().zip(args) {
@@ -233,7 +241,7 @@ impl Runtime {
         }
         self.depth += 1;
         let mut regs = self.frames.pop().unwrap_or_default();
-        regs.resize(proto.regs.len(), Value::Nil);
+        fill_nil(&mut regs, proto.regs.len());
         let r = stacker::maybe_grow(RED_ZONE, STACK_GROW, || {
             bind(self, &mut regs)?;
             #[cfg(feature = "jit")]
@@ -374,6 +382,10 @@ impl Runtime {
         let mut cells: Vec<Cell> = (0..proto.ncells)
             .map(|_| Rc::new(RefCell::new(Value::Uninit)))
             .collect();
+        #[cfg(feature = "jit")]
+        if let Some(entry) = self.dyn_entry(proto) {
+            return self.run_native(entry, proto, upvals, ctx, regs, &mut cells);
+        }
         let mut b = 0usize;
         macro_rules! reg {
             ($r:expr) => {
@@ -383,163 +395,7 @@ impl Runtime {
         loop {
             let block = &proto.blocks[b];
             for (ins, &span) in block.instrs.iter().zip(&block.spans) {
-                match ins {
-                    Instr::Int(d, n) => reg!(*d) = Value::Int(*n),
-                    Instr::Float(d, f) => reg!(*d) = Value::Float(*f),
-                    Instr::Bool(d, v) => reg!(*d) = Value::Bool(*v),
-                    Instr::Nil(d) => reg!(*d) = Value::Nil,
-                    Instr::Const(d, c) => reg!(*d) = proto.consts[*c as usize].clone(),
-                    Instr::Move(d, a) => reg!(*d) = reg!(*a).clone(),
-                    Instr::GetGlobal(d, g) => match &self.globals.at(*g).value {
-                        Some(v) => reg!(*d) = v.clone(),
-                        None => {
-                            let n = self.name(self.globals.at(*g).name).to_string();
-                            return rt_err(format!("`{n}` n'est pas défini"), span);
-                        }
-                    },
-                    Instr::SetGlobal(g, a) => {
-                        let v = reg!(*a).clone();
-                        self.set_global(*g, v, span)?;
-                    }
-                    Instr::NewCell(c) => cells[*c as usize] = Rc::new(RefCell::new(Value::Uninit)),
-                    Instr::GetCell(d, c) => {
-                        let v = cells[*c as usize].borrow().clone();
-                        reg!(*d) = init_check(v, span)?;
-                    }
-                    Instr::SetCell(c, a) => *cells[*c as usize].borrow_mut() = reg!(*a).clone(),
-                    Instr::GetUp(d, u) => {
-                        let v = upvals[*u as usize].borrow().clone();
-                        reg!(*d) = init_check(v, span)?;
-                    }
-                    Instr::SetUp(u, a) => *upvals[*u as usize].borrow_mut() = reg!(*a).clone(),
-                    Instr::Guard(d, a, ty) => {
-                        let v = reg!(*a).clone();
-                        reg!(*d) = self.guard(v, *ty, span)?;
-                    }
-                    Instr::IBin(op, d, a, b) => {
-                        let (Value::Int(x), Value::Int(y)) = (&reg!(*a), &reg!(*b)) else {
-                            unreachable!("registre int qui ne contient pas un int")
-                        };
-                        reg!(*d) = int_op(*op, *x, *y, span)?;
-                    }
-                    Instr::IBinK(op, d, a, k) => {
-                        let Value::Int(x) = reg!(*a) else {
-                            unreachable!("registre int qui ne contient pas un int")
-                        };
-                        reg!(*d) = int_op(*op, x, *k, span)?;
-                    }
-                    Instr::FBin(op, d, a, b) => {
-                        let (Value::Float(x), Value::Float(y)) = (&reg!(*a), &reg!(*b)) else {
-                            unreachable!("registre float qui ne contient pas un float")
-                        };
-                        reg!(*d) = float_op(*op, *x, *y);
-                    }
-                    Instr::INeg(d, a) => {
-                        let Value::Int(x) = reg!(*a) else {
-                            unreachable!()
-                        };
-                        reg!(*d) = match x.checked_neg() {
-                            Some(n) => Value::Int(n),
-                            None => return rt_err("dépassement de capacité d'un entier", span),
-                        };
-                    }
-                    Instr::IToF(d, a) => {
-                        let Value::Int(x) = reg!(*a) else {
-                            unreachable!()
-                        };
-                        reg!(*d) = Value::Float(x as f64);
-                    }
-
-                    Instr::Bin(op, d, a, b) => {
-                        // Cas courant du code non annoté : deux entiers.
-                        if let (Value::Int(x), Value::Int(y)) = (&reg!(*a), &reg!(*b))
-                            && !matches!(op, BinOp::Push | BinOp::And | BinOp::Or)
-                        {
-                            reg!(*d) = int_op(*op, *x, *y, span)?;
-                            continue;
-                        }
-                        let (l, r) = (reg!(*a).clone(), reg!(*b).clone());
-                        reg!(*d) = self.binary(*op, l, r, span)?;
-                    }
-                    Instr::Not(d, a) => reg!(*d) = Value::Bool(!reg!(*a).truthy()),
-
-                    Instr::Index(d, a, i) => {
-                        let (r, i) = (reg!(*a).clone(), reg!(*i).clone());
-                        reg!(*d) = self.index(&r, &i, span)?;
-                    }
-                    Instr::Field(d, a, name) => {
-                        let r = reg!(*a).clone();
-                        reg!(*d) = self.field(&r, *name, span)?;
-                    }
-                    Instr::FieldAt(d, a, idx) => {
-                        let Value::Object(o) = &reg!(*a) else {
-                            return rt_err("`@champ` : `self` n'est pas un objet", span);
-                        };
-                        let v = o.borrow().fields[*idx as usize].clone();
-                        if let Value::Uninit = v {
-                            let n = self
-                                .name(o.borrow().info.fields[*idx as usize].name)
-                                .to_string();
-                            return rt_err(format!("`@{n}` est lu avant d'être initialisé"), span);
-                        }
-                        reg!(*d) = v;
-                    }
-                    Instr::Call { dst, f, site } => {
-                        let site = &proto.calls[*site as usize];
-                        // Cas courant : fonction du script, arguments positionnels exacts. La
-                        // fonction et les arguments sont lus en place dans les registres.
-                        if !site.block
-                            && site.named.is_empty()
-                            && let Value::Function(func) = &reg!(*f)
-                            && let Function::Script(c) = &**func
-                            && c.proto.params.len() == site.npos as usize
-                            && site.shapes.iter().all(Option::is_none)
-                        {
-                            let start = site.start as usize;
-                            let v = self.invoke_regs(
-                                c,
-                                &regs[start..start + site.npos as usize],
-                                span,
-                            )?;
-                            reg!(*dst) = v;
-                            continue;
-                        }
-                        let f = reg!(*f).clone();
-                        let mut args = Self::call_args(proto, regs, site);
-                        let v = match (&f, site.block) {
-                            // Construction : le bloc `do` remplit les champs.
-                            (Value::Type(info), true) => {
-                                let block = args.pos.pop().unwrap();
-                                if !args.shapes.is_empty() {
-                                    args.shapes.remove(site.npos as usize - 1);
-                                }
-                                let Value::Function(func) = block else {
-                                    unreachable!()
-                                };
-                                let Function::Script(c) = &*func else {
-                                    unreachable!()
-                                };
-                                self.construct(info, args, Some(c), span)?
-                            }
-                            _ => self.call_value(&f, args, span)?,
-                        };
-                        reg!(*dst) = v;
-                    }
-                    Instr::CallMethod {
-                        dst,
-                        recv,
-                        name,
-                        site,
-                    } => {
-                        let r = reg!(*recv).clone();
-                        let args = Self::call_args(proto, regs, &proto.calls[*site as usize]);
-                        reg!(*dst) = self.call_method_named(r, *name, args, span)?;
-                    }
-
-                    // Instructions moins fréquentes : hors de la boucle principale, pour
-                    // qu'elle reste petite et bien optimisée.
-                    other => self.exec_slow(proto, upvals, ctx, regs, &mut cells, other, span)?,
-                }
+                self.step(proto, upvals, ctx, regs, &mut cells, ins, span)?;
             }
             match &block.term {
                 Term::Jump(t) => b = *t as usize,
@@ -586,26 +442,191 @@ impl Runtime {
                     body,
                     done,
                 } => {
-                    let Value::Iter(it) = &reg!(*iter) else {
-                        unreachable!()
-                    };
-                    let next = match &mut *it.borrow_mut() {
-                        IterState::Values(v) => v.next(),
-                        IterState::Range(cur, end) => (*cur < *end).then(|| {
-                            *cur += 1;
-                            Value::Int(*cur - 1)
-                        }),
-                    };
-                    match next {
-                        Some(v) => {
-                            reg!(*dst) = v;
-                            b = *body as usize;
-                        }
-                        None => b = *done as usize,
-                    }
+                    b = if iter_next(regs, *iter, *dst) {
+                        *body
+                    } else {
+                        *done
+                    } as usize;
                 }
             }
         }
+    }
+
+    /// Exécute une instruction (hors terminateur). Utilisée par la boucle de
+    /// l'interpréteur (intégrée en ligne) et par le code natif du JIT pour les
+    /// instructions qu'il ne traduit pas lui-même : la sémantique est la même par
+    /// construction.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn step(
+        &mut self,
+        proto: &Proto,
+        upvals: &[Cell],
+        ctx: &Rc<[u32]>,
+        regs: &mut [Value],
+        cells: &mut [Cell],
+        ins: &Instr,
+        span: Span,
+    ) -> R<()> {
+        macro_rules! reg {
+            ($r:expr) => {
+                regs[$r as usize]
+            };
+        }
+        match ins {
+            Instr::Int(d, n) => reg!(*d) = Value::Int(*n),
+            Instr::Float(d, f) => reg!(*d) = Value::Float(*f),
+            Instr::Bool(d, v) => reg!(*d) = Value::Bool(*v),
+            Instr::Nil(d) => reg!(*d) = Value::Nil,
+            Instr::Const(d, c) => reg!(*d) = proto.consts[*c as usize].clone(),
+            Instr::Move(d, a) => reg!(*d) = reg!(*a).clone(),
+            Instr::GetGlobal(d, g) => match &self.globals.at(*g).value {
+                Some(v) => reg!(*d) = v.clone(),
+                None => {
+                    let n = self.name(self.globals.at(*g).name).to_string();
+                    return rt_err(format!("`{n}` n'est pas défini"), span);
+                }
+            },
+            Instr::SetGlobal(g, a) => {
+                let v = reg!(*a).clone();
+                self.set_global(*g, v, span)?;
+            }
+            Instr::NewCell(c) => cells[*c as usize] = Rc::new(RefCell::new(Value::Uninit)),
+            Instr::GetCell(d, c) => {
+                let v = cells[*c as usize].borrow().clone();
+                reg!(*d) = init_check(v, span)?;
+            }
+            Instr::SetCell(c, a) => *cells[*c as usize].borrow_mut() = reg!(*a).clone(),
+            Instr::GetUp(d, u) => {
+                let v = upvals[*u as usize].borrow().clone();
+                reg!(*d) = init_check(v, span)?;
+            }
+            Instr::SetUp(u, a) => *upvals[*u as usize].borrow_mut() = reg!(*a).clone(),
+            Instr::Guard(d, a, ty) => {
+                let v = reg!(*a).clone();
+                reg!(*d) = self.guard(v, *ty, span)?;
+            }
+            Instr::IBin(op, d, a, b) => {
+                let (Value::Int(x), Value::Int(y)) = (&reg!(*a), &reg!(*b)) else {
+                    unreachable!("registre int qui ne contient pas un int")
+                };
+                reg!(*d) = int_op(*op, *x, *y, span)?;
+            }
+            Instr::IBinK(op, d, a, k) => {
+                let Value::Int(x) = reg!(*a) else {
+                    unreachable!("registre int qui ne contient pas un int")
+                };
+                reg!(*d) = int_op(*op, x, *k, span)?;
+            }
+            Instr::FBin(op, d, a, b) => {
+                let (Value::Float(x), Value::Float(y)) = (&reg!(*a), &reg!(*b)) else {
+                    unreachable!("registre float qui ne contient pas un float")
+                };
+                reg!(*d) = float_op(*op, *x, *y);
+            }
+            Instr::INeg(d, a) => {
+                let Value::Int(x) = reg!(*a) else {
+                    unreachable!()
+                };
+                reg!(*d) = match x.checked_neg() {
+                    Some(n) => Value::Int(n),
+                    None => return rt_err("dépassement de capacité d'un entier", span),
+                };
+            }
+            Instr::IToF(d, a) => {
+                let Value::Int(x) = reg!(*a) else {
+                    unreachable!()
+                };
+                reg!(*d) = Value::Float(x as f64);
+            }
+
+            Instr::Bin(op, d, a, b) => {
+                // Cas courant du code non annoté : deux entiers.
+                if let (Value::Int(x), Value::Int(y)) = (&reg!(*a), &reg!(*b))
+                    && !matches!(op, BinOp::Push | BinOp::And | BinOp::Or)
+                {
+                    reg!(*d) = int_op(*op, *x, *y, span)?;
+                    return Ok(());
+                }
+                let (l, r) = (reg!(*a).clone(), reg!(*b).clone());
+                reg!(*d) = self.binary(*op, l, r, span)?;
+            }
+            Instr::Not(d, a) => reg!(*d) = Value::Bool(!reg!(*a).truthy()),
+
+            Instr::Index(d, a, i) => {
+                let (r, i) = (reg!(*a).clone(), reg!(*i).clone());
+                reg!(*d) = self.index(&r, &i, span)?;
+            }
+            Instr::Field(d, a, name) => {
+                let r = reg!(*a).clone();
+                reg!(*d) = self.field(&r, *name, span)?;
+            }
+            Instr::FieldAt(d, a, idx) => {
+                let Value::Object(o) = &reg!(*a) else {
+                    return rt_err("`@champ` : `self` n'est pas un objet", span);
+                };
+                let v = o.borrow().fields[*idx as usize].clone();
+                if let Value::Uninit = v {
+                    let n = self
+                        .name(o.borrow().info.fields[*idx as usize].name)
+                        .to_string();
+                    return rt_err(format!("`@{n}` est lu avant d'être initialisé"), span);
+                }
+                reg!(*d) = v;
+            }
+            Instr::Call { dst, f, site } => {
+                let site = &proto.calls[*site as usize];
+                // Cas courant : fonction du script, arguments positionnels exacts. La
+                // fonction et les arguments sont lus en place dans les registres.
+                if !site.block
+                    && site.named.is_empty()
+                    && let Value::Function(func) = &reg!(*f)
+                    && let Function::Script(c) = &**func
+                    && c.proto.params.len() == site.npos as usize
+                    && site.shapes.iter().all(Option::is_none)
+                {
+                    let start = site.start as usize;
+                    let v = self.invoke_regs(c, &regs[start..start + site.npos as usize], span)?;
+                    reg!(*dst) = v;
+                    return Ok(());
+                }
+                let f = reg!(*f).clone();
+                let mut args = Self::call_args(proto, regs, site);
+                let v = match (&f, site.block) {
+                    // Construction : le bloc `do` remplit les champs.
+                    (Value::Type(info), true) => {
+                        let block = args.pos.pop().unwrap();
+                        if !args.shapes.is_empty() {
+                            args.shapes.remove(site.npos as usize - 1);
+                        }
+                        let Value::Function(func) = block else {
+                            unreachable!()
+                        };
+                        let Function::Script(c) = &*func else {
+                            unreachable!()
+                        };
+                        self.construct(info, args, Some(c), span)?
+                    }
+                    _ => self.call_value(&f, args, span)?,
+                };
+                reg!(*dst) = v;
+            }
+            Instr::CallMethod {
+                dst,
+                recv,
+                name,
+                site,
+            } => {
+                let r = reg!(*recv).clone();
+                let args = Self::call_args(proto, regs, &proto.calls[*site as usize]);
+                reg!(*dst) = self.call_method_named(r, *name, args, span)?;
+            }
+
+            // Instructions moins fréquentes : hors de la boucle principale, pour
+            // qu'elle reste petite et bien optimisée.
+            other => self.exec_slow(proto, upvals, ctx, regs, cells, other, span)?,
+        }
+        Ok(())
     }
 
     #[inline(never)]
@@ -920,6 +941,83 @@ impl Runtime {
             _ => unreachable!("instruction traitée dans la boucle principale"),
         }
         Ok(())
+    }
+
+    /// Point d'entrée du code natif de base de `proto`, compilé au deuxième appel (ou au
+    /// premier s'il contient une boucle).
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn dyn_entry(&mut self, proto: &Proto) -> Option<usize> {
+        match proto.jit_dyn.get() {
+            0 => {}
+            1 => return None,
+            e => return Some(e),
+        }
+        if !self.jit_enabled {
+            return None;
+        }
+        let n = proto.calls_seen.get() + 1;
+        proto.calls_seen.set(n);
+        if n < 2 && !proto.has_loop && !self.jit_eager {
+            return None;
+        }
+        if self.jit.is_none() {
+            match crate::jit::Jit::new() {
+                Some(j) => self.jit = Some(j),
+                None => {
+                    self.jit_enabled = false;
+                    return None;
+                }
+            }
+        }
+        let e = self.jit.as_mut()?.compile_dynamic(proto).unwrap_or(1);
+        proto.jit_dyn.set(e);
+        (e != 1).then_some(e)
+    }
+
+    #[cfg(feature = "jit")]
+    pub(crate) fn set_pending(&mut self, e: Error) {
+        self.pending = Some(e);
+    }
+
+    #[cfg(feature = "jit")]
+    fn run_native(
+        &mut self,
+        entry: usize,
+        proto: &Proto,
+        upvals: &[Cell],
+        ctx: &Rc<[u32]>,
+        regs: &mut [Value],
+        cells: &mut [Cell],
+    ) -> R {
+        let mut f = crate::ir::NativeFrame {
+            regs: regs.as_mut_ptr(),
+            nregs: regs.len(),
+            cells: cells.as_mut_ptr(),
+            ncells: cells.len(),
+            upvals: upvals.as_ptr(),
+            nupvals: upvals.len(),
+            ctx,
+            proto,
+            ret: 0,
+            ret_shape: 0,
+        };
+        // SAFETY : `entry` vient de `compile_dynamic` pour ce `proto` ; le code natif
+        // n'accède à `regs`, `cells`, `upvals` que par la fenêtre `f`.
+        let code: extern "C" fn(*mut Runtime, *mut crate::ir::NativeFrame) -> i32 =
+            unsafe { std::mem::transmute(entry) };
+        if code(self, &mut f) != 0 {
+            return Err(self.pending.take().expect("erreur du code natif"));
+        }
+        let v = std::mem::replace(&mut regs[f.ret as usize], Value::Nil);
+        match &proto.ret {
+            Some(ty) => {
+                let shape =
+                    (f.ret_shape != u32::MAX).then(|| proto.shapes[f.ret_shape as usize].clone());
+                self.coerce(v, ty, shape.as_deref(), ty.span)
+            }
+            None => Ok(v),
+        }
     }
 
     /// Exécute `proto` en natif s'il est (ou devient) compilé ; `None` sinon.
@@ -1478,5 +1576,41 @@ impl TypeInfo {
             methods: t.methods.iter().cloned().collect(),
             script: script.clone(),
         }
+    }
+}
+
+/// Avance l'itérateur du registre `iter` : `true` et l'élément dans `dst`, ou `false`.
+#[inline]
+pub(crate) fn iter_next(regs: &mut [Value], iter: Reg, dst: Reg) -> bool {
+    let Value::Iter(it) = &regs[iter as usize] else {
+        unreachable!()
+    };
+    let next = match &mut *it.borrow_mut() {
+        IterState::Values(v) => v.next(),
+        IterState::Range(cur, end) => (*cur < *end).then(|| {
+            *cur += 1;
+            Value::Int(*cur - 1)
+        }),
+    };
+    match next {
+        Some(v) => {
+            regs[dst as usize] = v;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Agrandit le vecteur vide `regs` à `n` registres `nil`. `Value::Nil` est fait d'octets
+/// nuls (`repr(C, u8)`, étiquette 0) : une mise à zéro suffit, sans boucle de copies.
+#[inline]
+fn fill_nil(regs: &mut Vec<Value>, n: usize) {
+    debug_assert!(regs.is_empty());
+    regs.reserve(n);
+    // SAFETY : la capacité est d'au moins `n` ; des octets nuls forment `Value::Nil`
+    // (vérifié par `value::tests::native_layout`), une valeur valide qui ne possède rien.
+    unsafe {
+        std::ptr::write_bytes(regs.as_mut_ptr(), 0, n);
+        regs.set_len(n);
     }
 }

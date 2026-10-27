@@ -21,13 +21,17 @@ use crate::ast::BinOp;
 use crate::diagnostic::Error;
 use crate::globals::Globals;
 use crate::intern::FxHashMap;
+use crate::ir::NativeFrame;
 use crate::ir::{Instr, JitState, NativeCode, Proto, ProtoKind, Reg, RegTy, RtType, Script, Term};
 use crate::span::Span;
+use crate::value::layout::{FIRST_HEAP_TAG, PAYLOAD, SIZE, TAG_BOOL, TAG_FLOAT, TAG_INT, TAG_NIL};
 use crate::value::{Function, Value};
+use crate::vm::Runtime;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
     AbiParam, InstBuilder, MemFlagsData, Signature, Type, UserFuncName, types,
 };
+use cranelift_codegen::ir::{Block as CBlock, FuncRef, Value as CValue};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -93,6 +97,8 @@ pub struct Jit {
     compiled: FxHashMap<usize, Compiled>,
     trace_fn: FuncId,
     frem_fn: FuncId,
+    /// Fonctions d'aide du code de base (`bk_step`, `bk_iter_next`, `bk_drop`).
+    dyn_fns: Option<(FuncId, FuncId, FuncId)>,
     next: u32,
 }
 
@@ -393,6 +399,9 @@ impl Jit {
         let mut builder = JITBuilder::with_isa(isa, default_libcall_names());
         builder.symbol("bk_trace", bk_trace as *const u8);
         builder.symbol("bk_frem", bk_frem as *const u8);
+        builder.symbol("bk_step", bk_step as *const u8);
+        builder.symbol("bk_iter_next", bk_iter_next as *const u8);
+        builder.symbol("bk_drop", bk_drop as *const u8);
         let mut module = JITModule::new(builder);
         let ptr = module.target_config().pointer_type();
         let mut sig = module.make_signature();
@@ -421,6 +430,7 @@ impl Jit {
             compiled: FxHashMap::default(),
             trace_fn,
             frem_fn,
+            dyn_fns: None,
             next: 0,
         })
     }
@@ -1118,4 +1128,519 @@ fn float_bin(
         }
         op => bx.ins().fcmp(float_cc(op), x, y),
     }
+}
+
+// ─── Compilation de base (code non typé) ────────────────────────────────────
+//
+// Toute fonction peut être compilée ainsi. Les registres restent des `Value` en mémoire
+// (la fenêtre de l'appel) ; le code natif traite lui-même les cas simples (constantes,
+// copies de valeurs scalaires, arithmétique et comparaisons d'entiers et de décimaux,
+// branchements) et appelle `Runtime::step` — le code de l'interpréteur — pour tout le
+// reste, y compris les cas inhabituels (dépassement…) : la sémantique est la même.
+
+/// Exécute une instruction de l'IR avec le code de l'interpréteur. 0 : succès, 1 : erreur
+/// (rangée dans le `Runtime`).
+extern "C" fn bk_step(
+    rt: *mut Runtime,
+    f: *mut NativeFrame,
+    ins: *const Instr,
+    lo: u32,
+    hi: u32,
+) -> i32 {
+    // SAFETY : `rt`, `f` et `ins` viennent de `Runtime::run_native`, valides pendant
+    // l'appel ; les pointeurs de la fenêtre désignent des tranches de la longueur donnée.
+    unsafe {
+        let rt = &mut *rt;
+        let f = &mut *f;
+        let regs = std::slice::from_raw_parts_mut(f.regs, f.nregs);
+        let cells = std::slice::from_raw_parts_mut(f.cells, f.ncells);
+        let upvals = std::slice::from_raw_parts(f.upvals, f.nupvals);
+        match rt.step(
+            &*f.proto,
+            upvals,
+            &*f.ctx,
+            regs,
+            cells,
+            &*ins,
+            Span::new(lo, hi),
+        ) {
+            Ok(()) => 0,
+            Err(e) => {
+                rt.set_pending(e);
+                1
+            }
+        }
+    }
+}
+
+/// Élément suivant d'un itérateur `for` : 1 s'il y en a un (rangé dans `dst`), 0 sinon.
+extern "C" fn bk_iter_next(f: *mut NativeFrame, iter: u32, dst: u32) -> i32 {
+    // SAFETY : comme pour `bk_step`.
+    unsafe {
+        let f = &mut *f;
+        let regs = std::slice::from_raw_parts_mut(f.regs, f.nregs);
+        crate::vm::iter_next(regs, iter, dst) as i32
+    }
+}
+
+/// Libère la valeur d'un registre avant d'y écrire une valeur scalaire.
+extern "C" fn bk_drop(slot: *mut Value) {
+    // SAFETY : `slot` est un registre de la fenêtre en cours.
+    unsafe {
+        std::ptr::drop_in_place(slot);
+        slot.write(Value::Nil);
+    }
+}
+
+struct Dyn<'a> {
+    regs_ty: &'a [RegTy],
+    regs: CValue,
+    rt: CValue,
+    frame: CValue,
+    step: FuncRef,
+    drop: FuncRef,
+    fail: CBlock,
+}
+
+impl Dyn<'_> {
+    fn off(r: Reg) -> i32 {
+        r as i32 * SIZE
+    }
+
+    fn tag(&self, bx: &mut FunctionBuilder, r: Reg) -> CValue {
+        bx.ins()
+            .load(types::I8, MemFlagsData::trusted(), self.regs, Self::off(r))
+    }
+
+    fn payload(&self, bx: &mut FunctionBuilder, r: Reg, ty: Type) -> CValue {
+        bx.ins().load(
+            ty,
+            MemFlagsData::trusted(),
+            self.regs,
+            Self::off(r) + PAYLOAD,
+        )
+    }
+
+    /// Écrit une valeur scalaire (étiquette, valeur) dans un registre. Un registre
+    /// `valeur` peut contenir une ressource : elle est d'abord libérée.
+    fn write(&self, bx: &mut FunctionBuilder, d: Reg, tag: CValue, payload: Option<CValue>) {
+        if self.regs_ty[d as usize] == RegTy::Value {
+            let old = self.tag(bx, d);
+            let heap = bx.ins().icmp_imm_u(
+                IntCC::UnsignedGreaterThanOrEqual,
+                old,
+                FIRST_HEAP_TAG as i64,
+            );
+            let free = bx.create_block();
+            let cont = bx.create_block();
+            bx.ins().brif(heap, free, &[], cont, &[]);
+            bx.switch_to_block(free);
+            let addr = bx.ins().iadd_imm_s(self.regs, Self::off(d) as i64);
+            bx.ins().call(self.drop, &[addr]);
+            bx.ins().jump(cont, &[]);
+            bx.switch_to_block(cont);
+        }
+        bx.ins()
+            .store(MemFlagsData::trusted(), tag, self.regs, Self::off(d));
+        if let Some(p) = payload {
+            bx.ins().store(
+                MemFlagsData::trusted(),
+                p,
+                self.regs,
+                Self::off(d) + PAYLOAD,
+            );
+        }
+    }
+
+    fn write_const(&self, bx: &mut FunctionBuilder, d: Reg, tag: u8, payload: Option<CValue>) {
+        let t = bx.ins().iconst(types::I8, tag as i64);
+        self.write(bx, d, t, payload);
+    }
+
+    /// Appel de `bk_step` pour l'instruction `ins` ; continue dans un nouveau bloc.
+    fn step(&self, bx: &mut FunctionBuilder, ins: &Instr, span: Span) {
+        let ptr = bx.func.dfg.value_type(self.regs);
+        let ip = bx.ins().iconst(ptr, ins as *const Instr as i64);
+        let lo = bx.ins().iconst(types::I32, span.start as i64);
+        let hi = bx.ins().iconst(types::I32, span.end as i64);
+        let call = bx.ins().call(self.step, &[self.rt, self.frame, ip, lo, hi]);
+        let status = bx.inst_results(call)[0];
+        let cont = bx.create_block();
+        bx.ins().brif(status, self.fail, &[], cont, &[]);
+        bx.switch_to_block(cont);
+    }
+
+    /// Vérité d'un registre (`nil` et `false` sont faux), en `i8` (1 : vrai).
+    fn truthy(&self, bx: &mut FunctionBuilder, r: Reg) -> CValue {
+        match self.regs_ty[r as usize] {
+            RegTy::Bool => {
+                let b = self.payload(bx, r, types::I8);
+                bx.ins().icmp_imm_s(IntCC::NotEqual, b, 0)
+            }
+            RegTy::Int | RegTy::Float => bx.ins().iconst(types::I8, 1),
+            RegTy::Value => {
+                let t = self.tag(bx, r);
+                let b = self.payload(bx, r, types::I8);
+                let nil = bx.ins().icmp_imm_s(IntCC::Equal, t, TAG_NIL as i64);
+                let is_bool = bx.ins().icmp_imm_s(IntCC::Equal, t, TAG_BOOL as i64);
+                let zero = bx.ins().icmp_imm_s(IntCC::Equal, b, 0);
+                let fals = bx.ins().band(is_bool, zero);
+                let falsy = bx.ins().bor(nil, fals);
+                bx.ins().icmp_imm_s(IntCC::Equal, falsy, 0)
+            }
+        }
+    }
+}
+
+impl Jit {
+    /// Compile `p` en code natif de base ; adresse du point d'entrée.
+    pub fn compile_dynamic(&mut self, p: &Proto) -> Option<usize> {
+        let ptr = self.module.target_config().pointer_type();
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(ptr));
+        sig.params.push(AbiParam::new(ptr));
+        sig.returns.push(AbiParam::new(types::I32));
+        self.next += 1;
+        let id = self
+            .module
+            .declare_function(&format!("bkd{}", self.next), Linkage::Local, &sig)
+            .ok()?;
+        let helpers = self.dyn_helpers()?;
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = sig;
+        ctx.func.name = UserFuncName::user(0, id.as_u32());
+        let step = self.module.declare_func_in_func(helpers.0, &mut ctx.func);
+        let iter = self.module.declare_func_in_func(helpers.1, &mut ctx.func);
+        let drop = self.module.declare_func_in_func(helpers.2, &mut ctx.func);
+        let tc = self.module.target_config();
+        let mut fctx = FunctionBuilderContext::new();
+        let mut bx = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+        let entry = bx.create_block();
+        bx.append_block_params_for_function_params(entry);
+        let blocks: Vec<CBlock> = p.blocks.iter().map(|_| bx.create_block()).collect();
+        let fail = bx.create_block();
+        bx.switch_to_block(entry);
+        let (rt, frame) = {
+            let ps = bx.block_params(entry);
+            (ps[0], ps[1])
+        };
+        let regs = bx.ins().load(
+            ptr,
+            MemFlagsData::trusted(),
+            frame,
+            std::mem::offset_of!(NativeFrame, regs) as i32,
+        );
+        bx.ins().jump(blocks[0], &[]);
+        let d = Dyn {
+            regs_ty: &p.regs,
+            regs,
+            rt,
+            frame,
+            step,
+            drop,
+            fail,
+        };
+        for (bi, b) in p.blocks.iter().enumerate() {
+            bx.switch_to_block(blocks[bi]);
+            for (ins, &span) in b.instrs.iter().zip(&b.spans) {
+                dyn_instr(&d, &mut bx, ins, span);
+            }
+            match &b.term {
+                Term::Jump(t) => {
+                    bx.ins().jump(blocks[*t as usize], &[]);
+                }
+                Term::Branch { cond, then, else_ } => {
+                    let c = d.truthy(&mut bx, *cond);
+                    bx.ins()
+                        .brif(c, blocks[*then as usize], &[], blocks[*else_ as usize], &[]);
+                }
+                Term::IfInt {
+                    op,
+                    a,
+                    b: y,
+                    then,
+                    else_,
+                } => {
+                    let x = d.payload(&mut bx, *a, types::I64);
+                    let y = d.payload(&mut bx, *y, types::I64);
+                    let c = bx.ins().icmp(int_cc(*op), x, y);
+                    bx.ins()
+                        .brif(c, blocks[*then as usize], &[], blocks[*else_ as usize], &[]);
+                }
+                Term::IfIntK {
+                    op,
+                    a,
+                    k,
+                    then,
+                    else_,
+                } => {
+                    let x = d.payload(&mut bx, *a, types::I64);
+                    let c = bx.ins().icmp_imm_s(int_cc(*op), x, *k);
+                    bx.ins()
+                        .brif(c, blocks[*then as usize], &[], blocks[*else_ as usize], &[]);
+                }
+                Term::Return { reg, shape } => {
+                    let r = bx.ins().iconst(types::I32, *reg as i64);
+                    let s = bx
+                        .ins()
+                        .iconst(types::I32, shape.unwrap_or(u32::MAX) as i64);
+                    bx.ins().store(
+                        MemFlagsData::trusted(),
+                        r,
+                        frame,
+                        std::mem::offset_of!(NativeFrame, ret) as i32,
+                    );
+                    bx.ins().store(
+                        MemFlagsData::trusted(),
+                        s,
+                        frame,
+                        std::mem::offset_of!(NativeFrame, ret_shape) as i32,
+                    );
+                    let ok = bx.ins().iconst(types::I32, 0);
+                    bx.ins().return_(&[ok]);
+                }
+                Term::IterNext {
+                    iter: it,
+                    dst,
+                    body,
+                    done,
+                } => {
+                    let a = bx.ins().iconst(types::I32, *it as i64);
+                    let b2 = bx.ins().iconst(types::I32, *dst as i64);
+                    let call = bx.ins().call(iter, &[frame, a, b2]);
+                    let got = bx.inst_results(call)[0];
+                    bx.ins().brif(
+                        got,
+                        blocks[*body as usize],
+                        &[],
+                        blocks[*done as usize],
+                        &[],
+                    );
+                }
+            }
+        }
+        bx.switch_to_block(fail);
+        let one = bx.ins().iconst(types::I32, 1);
+        bx.ins().return_(&[one]);
+        bx.seal_all_blocks();
+        bx.finalize(tc);
+        self.module.define_function(id, &mut ctx).ok()?;
+        self.module.clear_context(&mut ctx);
+        self.module.finalize_definitions().ok()?;
+        Some(self.module.get_finalized_function(id) as usize)
+    }
+
+    /// `bk_step`, `bk_iter_next`, `bk_drop` (déclarés au premier besoin).
+    fn dyn_helpers(&mut self) -> Option<(FuncId, FuncId, FuncId)> {
+        if let Some(h) = self.dyn_fns {
+            return Some(h);
+        }
+        let ptr = self.module.target_config().pointer_type();
+        let mut sig = self.module.make_signature();
+        for t in [ptr, ptr, ptr, types::I32, types::I32] {
+            sig.params.push(AbiParam::new(t));
+        }
+        sig.returns.push(AbiParam::new(types::I32));
+        let step = self
+            .module
+            .declare_function("bk_step", Linkage::Import, &sig)
+            .ok()?;
+        let mut sig = self.module.make_signature();
+        for t in [ptr, types::I32, types::I32] {
+            sig.params.push(AbiParam::new(t));
+        }
+        sig.returns.push(AbiParam::new(types::I32));
+        let iter = self
+            .module
+            .declare_function("bk_iter_next", Linkage::Import, &sig)
+            .ok()?;
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(ptr));
+        let drop = self
+            .module
+            .declare_function("bk_drop", Linkage::Import, &sig)
+            .ok()?;
+        self.dyn_fns = Some((step, iter, drop));
+        self.dyn_fns
+    }
+}
+
+/// Traduit une instruction : en ligne pour les cas simples, sinon `bk_step`.
+fn dyn_instr(d: &Dyn, bx: &mut FunctionBuilder, ins: &Instr, span: Span) {
+    use Instr::*;
+    let ty = |r: Reg| d.regs_ty[r as usize];
+    match ins {
+        Int(r, n) => {
+            let v = bx.ins().iconst(types::I64, *n);
+            d.write_const(bx, *r, TAG_INT, Some(v));
+        }
+        Float(r, f) => {
+            let v = bx.ins().f64const(*f);
+            d.write_const(bx, *r, TAG_FLOAT, Some(v));
+        }
+        Bool(r, b) => {
+            let v = bx.ins().iconst(types::I8, *b as i64);
+            d.write_const(bx, *r, TAG_BOOL, Some(v));
+        }
+        Nil(r) => d.write_const(bx, *r, TAG_NIL, None),
+        Move(dst, a) if ty(*a) != RegTy::Value => {
+            let (tag, t) = scalar(ty(*a));
+            let v = d.payload(bx, *a, t);
+            d.write_const(bx, *dst, tag, Some(v));
+        }
+        // Copie d'une valeur : directe si elle est scalaire, sinon par l'interpréteur.
+        Move(dst, a) if ty(*dst) == RegTy::Value => {
+            let t = d.tag(bx, *a);
+            let scalar = bx
+                .ins()
+                .icmp_imm_u(IntCC::UnsignedLessThan, t, FIRST_HEAP_TAG as i64);
+            let fast = bx.create_block();
+            let slow = bx.create_block();
+            let next = bx.create_block();
+            bx.ins().brif(scalar, fast, &[], slow, &[]);
+            bx.switch_to_block(fast);
+            let v = d.payload(bx, *a, types::I64);
+            d.write(bx, *dst, t, Some(v));
+            bx.ins().jump(next, &[]);
+            bx.switch_to_block(slow);
+            d.step(bx, ins, span);
+            bx.ins().jump(next, &[]);
+            bx.switch_to_block(next);
+        }
+        IBin(op, r, a, b) => {
+            let x = d.payload(bx, *a, types::I64);
+            let y = d.payload(bx, *b, types::I64);
+            int_fast(d, bx, ins, span, *op, *r, x, y);
+        }
+        IBinK(op, r, a, k) => {
+            let x = d.payload(bx, *a, types::I64);
+            let y = bx.ins().iconst(types::I64, *k);
+            int_fast(d, bx, ins, span, *op, *r, x, y);
+        }
+        FBin(op, r, a, b) if *op != BinOp::Rem => {
+            let x = d.payload(bx, *a, types::F64);
+            let y = d.payload(bx, *b, types::F64);
+            float_fast(d, bx, *op, *r, x, y);
+        }
+        IToF(r, a) => {
+            let x = d.payload(bx, *a, types::I64);
+            let v = bx.ins().fcvt_from_sint(types::F64, x);
+            d.write_const(bx, *r, TAG_FLOAT, Some(v));
+        }
+        FNeg(r, a) => {
+            let x = d.payload(bx, *a, types::F64);
+            let v = bx.ins().fneg(x);
+            d.write_const(bx, *r, TAG_FLOAT, Some(v));
+        }
+        Not(r, a) => {
+            let t = d.truthy(bx, *a);
+            let v = bx.ins().icmp_imm_s(IntCC::Equal, t, 0);
+            d.write_const(bx, *r, TAG_BOOL, Some(v));
+        }
+        // Opération générique : en ligne pour deux entiers ou deux décimaux.
+        Bin(op, r, a, b) if is_arith(*op) || is_cmp(*op) => {
+            let ta = d.tag(bx, *a);
+            let tb = d.tag(bx, *b);
+            let ia = bx.ins().icmp_imm_s(IntCC::Equal, ta, TAG_INT as i64);
+            let ib = bx.ins().icmp_imm_s(IntCC::Equal, tb, TAG_INT as i64);
+            let both_int = bx.ins().band(ia, ib);
+            let ints = bx.create_block();
+            let other = bx.create_block();
+            let floats = bx.create_block();
+            let slow = bx.create_block();
+            let next = bx.create_block();
+            bx.ins().brif(both_int, ints, &[], other, &[]);
+            bx.switch_to_block(ints);
+            let x = d.payload(bx, *a, types::I64);
+            let y = d.payload(bx, *b, types::I64);
+            int_op_into(d, bx, *op, *r, x, y, slow);
+            bx.ins().jump(next, &[]);
+            bx.switch_to_block(other);
+            let fa = bx.ins().icmp_imm_s(IntCC::Equal, ta, TAG_FLOAT as i64);
+            let fb = bx.ins().icmp_imm_s(IntCC::Equal, tb, TAG_FLOAT as i64);
+            let both_float = bx.ins().band(fa, fb);
+            let not_rem = *op != BinOp::Rem;
+            if not_rem {
+                bx.ins().brif(both_float, floats, &[], slow, &[]);
+            } else {
+                bx.ins().jump(slow, &[]);
+            }
+            bx.switch_to_block(floats);
+            if not_rem {
+                let x = d.payload(bx, *a, types::F64);
+                let y = d.payload(bx, *b, types::F64);
+                float_fast(d, bx, *op, *r, x, y);
+                bx.ins().jump(next, &[]);
+            } else {
+                bx.ins().jump(slow, &[]);
+            }
+            bx.switch_to_block(slow);
+            d.step(bx, ins, span);
+            bx.ins().jump(next, &[]);
+            bx.switch_to_block(next);
+        }
+        _ => d.step(bx, ins, span),
+    }
+}
+
+fn scalar(t: RegTy) -> (u8, Type) {
+    match t {
+        RegTy::Int => (TAG_INT, types::I64),
+        RegTy::Float => (TAG_FLOAT, types::F64),
+        RegTy::Bool => (TAG_BOOL, types::I8),
+        RegTy::Value => unreachable!(),
+    }
+}
+
+/// Opération entière en ligne ; cas limite (dépassement, division par zéro) : `bk_step`.
+#[allow(clippy::too_many_arguments)]
+fn int_fast(
+    d: &Dyn,
+    bx: &mut FunctionBuilder,
+    ins: &Instr,
+    span: Span,
+    op: BinOp,
+    r: Reg,
+    x: CValue,
+    y: CValue,
+) {
+    let slow = bx.create_block();
+    let next = bx.create_block();
+    int_op_into(d, bx, op, r, x, y, slow);
+    bx.ins().jump(next, &[]);
+    bx.switch_to_block(slow);
+    d.step(bx, ins, span);
+    bx.ins().jump(next, &[]);
+    bx.switch_to_block(next);
+}
+
+/// Calcule `x op y` et l'écrit dans `r` ; branche vers `slow` pour tout cas limite.
+fn int_op_into(
+    d: &Dyn,
+    bx: &mut FunctionBuilder,
+    op: BinOp,
+    r: Reg,
+    x: CValue,
+    y: CValue,
+    slow: CBlock,
+) {
+    let v = int_bin(bx, op, x, y, &mut |bx, cond, _| {
+        let cont = bx.create_block();
+        bx.ins().brif(cond, slow, &[], cont, &[]);
+        bx.switch_to_block(cont);
+    });
+    let tag = if is_cmp(op) { TAG_BOOL } else { TAG_INT };
+    d.write_const(bx, r, tag, Some(v));
+}
+
+fn float_fast(d: &Dyn, bx: &mut FunctionBuilder, op: BinOp, r: Reg, x: CValue, y: CValue) {
+    let v = match op {
+        BinOp::Add => bx.ins().fadd(x, y),
+        BinOp::Sub => bx.ins().fsub(x, y),
+        BinOp::Mul => bx.ins().fmul(x, y),
+        BinOp::Div => bx.ins().fdiv(x, y),
+        op => bx.ins().fcmp(float_cc(op), x, y),
+    };
+    let tag = if is_cmp(op) { TAG_BOOL } else { TAG_FLOAT };
+    d.write_const(bx, r, tag, Some(v));
 }

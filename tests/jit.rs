@@ -141,3 +141,79 @@ fn deep_recursion_beyond_the_native_stack() {
         "{err}"
     );
 }
+
+/// Comme `same`, avec la compilation de base dès le premier appel de chaque fonction.
+fn same_eager(src: &str) -> String {
+    let interp = outcome(src, false);
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    e.set_jit_eager(true);
+    let native = match e.eval(src) {
+        Ok(v) => e.inspect(&v),
+        Err(err) => err.render(src, "test"),
+    };
+    assert_eq!(interp, native, "code natif de base différent pour :\n{src}");
+    native
+}
+
+#[test]
+fn untyped_code_matches_the_interpreter() {
+    let programs = [
+        // Arithmétique générique : entiers, décimaux, mélanges, chaînes, cas limites.
+        "def f(a, b) = [a + b, a - b, a * b, a / b, a % b, a < b, a == b]\n[f(7, -2), f(-7.5, 2.0), f(3, 0.5), f(-7, 2)]",
+        &format!("def f(a, b) = a + b\nf({}, 1)", i64::MAX),
+        &format!("def f(a, b) = a / b\nf({}, -1)", i64::MIN),
+        "def f(a, b) = a % b\nf(5, 0)",
+        "def f(a, b) = a + b\n[f(\"a\", \"b\"), f([1], [2])]",
+        "def f(a) = not a\n[f(nil), f(false), f(0), f(\"\"), f([])]",
+        "def f(a) = if a then 1 else 2 end\n[f(nil), f(false), f(true), f(0), f([1])]",
+        // Closures, captures modifiées, compteurs.
+        "def counter()\n  let n = 0\n  || n += 1\nend\nlet c = counter()\nlet last = 0\nfor i in 0...1000\n  last = c()\nend\nlast",
+        "def make(k) = |x| x * k\nlet fs = [make(2), make(3.5)]\nfs.map(|f| f(4))",
+        "def f()\n  let fs = []\n  for i in 0..3\n    fs << || i * i\n  end\n  fs.map(|g| g())\nend\nf()",
+        // Listes, itérateurs, hash.
+        "let xs = (0...200).to_list()\nxs.map(|x| x * 2).filter(|x| x % 3 == 0).sum()",
+        "let t = 0\nfor x in [1, 2.5, 3]\n  t = t + x\nend\nt",
+        "let h = {\"a\" => 1, \"b\" => 2}\nlet s = 0\nh.each do |k, v|\n  s += v\nend\ns",
+        // Objets, classes, enum.
+        "type P\n  x: int = 0\n  y: int = 0\nend\nlet s = 0\nfor i in 0...500\n  let p = P(x: i, y: 2)\n  s += p.x + p.y\nend\ns",
+        "type P\n  x: int = 0\n  y = x + 1\nend\n[P(x: 3), P(), P(4, 5), P do\n  x = 9\nend]",
+        "type P\n  x: int\nend\nP(x: \"a\")",
+        "type P\n  x: int\nend\nP(x: 1, x: 2)",
+        "type P\n  x: int\nend\nP(z: 1)",
+        "type P\n  x: int\nend\nP()",
+        "class C\n  def init(@n: int)\n  end\n  def get() = @n\nend\nlet c = C(4)\nc.get() + C(5).get()",
+        // Erreurs à l'exécution dans du code non typé, avec la pile d'appels.
+        "def a(x) = b(x) + 1\ndef b(x) = x.nope()\na(1)",
+        "def a(x) = x + \"s\"\na(1)",
+        "def f()\n  let g = || x\n  g()\n  let x = 5\nend\nf()",
+        "def any(x) = x\ndef f()\n  let n = 0\n  n = any(\"a\")\nend\nf()",
+        "def inf(n) = inf(n + 1)\ninf(0)",
+        // Chaînes.
+        "let s = \"\"\nfor i in 0...50\n  s = \"#{s}#{i % 10}\"\nend\ns.len()",
+    ];
+    for src in programs {
+        same_eager(src);
+        same(src);
+    }
+}
+
+#[test]
+fn construction_errors_at_run_time() {
+    // Sans vérification statique, les erreurs viennent de l'exécution.
+    let run = |src: &str| {
+        let mut e = Engine::new();
+        e.set_static_checks(false);
+        e.eval(src)
+            .map(|v| e.inspect(&v))
+            .unwrap_or_else(|err| err.to_string())
+    };
+    let ty = "type P\n  x: int = 0\n  y: int = 0\nend\n";
+    assert!(run(&format!("{ty}P(z: 1, y: 2)")).contains("`P` n'a pas de champ `z`"));
+    assert!(run(&format!("{ty}P(1, x: 2)")).contains("champ `x` donné deux fois"));
+    assert!(
+        run(&format!("{ty}P(y: \"a\", x: 1)")).contains("type attendu `int`, reçu str (\"a\")")
+    );
+    assert!(run(&format!("{ty}P(1, 2, 3)")).contains("`P` a 2 champs, reçu 3 arguments"));
+    assert_eq!(run(&format!("{ty}P(y: 1, x: 2)")), "P(x: 2, y: 1)");
+}
