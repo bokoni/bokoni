@@ -345,6 +345,8 @@ fn is_keyword(kind: TokenKind) -> bool {
             | T::Trait
             | T::Abstract
             | T::Include
+            | T::Private
+            | T::Protected
             | T::Type
             | T::Class
             | T::Enum
@@ -369,6 +371,7 @@ fn expr_block(e: ExprId, span: Span) -> Block {
         stmts: vec![Stmt {
             span,
             kind: StmtKind::Expr(e),
+            vis: Visibility::Public,
         }],
     }
 }
@@ -708,6 +711,29 @@ impl Parser<'_, '_> {
 
     fn stmt_with(&mut self, annotations: Vec<AnnotationUse>) -> Result<Stmt> {
         let start = self.tok().span;
+        if matches!(self.peek(), T::Private | T::Protected) {
+            let kw = self.bump();
+            if kw.kind == T::Protected {
+                return self.error_at(
+                    "`protected` is only allowed before a method (`def`) of a `class` or a `trait`",
+                    kw.span,
+                );
+            }
+            let declares = matches!(
+                self.peek(),
+                T::Def | T::Let | T::Type | T::Class | T::Trait | T::Enum | T::Module
+            ) || (self.at(T::Abstract) && self.peek2() == T::Class);
+            if !declares {
+                return self.error_here(format!(
+                    "expected a declaration after `private` (`def`, `let`, `class`, `module`…), found {}",
+                    self.found()
+                ));
+            }
+            let mut s = self.stmt_with(annotations)?;
+            s.vis = Visibility::Private;
+            s.span = self.span_from(start);
+            return Ok(s);
+        }
         let kind = match self.peek() {
             T::Def => StmtKind::Def(Box::new(self.def(annotations)?)),
             T::Type | T::Class | T::Annotation | T::Trait => {
@@ -756,6 +782,7 @@ impl Parser<'_, '_> {
         Ok(Stmt {
             kind,
             span: self.span_from(start),
+            vis: Visibility::Public,
         })
     }
 
@@ -902,6 +929,7 @@ impl Parser<'_, '_> {
             ret,
             body,
             annotations,
+            vis: Visibility::Public,
             span: self.span_from(start),
         })
     }
@@ -1052,6 +1080,14 @@ impl Parser<'_, '_> {
                         "`abstract def` is only allowed in a `trait` or an `abstract class`",
                         f.span,
                     )),
+                    Member::Method(f) | Member::Abstract(f)
+                        if f.vis != Visibility::Public && kind == TypeDeclKind::Annotation =>
+                    {
+                        Some((
+                            "an `annotation` has no private or protected methods",
+                            f.name_span,
+                        ))
+                    }
                     Member::Include(_, span) if kind != TypeDeclKind::Class => {
                         Some(("`include` is only allowed in a `class`", *span))
                     }
@@ -1084,8 +1120,33 @@ impl Parser<'_, '_> {
     fn type_member(&mut self, members: &[Member]) -> Result<Member> {
         let annotations = self.annotations()?;
         let start = self.tok().span;
+        let vis = match self.peek() {
+            T::Private => Visibility::Private,
+            T::Protected => Visibility::Protected,
+            _ => Visibility::Public,
+        };
+        if vis != Visibility::Public {
+            self.bump();
+            if !(self.at(T::Def) || (self.at(T::Abstract) && self.peek2() == T::Def)) {
+                return self.error_here(format!(
+                    "expected `def` after `{0}` (only methods can be {0}), found {1}",
+                    vis.keyword(),
+                    self.found()
+                ));
+            }
+        }
         Ok(match (self.peek(), self.peek2()) {
-            (T::Def, _) => Member::Method(self.def(annotations)?),
+            (T::Def, _) => {
+                let mut f = self.def(annotations)?;
+                if vis != Visibility::Public && self.interner.resolve(f.name) == "init" {
+                    return self.error_at(
+                        format!("`init` cannot be {}: `Name(…)` calls it", vis.keyword()),
+                        f.name_span,
+                    );
+                }
+                f.vis = vis;
+                Member::Method(f)
+            }
             (T::Abstract, T::Def) => {
                 self.bump();
                 let def_start = self.bump().span;
@@ -1107,6 +1168,7 @@ impl Parser<'_, '_> {
                         span: Span::new(def_start.start, def_start.start),
                     },
                     annotations,
+                    vis,
                     span: self.span_from(start),
                 })
             }
@@ -1188,6 +1250,12 @@ impl Parser<'_, '_> {
         variants: &[Variant],
     ) -> Result<std::result::Result<Variant, FnDecl>> {
         let annotations = self.annotations()?;
+        if matches!(self.peek(), T::Private | T::Protected) {
+            return self.error_here(format!(
+                "{} methods are only allowed in a `class`, a `trait` or a `type`",
+                self.found()
+            ));
+        }
         if self.at(T::Def) {
             return Ok(Err(self.def(annotations)?));
         }

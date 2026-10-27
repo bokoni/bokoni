@@ -216,6 +216,9 @@ const VOCAB: &[&str] = &[
     "module M\n",
     "M::",
     "M.",
+    "private ",
+    "protected ",
+    "self.",
 ];
 
 /// Valid programs used as a base for mutations. No `while`: a mutation easily turns it
@@ -248,6 +251,7 @@ const CORPUS: &[&str] = &[
     "class A\n  def init(@n: int)\n  end\n  def f(): int = @n\nend\nclass B < A\n  def f(): int = super() * 2\nend\nclass E < Error\nend\nlet t = 0\nfor x in [A(1), B(2), A(3)]\n  t += x.f()\nend\n[t, begin\n  raise E(\"e\")\nrescue e: Error\n  e.message\nend]",
     "trait T\n  abstract def n(): int\n  def twice(): int = self.n() * 2\nend\nabstract class S\n  include T\nend\nclass K < S\n  def init(@v: int)\n  end\n  def n(): int = @v\nend\nlet ts: [T] = [K(1), K(4)]\nts.map(|t| t.twice()).sum()",
     "module M\n  let K = 3\n  class Box\n    def init(@v: int)\n    end\n    def v = @v\n  end\n  def mk(x: int): Box = Box(x * K)\n  module N\n    def twice(x: int): int = x * 2\n  end\nend\nlet b: M::Box = M.mk(2)\n[b.v, M::K, M::N.twice(b.v), typeof(b)]",
+    "class P\n  def init(@v: int)\n  end\n  private def dbl(): int = @v * 2\n  protected def v = @v\n  def sum(o: P): int = self.dbl() + o.v\nend\nmodule Q\n  private def k(): int = 5\n  def run(): int = P(k()).sum(P(1))\nend\nQ.run()",
 ];
 
 /// Mutates a program: deletes, duplicates or swaps lines, inserts a token, deletes or

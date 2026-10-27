@@ -15,7 +15,7 @@
 //! - Global variables (top level of a script, Rust functions) are slots of an
 //!   array (`GetGlobal`) that persist from one script to the next (REPL).
 
-use crate::ast::{BinOp, FnDecl, TypeDeclKind, TypeExpr};
+use crate::ast::{BinOp, FnDecl, TypeDeclKind, TypeExpr, Visibility};
 use crate::intern::{Interner, Symbol};
 use crate::span::Span;
 use crate::value::Value;
@@ -72,6 +72,8 @@ pub struct Proto {
     pub decls: Vec<Decl>,
     /// Source declaration (signature for the checker, introspection).
     pub decl: Option<Rc<FnDecl>>,
+    /// Method declared `private` or `protected`.
+    pub vis: Visibility,
     /// Native (JIT) compilation of the function, typed version.
     pub jit: std::cell::RefCell<JitState>,
     /// Baseline native compilation (untyped code): 0 = not yet, 1 = impossible,
@@ -192,6 +194,29 @@ pub struct Block {
     pub term_span: Span,
     /// Index in [`Proto::handlers`] of the handler for errors raised here.
     pub handler: Option<u32>,
+}
+
+/// Where a method is called from: decides whether a `private` or `protected` method may
+/// be called (or read as a field). Packed in 32 bits, as the instructions stay small.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Access(u32);
+
+impl Access {
+    /// On `self`: every method may be called.
+    pub const THIS: Access = Access(u32::MAX);
+    /// Outside of any class: public methods only.
+    pub const OUTSIDE: Access = Access(u32::MAX - 1);
+
+    /// In a method of the class (or trait) in global `slot`, on another value: also its
+    /// `protected` methods, and those of its ancestors.
+    pub fn inside(slot: u32) -> Access {
+        Access(slot)
+    }
+
+    /// Global slot of the calling class (`Access::inside`).
+    pub fn class(self) -> Option<u32> {
+        (self.0 < u32::MAX - 1).then_some(self.0)
+    }
 }
 
 /// Call: arguments in registers `start..start + npos + named.len()`.
@@ -388,7 +413,7 @@ pub enum Instr {
     /// `r[i]?`: `nil` when out of bounds.
     IndexOpt(Reg, Reg, Reg),
     SetIndex(Reg, Reg, Reg),
-    Field(Reg, Reg, Symbol),
+    Field(Reg, Reg, Symbol, Access),
     /// Field whose type the checker knows (`int` / `float` / `bool`), into a
     /// register of that type.
     FieldAs(Reg, Reg, Symbol, RegTy),
@@ -397,6 +422,7 @@ pub enum Instr {
         name: Symbol,
         src: Reg,
         shape: Option<u32>,
+        access: Access,
     },
     /// Object field by index (`@x` in a method).
     FieldAt(Reg, Reg, u32),
@@ -438,6 +464,7 @@ pub enum Instr {
         recv: Reg,
         name: Symbol,
         site: u32,
+        access: Access,
     },
 
     // ── Loops and `case`
@@ -659,7 +686,7 @@ impl Proto {
             Index(d, a, b) => format!("r{d} = r{a}[r{b}]"),
             IndexOpt(d, a, b) => format!("r{d} = r{a}[r{b}]?"),
             SetIndex(a, b, v) => format!("r{a}[r{b}] = r{v}"),
-            Field(d, a, f) => format!("r{d} = r{a}.{}", s(f)),
+            Field(d, a, f, _) => format!("r{d} = r{a}.{}", s(f)),
             FieldAs(d, a, f, t) => format!("r{d} = r{a}.{} : {}", s(f), t.name()),
             SetField { obj, name, src, .. } => format!("r{obj}.{} = r{src}", s(name)),
             FieldAt(d, a, f) => format!("r{d} = r{a}.#{f}"),
@@ -690,6 +717,7 @@ impl Proto {
                 recv,
                 name,
                 site,
+                ..
             } => {
                 format!("r{dst} = r{recv}.{}({})", s(name), self.show_args(*site, i))
             }

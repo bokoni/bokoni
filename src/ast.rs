@@ -268,6 +268,30 @@ pub struct Block {
 pub struct Stmt {
     pub kind: StmtKind,
     pub span: Span,
+    /// `private` before a declaration of a module.
+    pub vis: Visibility,
+}
+
+/// Who may use a method of a class, or a declaration of a module.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Visibility {
+    #[default]
+    Public,
+    /// Method: called on `self` only. Module member: used inside the module only.
+    Private,
+    /// Method: called from the methods of its class (or trait) and of their subclasses,
+    /// on any object.
+    Protected,
+}
+
+impl Visibility {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Visibility::Public => "public",
+            Visibility::Private => "private",
+            Visibility::Protected => "protected",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -352,6 +376,8 @@ pub struct FnDecl {
     pub ret: Option<TypeExpr>,
     pub body: Block,
     pub annotations: Vec<AnnotationUse>,
+    /// Method declared `private` or `protected`.
+    pub vis: Visibility,
     pub span: Span,
 }
 

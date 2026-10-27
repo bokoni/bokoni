@@ -5,6 +5,7 @@
 use crate::ast::BinOp;
 use crate::diagnostic::Error;
 use crate::intern::Symbol;
+use crate::ir::Access;
 use crate::span::Span;
 use crate::value::{Function, HashKey, Value};
 use crate::vm::{CallArgs, Runtime};
@@ -73,7 +74,7 @@ impl Runtime {
         }
     }
 
-    pub(crate) fn field(&mut self, r: &Value, name: Symbol, span: Span) -> R {
+    pub(crate) fn field(&mut self, r: &Value, name: Symbol, access: Access, span: Span) -> R {
         match r {
             Value::Record(rec) => match rec.borrow().get(name) {
                 Some(v) => Ok(v.clone()),
@@ -82,7 +83,7 @@ impl Runtime {
                     span,
                 ),
             },
-            Value::Object(_) | Value::Variant(..) => self.object_field(r, name, span),
+            Value::Object(_) | Value::Variant(..) => self.object_field(r, name, access, span),
             _ if self.methods.contains_key(&name) => rt_err(
                 format!(
                     "`{n}` is a method: write `.{n}()`",

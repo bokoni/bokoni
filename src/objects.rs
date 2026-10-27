@@ -11,9 +11,9 @@
 //! its default value; fields never touched get theirs after the block, once the other
 //! fields are known (`port` may depend on `protocol`).
 
-use crate::ast::TypeDeclKind;
+use crate::ast::{TypeDeclKind, Visibility};
 use crate::intern::{FxHashMap, Interner, Symbol};
-use crate::ir::{Proto, Script, Shape, TypeRef};
+use crate::ir::{Access, Proto, Script, Shape, TypeRef};
 use crate::ops::{R, rt_err, type_err};
 use crate::span::Span;
 use crate::value::Value;
@@ -67,7 +67,7 @@ impl TypeInfo {
     /// Is it `other`, a class that inherits from it, or one that includes it (trait)?
     pub fn is_a(self: &Rc<Self>, other: &Rc<TypeInfo>) -> bool {
         if other.kind == TypeDeclKind::Trait {
-            return self.traits.iter().any(|t| Rc::ptr_eq(t, other));
+            return Rc::ptr_eq(self, other) || self.traits.iter().any(|t| Rc::ptr_eq(t, other));
         }
         let mut t = self;
         loop {
@@ -138,6 +138,38 @@ impl Syms {
 }
 
 /// Is this a method callable without arguments (a getter)?
+/// Type that declares method `m`, found as `name` in `info`: the class, one of its
+/// ancestors, or a trait.
+pub(crate) fn method_owner(info: &Rc<TypeInfo>, name: Symbol, m: &Rc<Proto>) -> Rc<TypeInfo> {
+    let has = |t: &TypeInfo| t.methods.get(&name).is_some_and(|x| Rc::ptr_eq(x, m));
+    let mut owner = info.clone();
+    while let Some(p) = owner.parent.clone()
+        && has(&p)
+    {
+        owner = p;
+    }
+    match owner.traits.iter().find(|t| has(t)) {
+        Some(t) => t.clone(),
+        None => owner,
+    }
+}
+
+/// Message for a `private` / `protected` method called from where it may not be (the
+/// checker gives the same).
+pub(crate) fn access_error(name: &str, owner: &str, kind: TypeDeclKind, vis: Visibility) -> String {
+    match vis {
+        Visibility::Protected => format!(
+            "`{name}` is a protected method of `{owner}`: it can only be called in the methods of `{owner}` and of {}",
+            if kind == TypeDeclKind::Trait {
+                "the classes that include it"
+            } else {
+                "its subclasses"
+            }
+        ),
+        _ => format!("`{name}` is a private method of `{owner}`: it can only be called on `self`"),
+    }
+}
+
 fn is_getter(m: &Proto) -> bool {
     m.params.iter().all(|p| p.has_default)
 }
@@ -544,7 +576,13 @@ impl Runtime {
     }
 
     /// `obj.field` on an object or a variant.
-    pub(crate) fn object_field(&mut self, v: &Value, name: Symbol, span: Span) -> R {
+    pub(crate) fn object_field(
+        &mut self,
+        v: &Value,
+        name: Symbol,
+        access: Access,
+        span: Span,
+    ) -> R {
         match v {
             Value::Object(o) => {
                 let (info, idx) = {
@@ -560,6 +598,7 @@ impl Runtime {
                 if let Some(m) = info.methods.get(&name).cloned()
                     && is_getter(&m)
                 {
+                    self.check_access(&info, name, &m, access, span)?;
                     return self.call_method(v.clone(), &m, CallArgs::plain(Vec::new()), span);
                 }
                 if idx.is_some() {
@@ -613,6 +652,7 @@ impl Runtime {
         name: Symbol,
         v: Value,
         shape: Option<&Shape>,
+        access: Access,
         span: Span,
     ) -> R<()> {
         let Value::Object(o) = obj else {
@@ -624,6 +664,7 @@ impl Runtime {
         let info = o.borrow().info.clone();
         let setter = self.interner.intern(&format!("{}=", self.name(name)));
         if let Some(m) = info.methods.get(&setter).cloned() {
+            self.check_access(&info, setter, &m, access, span)?;
             self.call_method(obj.clone(), &m, CallArgs::plain(vec![v]), span)?;
             return Ok(());
         }
@@ -651,6 +692,34 @@ impl Runtime {
                 span,
             ),
         }
+    }
+
+    /// May method `m` (`name` in `info`) be called from `access`? A `private` method only
+    /// on `self`; a `protected` one also in the methods of the type that declares it
+    /// and of its subclasses.
+    pub(crate) fn check_access(
+        &self,
+        info: &Rc<TypeInfo>,
+        name: Symbol,
+        m: &Rc<Proto>,
+        access: Access,
+        span: Span,
+    ) -> R<()> {
+        if m.vis == Visibility::Public || access == Access::THIS {
+            return Ok(());
+        }
+        let owner = method_owner(info, name, m);
+        if m.vis == Visibility::Protected
+            && let Some(slot) = access.class()
+            && let Some(Value::Type(caller)) = &self.globals.at(slot).value
+            && caller.is_a(&owner)
+        {
+            return Ok(());
+        }
+        rt_err(
+            access_error(self.name(name), &owner.name, owner.kind, m.vis),
+            span,
+        )
     }
 
     /// Methods of enums themselves: `Protocol.values()`, `Protocol.from("TCP")`.

@@ -332,7 +332,7 @@ impl Engine {
             }
             errs
         })?;
-        crate::compile::intern_module_names(&program, &mut self.rt.interner);
+        crate::compile::intern_module_names(&program, &mut self.rt.interner, &mut self.rt.globals);
         let prims = if self.static_checks {
             let (errors, warnings, prims) =
                 crate::check::check(&program, &self.rt.interner, &self.rt.globals);

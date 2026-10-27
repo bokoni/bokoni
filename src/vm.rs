@@ -5,7 +5,7 @@
 //! (`Value::Int` in an `int` register), so specialized instructions (`IBin`) need not
 //! check the type.
 
-use crate::ast::{BinOp, TypeDeclKind};
+use crate::ast::{BinOp, TypeDeclKind, Visibility};
 use crate::diagnostic::{Error, ErrorKind, Raised};
 use crate::globals::Globals;
 use crate::intern::{FxHashMap, Interner, Symbol};
@@ -681,13 +681,14 @@ impl Runtime {
                 let (r, i) = (reg!(*a).clone(), reg!(*i).clone());
                 reg!(*d) = self.index_opt(&r, &i, span)?;
             }
-            Instr::Field(d, a, name) => {
+            Instr::Field(d, a, name, access) => {
                 let r = reg!(*a).clone();
-                reg!(*d) = self.field(&r, *name, span)?;
+                reg!(*d) = self.field(&r, *name, *access, span)?;
             }
             Instr::FieldAs(d, a, name, t) => {
                 let r = reg!(*a).clone();
-                let v = self.field(&r, *name, span)?;
+                // A public field of a `type`.
+                let v = self.field(&r, *name, Access::THIS, span)?;
                 reg!(*d) = self.field_as(v, *t, *name, span)?;
             }
             Instr::FieldAt(d, a, idx) => {
@@ -709,6 +710,7 @@ impl Runtime {
                 recv,
                 name,
                 site,
+                access,
             } => {
                 let site = &proto.calls[*site as usize];
                 let r = reg!(*recv).clone();
@@ -726,7 +728,7 @@ impl Runtime {
                     return Ok(());
                 }
                 let args = Self::call_args(proto, regs, site);
-                reg!(*dst) = self.call_method_named(r, *name, args, span)?;
+                reg!(*dst) = self.call_method_named(r, *name, args, *access, span)?;
             }
 
             // Less frequent instructions: outside the main loop, so that it stays small
@@ -1021,10 +1023,11 @@ impl Runtime {
                 name,
                 src,
                 shape,
+                access,
             } => {
                 let (o, v) = (reg!(*obj).clone(), reg!(*src).clone());
                 let shape = shape.map(|s| proto.shapes[s as usize].clone());
-                self.set_field(&o, *name, v, shape.as_deref(), span)?;
+                self.set_field(&o, *name, v, shape.as_deref(), *access, span)?;
             }
             Instr::SetFieldAt {
                 obj,
@@ -1441,6 +1444,7 @@ impl Runtime {
         name: Symbol,
         v: Value,
         shape: Option<&Shape>,
+        access: Access,
         span: Span,
     ) -> R<()> {
         match obj {
@@ -1454,7 +1458,7 @@ impl Runtime {
                     span,
                 ),
             },
-            _ => self.object_set_field(obj, name, v, shape, span),
+            _ => self.object_set_field(obj, name, v, shape, access, span),
         }
     }
 
@@ -1532,7 +1536,14 @@ impl Runtime {
     }
 
     /// `recv.name(args)`: function field, declared method, enum method or built-in.
-    fn call_method_named(&mut self, r: Value, name: Symbol, args: CallArgs, span: Span) -> R {
+    fn call_method_named(
+        &mut self,
+        r: Value,
+        name: Symbol,
+        args: CallArgs,
+        access: Access,
+        span: Span,
+    ) -> R {
         let field_fn = match &r {
             Value::Record(rec) => rec.borrow().get(name).cloned(),
             Value::Object(o) => {
@@ -1548,6 +1559,12 @@ impl Runtime {
             return self.call_value(&f, args, span);
         }
         if let Some(m) = self.user_method(&r, name) {
+            if m.vis != Visibility::Public
+                && let Value::Object(o) = &r
+            {
+                let info = o.borrow().info.clone();
+                self.check_access(&info, name, &m, access, span)?;
+            }
             return self.call_method(r, &m, args, span);
         }
         if let Value::Enum(e) = &r {

@@ -19,6 +19,7 @@
 //! Descriptions are copies: they keep no link to the engine. Annotation arguments are
 //! evaluated when read.
 
+use crate::ast::Visibility;
 use crate::engine::FromValue;
 use crate::ir::{Annotations, Proto};
 use crate::objects::{EnumInfo, TypeInfo};
@@ -161,6 +162,8 @@ pub struct FnDesc {
     pub name: String,
     pub params: Vec<ParamDesc>,
     pub ret: Option<String>,
+    /// Method declared `private` or `protected`.
+    pub visibility: Visibility,
     annotations: Vec<Annotation>,
 }
 
@@ -261,6 +264,7 @@ impl Runtime {
             name: name.to_string(),
             params,
             ret: p.ret.as_ref().map(|t| t.shown.to_string()),
+            visibility: p.vis,
             annotations: self.eval_annotations(&p.annotations)?,
         })
     }

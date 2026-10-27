@@ -598,6 +598,42 @@ Shape()                                     # error: an abstract class
 An `abstract class` cannot be instantiated and may declare `abstract def`s; its
 subclasses must define them, unless they are abstract too.
 
+### `private` and `protected` methods
+
+```ruby
+class Account
+  def init(@cents: int)
+  end
+
+  private def valid(n: int): bool = n > 0
+  protected def cents = @cents
+
+  def deposit(n: int)
+    raise Error("invalid amount") unless self.valid(n)   # on `self`: allowed
+    @cents += n
+  end
+
+  def richer(o: Account): bool = self.cents > o.cents    # another Account: allowed
+end
+
+let a = Account(10)
+a.deposit(5)
+a.valid(1)          # error: `valid` is a private method of `Account`
+a.cents             # error: `cents` is a protected method of `Account`
+```
+
+As in Ruby and Crystal:
+
+- A `private` method is called on `self` only (`self.valid(n)`), in the methods of
+  its class and of its subclasses; not on another object, even of the same class.
+- A `protected` method is also called on other objects, but only in the methods of
+  the class (or trait) that declares it and of its subclasses (or of the classes that
+  include the trait).
+- This applies to getters and setters too (`private def name=(v)`), and to the
+  methods of a trait or a `type`. `init` stays public.
+- The checker reports a misuse before running; without static checks, the same error
+  happens when running.
+
 ## Modules
 
 A `module` groups declarations under a name: constants, functions, types, classes,
@@ -637,8 +673,20 @@ end
 - A module's body runs when the block that contains it starts, before the block's
   statements (like the declarations of types): its statements cannot use the script's
   variables, its functions can (they run later).
-- Everything is public (`private` may come later). A module can be reopened, also by a
-  later script, to add members.
+- A module can be reopened, also by a later script, to add members.
+- `private` before a declaration keeps it inside the module (and the modules nested
+  in it): `Http.sign(…)` or `Http::Conn` outside is an error, reported before running.
+
+```ruby
+module Http
+  private let TOKEN = "t0k"
+  private def sign(s: str): str = "#{s}+#{TOKEN}"
+  def get(url: str): str = sign(url)
+end
+
+Http.get("a.org")      # "a.org+t0k"
+Http.sign("a.org")     # error: `sign` is private to module `Http`
+```
 - A module is declared at the top level of the script, or in a module.
 
 ### Files: `require`
@@ -855,7 +903,7 @@ Point(x: 1).to_s()            # "Point(x=1, y=0)"
 ## Reserved words
 
 `let def end if elsif else unless then case when while for in do break next return
-module require
+module require private protected
 begin rescue ensure raise super trait abstract include type class enum annotation macro true false nil and or not`
 
 ## Open questions

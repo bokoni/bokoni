@@ -54,6 +54,8 @@ pub enum TokenKind {
     Trait,
     Abstract,
     Include,
+    Private,
+    Protected,
     Type,
     Class,
     Enum,
@@ -191,6 +193,8 @@ impl TokenKind {
             Trait => "`trait`",
             Abstract => "`abstract`",
             Include => "`include`",
+            Private => "`private`",
+            Protected => "`protected`",
             Type => "`type`",
             Class => "`class`",
             Enum => "`enum`",
@@ -259,7 +263,7 @@ fn keyword(s: &[u8]) -> Option<TokenKind> {
     if !(2..=10).contains(&s.len())
         || !matches!(
             s[0],
-            b'a'..=b'f' | b'i' | b'l' | b'm' | b'n' | b'o' | b'r' | b's' | b't' | b'u' | b'w'
+            b'a'..=b'f' | b'i' | b'l'..=b'p' | b'r'..=b'u' | b'w'
         )
     {
         return None;
@@ -290,6 +294,8 @@ fn keyword(s: &[u8]) -> Option<TokenKind> {
         b"trait" => Trait,
         b"abstract" => Abstract,
         b"include" => Include,
+        b"private" => Private,
+        b"protected" => Protected,
         b"type" => Type,
         b"class" => Class,
         b"enum" => Enum,

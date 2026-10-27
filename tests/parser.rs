@@ -373,3 +373,24 @@ fn incomplete_source_stops_cleanly() {
     assert_eq!(e.len(), 2, "{e}");
     assert!(e[1].message.contains("unclosed string"));
 }
+
+#[test]
+fn private_and_protected() {
+    assert_eq!(
+        sexp(
+            "class A\n  private def f() = 1\n  protected def g = 2\n  @[X] private def h=(v)\n  end\nend"
+        ),
+        "(class A (private def f () 1) (protected def g 2) @[X] (private def h= (v)))"
+    );
+    assert_eq!(
+        sexp("trait T\n  private abstract def f(): int\nend"),
+        "(trait T (abstract (private def f () : int)))"
+    );
+    assert_eq!(
+        sexp(
+            "module M\n  private let x = 1\n  private class C\n  end\n  private module N\n  end\nend"
+        ),
+        "(module M (private (let x 1)) (private (class C)) (private (module N)))"
+    );
+    assert!(err("class A\n  protected x: int\nend").contains("expected `def` after `protected`"));
+}

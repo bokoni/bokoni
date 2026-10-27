@@ -240,7 +240,18 @@ namespaces, `trait` for shared behavior.
 - [x] `require "file"`: loaded once, before the script is checked (its declarations
       known as a previous script's); nested requires, cycles reported; files provided
       by the host (`Engine::set_loader`), from disk for the `bokoni` command
-- [ ] `private`
+
+### v0.11 — Visibility
+
+- [x] `private def` / `protected def` in a class, a trait or a `type` (Ruby's and
+      Crystal's rules: `private` on `self` only, `protected` from the methods of the
+      declaring type and of its subclasses), getters and setters included
+- [x] Checked before running, and again when running (static checks off): each call
+      site carries where it is called from, the check costs nothing for a public
+      method
+- [x] `private` declarations of a module: used only inside it (and its nested
+      modules), checked when compiling
+- [x] `FnDesc::visibility`
 
 ### Next
 

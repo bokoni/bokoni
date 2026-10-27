@@ -224,6 +224,8 @@ struct TypeDef {
     ready: bool,
     fields: Vec<FieldDef>,
     methods: FxHashMap<Symbol, Rc<FnSig>>,
+    /// `private` / `protected` methods: their visibility and the type that declares them.
+    access: FxHashMap<Symbol, (Visibility, TypeId)>,
     deprecated: Option<Dep>,
 }
 
@@ -808,6 +810,7 @@ impl Checker<'_> {
             ready: true,
             fields: Vec::new(),
             methods: FxHashMap::default(),
+            access: FxHashMap::default(),
             deprecated,
         });
         self.imported.insert(key, Ty::TypeValue(id));
@@ -835,9 +838,19 @@ impl Checker<'_> {
             let sig = self.signature(d.params.as_deref().unwrap_or(&[]), d.ret.as_ref(), false);
             methods.insert(r.name, sig);
         }
+        let access = info
+            .methods
+            .iter()
+            .filter(|(_, m)| m.vis != Visibility::Public)
+            .map(|(n, m)| {
+                let owner = crate::objects::method_owner(info, *n, m);
+                (*n, (m.vis, self.import_type(&owner)))
+            })
+            .collect();
         self.quiet -= 1;
         self.types[id].fields = fields;
         self.types[id].methods = methods;
+        self.types[id].access = access;
         id
     }
 
@@ -1094,6 +1107,7 @@ impl Checker<'_> {
                         ready: false,
                         fields: Vec::new(),
                         methods: FxHashMap::default(),
+                        access: FxHashMap::default(),
                         deprecated,
                     });
                     self.declare(t.name, Ty::TypeValue(id), VarKind::Type);
@@ -1167,6 +1181,7 @@ impl Checker<'_> {
                 Some(pid) => (self.types[pid].fields.clone(), self.types[pid].methods.clone()),
                 None => (Vec::new(), FxHashMap::default()),
             };
+            let mut access = parent.map_or(FxHashMap::default(), |pid| self.types[pid].access.clone());
             let (mut required, mut traits) = match parent {
                 Some(pid) => (self.types[pid].required.clone(), self.types[pid].traits.clone()),
                 None => (Vec::new(), Vec::new()),
@@ -1192,9 +1207,18 @@ impl Checker<'_> {
                         let tr = &self.types[tid];
                         for (name, sig) in &tr.methods {
                             if tr.required.iter().any(|(r, _)| r == name) {
+                                if !methods.contains_key(name)
+                                    && let Some(a) = tr.access.get(name)
+                                {
+                                    access.insert(*name, *a);
+                                }
                                 methods.entry(*name).or_insert_with(|| sig.clone());
                             } else {
                                 methods.insert(*name, sig.clone());
+                                match tr.access.get(name) {
+                                    Some(a) => access.insert(*name, *a),
+                                    None => access.remove(name),
+                                };
                                 defined.push(*name);
                             }
                         }
@@ -1249,6 +1273,11 @@ impl Checker<'_> {
                         self.mark_fn(&sig, dep);
                         self.mark_params_ast(&sig, f.params.as_deref());
                         methods.insert(f.name, sig);
+                        if f.vis == Visibility::Public {
+                            access.remove(&f.name);
+                        } else {
+                            access.insert(f.name, (f.vis, id));
+                        }
                         defined.push(f.name);
                     }
                     Member::Abstract(f) => {
@@ -1257,6 +1286,9 @@ impl Checker<'_> {
                             f.ret.as_ref(),
                             false,
                         );
+                        if !methods.contains_key(&f.name) && f.vis != Visibility::Public {
+                            access.insert(f.name, (f.vis, id));
+                        }
                         methods.entry(f.name).or_insert(sig);
                         required.push((f.name, self.i.resolve(t.name).into()));
                     }
@@ -1302,6 +1334,7 @@ impl Checker<'_> {
             }
             self.types[id].fields = fields;
             self.types[id].methods = methods;
+            self.types[id].access = access;
             self.types[id].required = required;
             self.types[id].traits = traits;
             self.types[id].ready = true;
@@ -1867,6 +1900,10 @@ impl Checker<'_> {
                     return self.call(&f, args, block, span, Some(&label));
                 }
                 let r = self.expr(recv, None);
+                if let Ty::Object(id) = r {
+                    let this = matches!(ast.kind(recv), ExprKind::SelfRef);
+                    self.check_access(id, name, this, span);
+                }
                 self.method_call(&r, name, args, block, span)
             }
             ExprKind::Field(recv, name) if self.module_of(recv).is_some() => {
@@ -1884,6 +1921,8 @@ impl Checker<'_> {
                     {
                         self.prims.fields.insert(e.0, p);
                     }
+                    let this = matches!(ast.kind(recv), ExprKind::SelfRef);
+                    self.check_access(id, name, this, span);
                 }
                 self.field_ty(&r, name, span)
             }
@@ -2144,6 +2183,24 @@ impl Checker<'_> {
     }
 
     /// Type of the current method's `self` object, if it has fields.
+    /// A `private` / `protected` method of type `id` used from here (`this`: on `self`):
+    /// a `private` one only on `self`, a `protected` one also in the methods of the
+    /// type that declares it and of its subclasses.
+    fn check_access(&mut self, id: TypeId, name: Symbol, this: bool, span: Span) {
+        let Some(&(vis, owner)) = self.types[id].access.get(&name) else {
+            return;
+        };
+        if this
+            || (vis == Visibility::Protected
+                && self.this_type().is_some_and(|c| self.descends(c, owner)))
+        {
+            return;
+        }
+        let o = &self.types[owner];
+        let msg = crate::objects::access_error(self.name(name), self.name(o.name), o.kind, vis);
+        self.error(msg, span);
+    }
+
     fn this_type(&self) -> Option<TypeId> {
         match self.fns.last()?.this {
             Some(Ty::Object(id)) => Some(id),
@@ -2381,6 +2438,12 @@ impl Checker<'_> {
             ExprKind::IVar(name) => Some(self.ivar(name, tspan)),
             ExprKind::Field(recv, name) => {
                 let r = self.expr(recv, None);
+                if let Ty::Object(id) = r
+                    && let Some(setter) = self.i.get(&format!("{}=", self.name(name)))
+                {
+                    let this = matches!(self.ast.kind(recv), ExprKind::SelfRef);
+                    self.check_access(id, setter, this, tspan);
+                }
                 Some(self.field_target(&r, name, tspan))
             }
             ExprKind::Index(recv, idx) => {

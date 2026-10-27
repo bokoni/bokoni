@@ -25,6 +25,8 @@ pub struct Globals {
     /// Declared modules, by qualified name (`Http`, `Http::Client`): their members are
     /// the globals `Http::name`.
     modules: FxHashSet<Symbol>,
+    /// Members declared `private` in their module (`Http::parse`).
+    private: FxHashSet<Symbol>,
 }
 
 impl Globals {
@@ -98,6 +100,19 @@ impl Globals {
 
     pub fn is_module(&self, name: Symbol) -> bool {
         self.modules.contains(&name)
+    }
+
+    /// Visibility of a member of a module (the last declaration wins).
+    pub fn set_private(&mut self, name: Symbol, private: bool) {
+        if private {
+            self.private.insert(name);
+        } else {
+            self.private.remove(&name);
+        }
+    }
+
+    pub fn is_private(&self, name: Symbol) -> bool {
+        self.private.contains(&name)
     }
 
     /// Is the name known (declared by a script compiled before)?

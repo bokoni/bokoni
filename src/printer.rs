@@ -84,6 +84,18 @@ impl Printer<'_> {
     }
 
     fn stmt(&mut self, s: &Stmt) {
+        if s.vis != Visibility::Public {
+            self.out.push('(');
+            self.out.push_str(s.vis.keyword());
+            self.out.push(' ');
+            self.stmt_kind(s);
+            self.out.push(')');
+        } else {
+            self.stmt_kind(s);
+        }
+    }
+
+    fn stmt_kind(&mut self, s: &Stmt) {
         match &s.kind {
             StmtKind::Expr(e) => self.expr(*e),
             StmtKind::Let(l) => {
@@ -192,7 +204,12 @@ impl Printer<'_> {
 
     fn def(&mut self, f: &FnDecl) {
         self.annotations(&f.annotations);
-        self.out.push_str("(def ");
+        self.out.push('(');
+        if f.vis != Visibility::Public {
+            self.out.push_str(f.vis.keyword());
+            self.out.push(' ');
+        }
+        self.out.push_str("def ");
         self.name(f.name);
         if let Some(params) = &f.params {
             self.out.push_str(" (");

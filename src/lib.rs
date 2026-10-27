@@ -29,6 +29,7 @@ pub mod span;
 pub mod value;
 pub mod vm;
 
+pub use ast::Visibility;
 pub use diagnostic::{Error, ErrorKind, Errors};
 pub use engine::{Engine, FromValue, IntoValue, Source};
 pub use reflect::{

@@ -16,9 +16,9 @@ use crate::diagnostic::{Error, Errors};
 use crate::globals::Globals;
 use crate::intern::{FxBuild, FxHashMap, Interner, Symbol};
 use crate::ir::{
-    AnnotationIr, Annotations, Block as IrBlock, BlockId, CallSite, Capture, Decl, EnumDeclIr,
-    Fallback, FieldIr, Handler, Instr, ParamProto, Proto, ProtoKind, Reg, RegTy, RtType, Script,
-    Shape, Term, TypeDeclIr, TypeRef,
+    Access, AnnotationIr, Annotations, Block as IrBlock, BlockId, CallSite, Capture, Decl,
+    EnumDeclIr, Fallback, FieldIr, Handler, Instr, ParamProto, Proto, ProtoKind, Reg, RegTy,
+    RtType, Script, Shape, Term, TypeDeclIr, TypeRef,
 };
 use crate::span::Span;
 use crate::value::Value;
@@ -115,37 +115,38 @@ pub(crate) fn qualify(i: &mut Interner, prefix: Option<Symbol>, name: Symbol) ->
 }
 
 /// Interns the qualified names of the modules' declarations (`Http::get`), so that the
-/// checker (which does not intern) can find them.
-pub fn intern_module_names(program: &Program, i: &mut Interner) {
-    fn walk(b: &Block, prefix: Option<Symbol>, i: &mut Interner) {
+/// checker (which does not intern) can find them, and records which are `private`
+/// (before compiling: a function may use a member declared further down).
+pub fn intern_module_names(program: &Program, i: &mut Interner, globals: &mut Globals) {
+    fn walk(b: &Block, prefix: Option<Symbol>, i: &mut Interner, g: &mut Globals) {
         for s in &b.stmts {
+            let mut names = Vec::new();
             match &s.kind {
                 StmtKind::Module(m) => {
                     let q = qualify(i, prefix, m.name);
-                    walk(&m.body, Some(q), i);
+                    walk(&m.body, Some(q), i, g);
+                    names.push(m.name);
                 }
-                _ if prefix.is_none() => {}
                 StmtKind::Let(l) => {
-                    let mut names = Vec::new();
-                    pattern_bindings(&l.pattern, &mut names);
-                    for (n, _) in names {
-                        qualify(i, prefix, n);
-                    }
+                    let mut bound = Vec::new();
+                    pattern_bindings(&l.pattern, &mut bound);
+                    names.extend(bound.into_iter().map(|(n, _)| n));
                 }
-                StmtKind::Def(f) => {
-                    qualify(i, prefix, f.name);
-                }
-                StmtKind::Type(t) => {
-                    qualify(i, prefix, t.name);
-                }
-                StmtKind::Enum(e) => {
-                    qualify(i, prefix, e.name);
-                }
+                StmtKind::Def(f) => names.push(f.name),
+                StmtKind::Type(t) => names.push(t.name),
+                StmtKind::Enum(e) => names.push(e.name),
                 StmtKind::Expr(_) | StmtKind::Require(_) => {}
+            }
+            if prefix.is_none() {
+                continue;
+            }
+            for n in names {
+                let q = qualify(i, prefix, n);
+                g.set_private(q, s.vis == Visibility::Private);
             }
         }
     }
-    walk(&program.body, None, i);
+    walk(&program.body, None, i, globals);
 }
 
 fn pattern_bindings(p: &Pattern, out: &mut Vec<(Symbol, u32)>) {
@@ -556,6 +557,9 @@ struct Fn_ {
     /// Method of a class that inherits (and its lambdas): (global slot of the parent,
     /// name of the method), for `super`.
     sup: Option<(u32, Symbol)>,
+    /// Method of a class or a trait (and its lambdas): the global slot of that type
+    /// (for its `private` and `protected` methods).
+    class: Option<u32>,
     /// Register 0 is `self`.
     has_self: bool,
     /// Fields of the type whose default value is being computed.
@@ -604,6 +608,7 @@ impl Compiler<'_> {
         let parent = self.fns.last();
         let this = parent.and_then(|p| p.this.clone());
         let sup = parent.and_then(|p| p.sup);
+        let class = parent.and_then(|p| p.class);
         let ctx_fields = parent.and_then(|p| p.ctx_fields.clone());
         let mut region = parent.and_then(|p| p.region);
         if kind == ProtoKind::DoBlock {
@@ -644,6 +649,7 @@ impl Compiler<'_> {
             ret: None,
             this,
             sup,
+            class,
             has_self: false,
             ctx_fields,
             region,
@@ -705,6 +711,10 @@ impl Compiler<'_> {
             records: f.records,
             children: f.children,
             decls: f.decls,
+            vis: match (&f.decl, f.kind) {
+                (Some(d), ProtoKind::Method) => d.vis,
+                _ => Visibility::Public,
+            },
             decl: f.decl,
             annotations: f.annotations,
             handlers: f.handlers,
@@ -965,16 +975,40 @@ impl Compiler<'_> {
     }
 
     /// Global slot of a member: `path` = module(s) then the member's name.
-    fn member_slot(&mut self, path: &[Symbol]) -> Option<u32> {
+    fn member_slot(&mut self, path: &[Symbol], span: Span) -> Option<u32> {
         let (&last, prefix) = path.split_last()?;
         let m = self.module_path(prefix)?;
         let q = qualify(self.i, Some(m), last);
+        self.check_private(q, span);
         Some(self.globals.slot(q))
+    }
+
+    /// Qualified name `q` (`A::B::x`) used here: a `private` member of a module (`x` of
+    /// `A::B`, or the module `B` of `A`) only inside that module (or a module nested in
+    /// it).
+    fn check_private(&mut self, q: Symbol, span: Span) {
+        let text = self.i.resolve(q).to_string();
+        let mut end = text.len();
+        while let Some(k) = text[..end].rfind("::") {
+            if let (Some(member), Some(m)) = (self.i.get(&text[..end]), self.i.get(&text[..k]))
+                && self.globals.is_private(member)
+                && !self.modules().contains(&m)
+            {
+                let msg = format!(
+                    "`{}` is private to module `{}`: it can only be used inside it",
+                    &text[k + 2..end],
+                    &text[..k]
+                );
+                self.errors.push(Error::type_error(msg, span));
+                return;
+            }
+            end = k;
+        }
     }
 
     /// Global slot of a name written here: variable in scope, member of an enclosing
     /// module (also declared by an earlier script), path, or plain global.
-    fn global_slot(&mut self, path: &[Symbol]) -> u32 {
+    fn global_slot(&mut self, path: &[Symbol], span: Span) -> u32 {
         if let [name] = path {
             if let Some((v, _)) = self.resolve(*name)
                 && let Store::Global(s) = v.store
@@ -989,7 +1023,7 @@ impl Compiler<'_> {
             }
             return self.globals.slot(*name);
         }
-        match self.member_slot(path) {
+        match self.member_slot(path, span) {
             Some(s) => s,
             None => {
                 let mut q = path[0];
@@ -1193,7 +1227,7 @@ impl Compiler<'_> {
         if self.named_access(name, found.map(|(_, o)| o), store) {
             let fallback = match store {
                 Some(s) => Self::fallback(s),
-                None => Fallback::Global(self.global_slot(&[name])),
+                None => Fallback::Global(self.global_slot(&[name], span)),
             };
             let dst = self.tmp(RegTy::Value);
             self.emit(
@@ -1233,7 +1267,7 @@ impl Compiler<'_> {
                         span,
                     );
                 }
-                let g = self.global_slot(&[name]);
+                let g = self.global_slot(&[name], span);
                 let d = self.tmp(RegTy::Value);
                 self.emit(Instr::GetGlobal(d, g), span);
                 (d, RegTy::Value)
@@ -1350,10 +1384,10 @@ impl Compiler<'_> {
                         "str" => RtType::Str,
                         "bool" => RtType::Bool,
                         "nil" => RtType::Nil,
-                        _ => RtType::Named(self.global_slot(&[*name]), *name),
+                        _ => RtType::Named(self.global_slot(&[*name], t.span), *name),
                     }
                 } else {
-                    match self.member_slot(path) {
+                    match self.member_slot(path, t.span) {
                         Some(slot) => RtType::Named(slot, *path.last().unwrap()),
                         None => RtType::Named(u32::MAX, path[0]),
                     }
@@ -1445,6 +1479,15 @@ impl Compiler<'_> {
 
     /// Declares the block's `let`s (variables), types, enums and `def`s (closures).
     fn hoist(&mut self, b: &Block, top: bool) {
+        let in_module = self.f().scopes.last().and_then(|s| s.module).is_some();
+        for s in b.stmts.iter().filter(|s| s.vis != Visibility::Public) {
+            if !in_module {
+                self.errors.push(Error::syntax(
+                    "`private` is only allowed in a module (before a declaration) or in a class (before a method)",
+                    s.span,
+                ));
+            }
+        }
         let mut let_count: FxHashMap<Symbol, u32> = FxHashMap::default();
         for s in &b.stmts {
             if let StmtKind::Let(l) = &s.kind {
@@ -1651,7 +1694,8 @@ impl Compiler<'_> {
             Pattern::Record(names, _) => {
                 for (n, nspan) in names {
                     let d = self.tmp(RegTy::Value);
-                    self.emit(Instr::Field(d, v.0, *n), *nspan);
+                    let access = self.access(None);
+                    self.emit(Instr::Field(d, v.0, *n, access), *nspan);
                     self.bind(&Pattern::Name(*n, *nspan), (d, RegTy::Value), span);
                 }
             }
@@ -1941,7 +1985,7 @@ impl Compiler<'_> {
     fn parent_fields(&mut self, t: &TypeDecl) -> Option<(u32, Rc<[Symbol]>)> {
         let (p, span) = t.parent?;
         let path = self.split_path(p);
-        let slot = self.global_slot(&path);
+        let slot = self.global_slot(&path, span);
         if let Some(fields) = self.classes.get(&self.globals.at(slot).name) {
             return Some((slot, fields.clone()));
         }
@@ -2024,7 +2068,7 @@ impl Compiler<'_> {
                 Member::Abstract(f) => abstracts.push(Rc::new(f.clone())),
                 Member::Include(name, span) => {
                     let path = self.split_path(*name);
-                    let slot = self.global_slot(&path);
+                    let slot = self.global_slot(&path, *span);
                     let known = self.traits.contains(&self.globals.at(slot).name)
                         || matches!(&self.globals.at(slot).value,
                             Some(Value::Type(info)) if info.kind == TypeDeclKind::Trait);
@@ -2047,6 +2091,8 @@ impl Compiler<'_> {
                         &mut self.f().sup,
                         parent.as_ref().map(|(slot, _)| (*slot, f.name)),
                     );
+                    let class = self.decl_slot(t.name);
+                    let saved_class = self.f().class.replace(class);
                     let pname = format!("{}.{}", self.i.resolve(t.name), self.i.resolve(f.name));
                     let p = self.function_proto(
                         ProtoKind::Method,
@@ -2060,6 +2106,7 @@ impl Compiler<'_> {
                     );
                     self.f().this = saved;
                     self.f().sup = saved_sup;
+                    self.f().class = saved_class;
                     methods.push((f.name, p));
                 }
                 Member::Stmt(s) => self.errors.push(Error::syntax(
@@ -2250,7 +2297,7 @@ impl Compiler<'_> {
             ExprKind::Path(p) => {
                 let p = ast.get(p).to_vec();
                 // Member of a module: `Http::Request`, `Http::VERSION`.
-                if let Some(slot) = self.member_slot(&p) {
+                if let Some(slot) = self.member_slot(&p, span) {
                     let d = self.tmp(RegTy::Value);
                     self.emit(Instr::GetGlobal(d, slot), span);
                     return (d, RegTy::Value);
@@ -2262,7 +2309,7 @@ impl Compiler<'_> {
                 let (&variant, head) = p.split_last().unwrap();
                 let head = match head {
                     [name] => self.read_var(*name, span),
-                    _ => match self.member_slot(head) {
+                    _ => match self.member_slot(head, span) {
                         Some(slot) => {
                             let d = self.tmp(RegTy::Value);
                             self.emit(Instr::GetGlobal(d, slot), span);
@@ -2404,6 +2451,7 @@ impl Compiler<'_> {
                 // Function of a module: `Http.get(url)`.
                 let m = self.module_of(recv).unwrap();
                 let q = qualify(self.i, Some(m), name);
+                self.check_private(q, span);
                 let slot = self.globals.slot(q);
                 let f = self.tmp(RegTy::Value);
                 self.emit(Instr::GetGlobal(f, slot), span);
@@ -2415,6 +2463,7 @@ impl Compiler<'_> {
             ExprKind::Field(recv, name) if self.module_of(recv).is_some() => {
                 let m = self.module_of(recv).unwrap();
                 let q = qualify(self.i, Some(m), name);
+                self.check_private(q, span);
                 let slot = self.globals.slot(q);
                 let d = self.tmp(RegTy::Value);
                 self.emit(Instr::GetGlobal(d, slot), span);
@@ -2434,12 +2483,14 @@ impl Compiler<'_> {
                 }
                 let site = self.call_site(args, block);
                 let dst = self.tmp(RegTy::Value);
+                let access = self.access(Some(recv));
                 self.emit(
                     Instr::CallMethod {
                         dst,
                         recv: r.0,
                         name,
                         site,
+                        access,
                     },
                     span,
                 );
@@ -2454,7 +2505,8 @@ impl Compiler<'_> {
                     return (d, t);
                 }
                 let d = self.tmp(RegTy::Value);
-                self.emit(Instr::Field(d, r.0, name), span);
+                let access = self.access(Some(recv));
+                self.emit(Instr::Field(d, r.0, name, access), span);
                 (d, RegTy::Value)
             }
             ExprKind::TupleIndex(recv, idx) => {
@@ -2879,6 +2931,19 @@ impl Compiler<'_> {
         }
     }
 
+    /// Who calls a method of `recv` from here (`None`: a value that is not written).
+    fn access(&self, recv: Option<ExprId>) -> Access {
+        if let Some(r) = recv
+            && matches!(self.ast.kind(r), ExprKind::SelfRef)
+        {
+            return Access::THIS;
+        }
+        match self.fns.last().unwrap().class {
+            Some(slot) => Access::inside(slot),
+            None => Access::OUTSIDE,
+        }
+    }
+
     /// Index of the `@name` field of `self`.
     fn this_field(&mut self, name: Symbol, span: Span) -> Option<u32> {
         let this = self.f().this.clone();
@@ -3005,11 +3070,12 @@ impl Compiler<'_> {
             }
             ExprKind::Field(recv, name) => {
                 let obj = self.expr(recv);
+                let access = self.access(Some(recv));
                 let mut v = self.expr(value);
                 let mut shape = self.shape(value);
                 if let Some(op) = op {
                     let old = self.tmp(RegTy::Value);
-                    self.emit(Instr::Field(old, obj.0, name), tspan);
+                    self.emit(Instr::Field(old, obj.0, name, access), tspan);
                     v = self.binary(op, (old, RegTy::Value), v, span);
                     shape = None;
                 }
@@ -3019,6 +3085,7 @@ impl Compiler<'_> {
                         name,
                         src: v.0,
                         shape,
+                        access,
                     },
                     tspan,
                 );
@@ -3219,7 +3286,7 @@ fn dest_mut(ins: &mut Instr) -> Option<&mut Reg> {
         List(d, _, _) | Tuple(d, _, _) | Hash(d, _, _) | Record(d, _, _) | Concat(d, _, _) => d,
         Index(d, _, _)
         | IndexOpt(d, _, _)
-        | Field(d, _, _)
+        | Field(d, ..)
         | FieldAs(d, _, _, _)
         | FieldAt(d, _, _)
         | TupleIndex(d, _, _)

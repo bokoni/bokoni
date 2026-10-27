@@ -2839,7 +2839,7 @@ fn dyn_instr(
         SetCell(c, a) => d.fast(bx, Fast::SetCell, *c, *a, null, ins, span),
         GetGlobal(r, g) => d.fast(bx, Fast::GetGlobal, *r, *g, null, ins, span),
         SetGlobal(g, a) => d.fast(bx, Fast::SetGlobal, *g, *a, null, ins, span),
-        Field(r, a, name) | FieldAs(r, a, name, _) => {
+        Field(r, a, name, _) | FieldAs(r, a, name, _) => {
             let want = match ins {
                 FieldAs(.., t) => *t,
                 _ => RegTy::Value,
