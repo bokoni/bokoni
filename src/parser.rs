@@ -1983,19 +1983,32 @@ impl Parser<'_, '_> {
 
     /// `a ?? b`: `b` if `a` is `nil` (evaluated once), otherwise `a`; as
     /// `begin let t = a; if t == nil then b else t end end`.
-    fn coalesce(&mut self, a: ExprId, b: ExprId, span: Span) -> ExprId {
-        let t = self.interner.intern("#coalesced");
-        let (sa, sb) = (self.span(a), self.span(b));
-        let read = |p: &mut Self| p.mk(ExprKind::Ident(t), sa);
-        let lhs = read(self);
+    fn coalesce(&mut self, a: ExprId, b: ExprId, span: Span, at: u32) -> ExprId {
+        // (One hidden name per `??`.)
+        let t = self.interner.intern(&format!("#coalesced{at}"));
+        let other = self.mk(ExprKind::Ident(t), self.span(a));
+        self.nil_test(a, t, b, other, span)
+    }
+
+    /// `begin let t = a; if t == nil then if_nil else other end end` (`other` may read
+    /// `t`).
+    fn nil_test(
+        &mut self,
+        a: ExprId,
+        t: Symbol,
+        if_nil: ExprId,
+        other: ExprId,
+        span: Span,
+    ) -> ExprId {
+        let sa = self.span(a);
+        let lhs = self.mk(ExprKind::Ident(t), sa);
         let nil = self.mk(ExprKind::Nil, sa);
         let cond = self.mk(ExprKind::Binary(BinOp::Eq, lhs, nil), sa);
-        let other = read(self);
         let test = self.ast.push_control(
             Control::If(If {
                 cond,
-                then: expr_block(b, sb),
-                else_: Some(expr_block(other, sa)),
+                then: expr_block(if_nil, self.span(if_nil)),
+                else_: Some(expr_block(other, self.span(other))),
             }),
             span,
         );
@@ -2049,7 +2062,7 @@ impl Parser<'_, '_> {
             let span = self.span(lhs).to(self.span(rhs));
             let node = match op {
                 Infix::Coalesce => {
-                    lhs = self.coalesce(lhs, rhs, span);
+                    lhs = self.coalesce(lhs, rhs, span, op_span.start);
                     continue;
                 }
                 Infix::Bin(op) => ExprKind::Binary(op, lhs, rhs),
@@ -2119,6 +2132,46 @@ impl Parser<'_, '_> {
         }
     }
 
+    /// After `e.`: a tuple index, a field, or a method (with or without `?`: `x.empty?`
+    /// without parentheses is a call, since a field's name has no `?`).
+    fn member(&mut self, e: ExprId) -> Result<ExprId> {
+        let t = self.tok();
+        let span = self.span(e).to(t.span);
+        if t.kind == T::Int {
+            self.bump();
+            let idx = t
+                .span
+                .text(self.src)
+                .replace('_', "")
+                .parse()
+                .map_err(|_| Error::syntax("invalid tuple index", t.span))?;
+            Ok(self.mk(ExprKind::TupleIndex(e, idx), span))
+        } else if t.kind == T::Ident || is_keyword(t.kind) {
+            self.bump();
+            let name_span = self.question_suffix(t.span);
+            let name = self.intern(name_span);
+            let span = span.to(name_span);
+            if name_span != t.span && !self.at(T::LParen) {
+                let args = self.ast.alloc(&[]);
+                return Ok(self.mk(
+                    ExprKind::MethodCall {
+                        recv: e,
+                        name,
+                        args,
+                        block: None,
+                    },
+                    span,
+                ));
+            }
+            Ok(self.mk(ExprKind::Field(e, name), span))
+        } else {
+            self.error_here(format!(
+                "expected a method or field name after `.`, found {}",
+                self.found()
+            ))
+        }
+    }
+
     fn postfix(&mut self, mut e: ExprId) -> Result<ExprId> {
         loop {
             match self.peek() {
@@ -2152,28 +2205,19 @@ impl Parser<'_, '_> {
                 }
                 T::Dot => {
                     self.bump();
-                    let t = self.tok();
-                    let span = self.span(e).to(t.span);
-                    if t.kind == T::Int {
-                        self.bump();
-                        let idx = t
-                            .span
-                            .text(self.src)
-                            .replace('_', "")
-                            .parse()
-                            .map_err(|_| Error::syntax("invalid tuple index", t.span))?;
-                        e = self.mk(ExprKind::TupleIndex(e, idx), span);
-                    } else if t.kind == T::Ident || is_keyword(t.kind) {
-                        self.bump();
-                        let name_span = self.question_suffix(t.span);
-                        let name = self.intern(name_span);
-                        e = self.mk(ExprKind::Field(e, name), span.to(name_span));
-                    } else {
-                        return self.error_here(format!(
-                            "expected a method or field name after `.`, found {}",
-                            self.found()
-                        ));
-                    }
+                    e = self.member(e)?;
+                }
+                // `a?.b…`: `nil` if `a` is `nil` (the rest of the chain is not evaluated).
+                T::QuestionDot => {
+                    // (One hidden name per `?.`: `a?.b?.c` nests them.)
+                    let at = self.bump().span.start;
+                    let t = self.interner.intern(&format!("#safe{at}"));
+                    let recv = self.mk(ExprKind::Ident(t), self.span(e));
+                    let link = self.member(recv)?;
+                    let rest = self.postfix(link)?;
+                    let span = self.span(e).to(self.span(rest));
+                    let nil = self.mk(ExprKind::Nil, span);
+                    return Ok(self.nil_test(e, t, nil, rest, span));
                 }
                 T::ColonColon => {
                     let ExprKind::Ident(first) = self.ast.kind(e) else {
@@ -2196,8 +2240,10 @@ impl Parser<'_, '_> {
                     let index = self.expr()?;
                     self.skip_newlines();
                     let close = self.expect(T::RBracket, "to close the index")?;
-                    // `xs[i]?`: `nil` rather than an error when out of bounds.
-                    let optional = self.question_suffix(close.span) != close.span;
+                    // `xs[i]?`: `nil` rather than an error when out of bounds (also
+                    // `xs[i]?.name`, then `nil` for a `nil` element).
+                    let optional = self.question_suffix(close.span) != close.span
+                        || (self.at(T::QuestionDot) && self.tok().span.start == close.span.end);
                     let span = self.span_from(self.span(e));
                     let kind = if optional {
                         ExprKind::IndexOpt(e, index)

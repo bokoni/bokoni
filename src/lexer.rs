@@ -92,6 +92,8 @@ pub enum TokenKind {
     Question,
     /// `??`
     QuestionQuestion,
+    /// `?.`
+    QuestionDot,
     FatArrow,
 
     // Operators
@@ -134,6 +136,7 @@ impl TokenKind {
                 | AtLBracket
                 | FatArrow
                 | QuestionQuestion
+                | QuestionDot
                 | Eq
                 | EqEq
                 | NotEq
@@ -231,6 +234,7 @@ impl TokenKind {
             Pipe => "`|`",
             Question => "`?`",
             QuestionQuestion => "`??`",
+            QuestionDot => "`?.`",
             FatArrow => "`=>`",
             Eq => "`=`",
             EqEq => "`==`",
@@ -564,7 +568,7 @@ impl Lexer<'_> {
         if self.last == TokenKind::Newline || self.last.continues_line() {
             return false;
         }
-        // Next line starts with `.` (and not `..`): method chaining.
+        // Next line starts with `.` or `?.` (and not `..`): method chaining.
         let mut p = self.pos;
         loop {
             match self.src.get(p) {
@@ -576,6 +580,9 @@ impl Lexer<'_> {
                 }
                 _ => break,
             }
+        }
+        if self.src.get(p) == Some(&b'?') {
+            p += 1;
         }
         !(self.src.get(p) == Some(&b'.') && self.src.get(p + 1) != Some(&b'.'))
     }
@@ -656,6 +663,7 @@ impl Lexer<'_> {
             (b';', _) => (Semi, 1),
             (b'|', _) => (Pipe, 1),
             (b'?', b'?') => (QuestionQuestion, 2),
+            (b'?', b'.') if self.peek_at(2) != b'.' => (QuestionDot, 2),
             (b'?', _) => (Question, 1),
             (b'.', b'.') if self.peek_at(2) == b'.' => (DotDotDot, 3),
             (b'.', b'.') => (DotDot, 2),

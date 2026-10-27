@@ -181,6 +181,16 @@ fn control_flow() {
         "=> [9, 1, false, 2, 1, 2, false, 7]"
     );
     assert!(err("true ? 1").1.contains("between the two values of `? :`"));
+    // `a?.b`: `nil` for a `nil` `a`, the rest of the chain skipped, `a` evaluated once.
+    assert_eq!(
+        run("class U\n  def init(@n: str, @up: U?)\n  end\n  def n = @n\n  def up = @up\n  def hi(x: str): str = x + @n\nend\nlet a = U(\"a\", nil)\nlet b = U(\"b\", a)\nlet k = 0\ndef f(u: U?): U?\n  k += 1\n  u\nend\nlet none: U? = nil\nlet ps = [{x: 1}]\n[b.up?.n, a.up?.n, a.up?.up?.n, none?.up.n, none?.n ?? \"?\", f(b)?.hi(\"h\"), f(nil)?.hi(\"h\"), k, ps[0]?.x, ps[5]?.x, b\n  ?.up\n  ?.n]"),
+        "=> [\"a\", nil, nil, nil, \"?\", \"hb\", nil, 2, 1, nil, \"a\"]"
+    );
+    // A method ending with `?`, without parentheses.
+    assert_eq!(
+        run("class U\n  def ok? = true\nend\n[\"5\".to_i?, \"x\".to_i? ?? 0, U().ok?, \"5\".to_i?().abs()]"),
+        "=> [5, 0, true, 5]"
+    );
     assert!(err("let x: int = false ? 1 : \"a\"").1.contains("expected type `int`"));
     assert_eq!(run("let x = 5\nx = 0 if x > 3\nx"), "=> 0");
     assert_eq!(

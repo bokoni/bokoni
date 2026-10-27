@@ -373,6 +373,20 @@ let port = s.to_i?() or 80     # `or`: also replaces `false`
 `??` evaluates its left side once; it binds tighter than comparisons and looser than
 arithmetic (`n ?? 0 + 1` is `n ?? (0 + 1)`, `n ?? 0 > 5` is `(n ?? 0) > 5`).
 
+`a?.b`: `nil` if `a` is `nil`, otherwise `a.b`; the rest of the chain is then skipped
+too (`a?.b.c` is `nil` for a `nil` `a`), and the arguments of `a?.m(x)` are not
+evaluated. `xs[i]?.name`: `nil` out of bounds or for a `nil` element.
+
+```ruby
+user?.name ?? "anonymous"
+order.customer?.address?.city
+find(id)?.greet("hi")
+```
+
+A method whose name ends with `?` can be called without parentheses (`s.to_i?`,
+`user.admin?`): a field's name never has a `?`. Before `.` or `?.`, write the
+parentheses: `s.to_i?().abs()` (`s.to_i?.abs()` reads `?.`).
+
 A wrong type is still an error (`xs["a"]?`). The other built-in methods already return
 `nil` when there is nothing to return: `first()`, `last()`, `pop()`, `min()`, `max()`,
 `find()`, `h[key]`, `get(key)`.
