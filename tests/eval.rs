@@ -762,3 +762,42 @@ fn deep_sources_do_not_overflow() {
     assert_eq!(out[3], "\"1\"");
     assert_eq!(out[4], "imbrication trop profonde");
 }
+
+#[test]
+fn cyclic_and_shared_structures() {
+    let run = |src: &str| {
+        let mut e = Engine::new();
+        e.set_output(|_| {});
+        e.set_static_checks(false);
+        e.eval(src)
+            .map(|v| e.inspect(&v))
+            .unwrap_or_else(|err| err.to_string())
+    };
+    // Cycles : affichés `[…]`, comparés sans fin de récursion.
+    assert_eq!(run("let l = []\nl << l\nl"), "[[…]]");
+    assert_eq!(run("let l = []\nl << l\nl << l\nl"), "[[…], […]]");
+    assert_eq!(run("let h = {}\nh[\"x\"] = h\nh"), "{\"x\" => {…}}");
+    assert_eq!(
+        run("let a = []\na << a\nlet b = []\nb << b\n[a == b, a == [a], a == [1], a == a]"),
+        "[true, true, false, true]"
+    );
+    assert_eq!(
+        run("let a = [1]\na << a\nlet b = [2]\nb << b\na == b"),
+        "false"
+    );
+    assert_eq!(
+        run("type N\n  v = nil\nend\nlet n = N()\nn.v = n\n[n, n == n, N(v: n) == N(v: n)]"),
+        "[N(v: (…)), true, true]"
+    );
+    // Partage : 2^40 chemins, mais peu de nœuds distincts.
+    assert_eq!(
+        run(
+            "let a = [1]\nlet b = [1]\nfor i in 0...40\n  a = [a, a]\n  b = [b, b]\nend\n[a == b, a.to_s().len() > 1000]"
+        ),
+        "[true, true]"
+    );
+    assert_eq!(
+        run("let a = [1]\nlet b = [1]\nfor i in 0...40\n  a = [a, a]\n  b = [b, [b]]\nend\na == b"),
+        "false"
+    );
+}

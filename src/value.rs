@@ -4,7 +4,7 @@
 //! allocation. Les valeurs composées sont partagées par comptage de références (`Rc`) :
 //! `let b = a` ne copie pas la liste, les deux noms désignent la même.
 
-use crate::intern::{FxHashMap, Interner, Symbol};
+use crate::intern::{FxHashMap, FxHashSet, Interner, Symbol};
 use crate::objects::{EnumInfo, Object, TypeInfo};
 use std::cell::RefCell;
 use std::fmt::{self, Write};
@@ -264,22 +264,37 @@ impl Value {
 
     /// Égalité structurelle (`==`). Un `int` et un `float` égaux sont égaux.
     pub fn equals(&self, other: &Value) -> bool {
-        use Value::*;
-        match (self, other) {
-            // Conteneurs : comparaison récursive, la pile grandit sur le tas au besoin
-            // (structures imbriquées très profondément).
-            (List(_), List(_))
-            | (Tuple(_), Tuple(_))
-            | (Hash(_), Hash(_))
-            | (Record(_), Record(_))
-            | (Object(_), Object(_)) => {
-                stacker::maybe_grow(64 * 1024, 1024 * 1024, || self.equals_deep(other))
-            }
-            _ => self.equals_deep(other),
-        }
+        // Ensemble vide : aucune allocation pour des valeurs simples.
+        self.equals_in(other, &mut FxHashSet::default())
     }
 
-    fn equals_deep(&self, other: &Value) -> bool {
+    /// Égalité structurelle. `seen` : paires de conteneurs déjà comparées (ou en cours) ;
+    /// une paire revue compte comme égale — égalité des structures cycliques, et travail
+    /// borné par le nombre de paires même pour des structures très partagées. La pile
+    /// grandit sur le tas pour les structures très profondes.
+    fn equals_in(&self, other: &Value, seen: &mut FxHashSet<(usize, usize)>) -> bool {
+        use Value::*;
+        let pair = |a: *const (), b: *const ()| (a as usize, b as usize);
+        let key = match (self, other) {
+            (List(a), List(b)) => Some(pair(Rc::as_ptr(a) as _, Rc::as_ptr(b) as _)),
+            (Tuple(a), Tuple(b)) => {
+                Some(pair(Rc::as_ptr(a) as *const (), Rc::as_ptr(b) as *const ()))
+            }
+            (Hash(a), Hash(b)) => Some(pair(Rc::as_ptr(a) as _, Rc::as_ptr(b) as _)),
+            (Record(a), Record(b)) => Some(pair(Rc::as_ptr(a) as _, Rc::as_ptr(b) as _)),
+            (Object(a), Object(b)) => Some(pair(Rc::as_ptr(a) as _, Rc::as_ptr(b) as _)),
+            _ => None,
+        };
+        if let Some(k) = key {
+            if !seen.insert(k) {
+                return true;
+            }
+            return stacker::maybe_grow(64 * 1024, 1024 * 1024, || self.equals_items(other, seen));
+        }
+        self.equals_items(other, seen)
+    }
+
+    fn equals_items(&self, other: &Value, seen: &mut FxHashSet<(usize, usize)>) -> bool {
         use Value::*;
         match (self, other) {
             (Nil, Nil) => true,
@@ -291,17 +306,18 @@ impl Value {
             (List(a), List(b)) => {
                 Rc::ptr_eq(a, b) || {
                     let (a, b) = (a.borrow(), b.borrow());
-                    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.equals(y))
+                    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.equals_in(y, seen))
                 }
             }
             (Tuple(a), Tuple(b)) => {
-                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.equals(y))
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.equals_in(y, seen))
             }
             (Hash(a), Hash(b)) => {
                 Rc::ptr_eq(a, b) || {
                     let (a, b) = (a.borrow(), b.borrow());
                     a.len() == b.len()
-                        && a.iter().all(|(k, v)| b.get(k).is_some_and(|w| v.equals(w)))
+                        && a.iter()
+                            .all(|(k, v)| b.get(k).is_some_and(|w| v.equals_in(w, seen)))
                 }
             }
             (Record(a), Record(b)) => {
@@ -310,7 +326,7 @@ impl Value {
                     a.fields.len() == b.fields.len()
                         && a.fields
                             .iter()
-                            .all(|(n, v)| b.get(*n).is_some_and(|w| v.equals(w)))
+                            .all(|(n, v)| b.get(*n).is_some_and(|w| v.equals_in(w, seen)))
                 }
             }
             (Range(a), Range(b)) => a == b,
@@ -321,7 +337,10 @@ impl Value {
                     let (a, b) = (a.borrow(), b.borrow());
                     Rc::ptr_eq(&a.info, &b.info)
                         && a.info.kind != crate::ast::TypeDeclKind::Class
-                        && a.fields.iter().zip(&b.fields).all(|(x, y)| x.equals(y))
+                        && a.fields
+                            .iter()
+                            .zip(&b.fields)
+                            .all(|(x, y)| x.equals_in(y, seen))
                 }
             }
             (Variant(a, i), Variant(b, j)) => Rc::ptr_eq(a, b) && i == j,
@@ -360,11 +379,46 @@ impl Value {
 
     /// Sans interner, les noms de champs s'affichent par leur numéro (`#3`).
     fn write_inspect(&self, out: &mut String, i: Option<&Interner>, depth: usize) {
-        if depth > 32 {
+        let mut cx = Inspect {
+            depth,
+            path: Vec::new(),
+            budget: INSPECT_BUDGET,
+        };
+        self.write_in(out, i, &mut cx);
+    }
+
+    /// Écrit la valeur ; un conteneur déjà sur le chemin courant (structure cyclique)
+    /// s'écrit `[…]`, et le nombre total de nœuds est borné (structures très partagées).
+    fn write_in(&self, out: &mut String, i: Option<&Interner>, cx: &mut Inspect) {
+        if cx.depth > 32 || cx.budget == 0 {
             out.push('…');
             return;
         }
-        let d = depth + 1;
+        cx.budget -= 1;
+        let ptr = match self {
+            Value::List(rc) => Some((Rc::as_ptr(rc) as *const () as usize, "[…]")),
+            Value::Tuple(rc) => Some((Rc::as_ptr(rc) as *const () as usize, "(…)")),
+            Value::Hash(rc) => Some((Rc::as_ptr(rc) as *const () as usize, "{…}")),
+            Value::Record(rc) => Some((Rc::as_ptr(rc) as *const () as usize, "{…}")),
+            Value::Object(rc) => Some((Rc::as_ptr(rc) as *const () as usize, "(…)")),
+            _ => None,
+        };
+        if let Some((p, cycle)) = ptr {
+            if cx.path.contains(&p) {
+                out.push_str(cycle);
+                return;
+            }
+            cx.path.push(p);
+            cx.depth += 1;
+            self.write_items(out, i, cx);
+            cx.depth -= 1;
+            cx.path.pop();
+        } else {
+            self.write_items(out, i, cx);
+        }
+    }
+
+    fn write_items(&self, out: &mut String, i: Option<&Interner>, cx: &mut Inspect) {
         match self {
             Value::Nil => out.push_str("nil"),
             Value::Bool(b) => {
@@ -383,7 +437,7 @@ impl Value {
                     if n > 0 {
                         out.push_str(", ");
                     }
-                    v.write_inspect(out, i, d);
+                    v.write_in(out, i, cx);
                 }
                 out.push(']');
             }
@@ -393,7 +447,7 @@ impl Value {
                     if n > 0 {
                         out.push_str(", ");
                     }
-                    v.write_inspect(out, i, d);
+                    v.write_in(out, i, cx);
                 }
                 if items.len() == 1 {
                     out.push(',');
@@ -406,9 +460,9 @@ impl Value {
                     if n > 0 {
                         out.push_str(", ");
                     }
-                    k.to_value().write_inspect(out, i, d);
+                    k.to_value().write_in(out, i, cx);
                     out.push_str(" => ");
-                    v.write_inspect(out, i, d);
+                    v.write_in(out, i, cx);
                 }
                 out.push('}');
             }
@@ -425,7 +479,7 @@ impl Value {
                         }
                     }
                     out.push_str(": ");
-                    v.write_inspect(out, i, d);
+                    v.write_in(out, i, cx);
                 }
                 out.push('}');
             }
@@ -456,7 +510,7 @@ impl Value {
                         }
                     }
                     out.push_str(": ");
-                    v.write_inspect(out, i, d);
+                    v.write_in(out, i, cx);
                 }
                 out.push(')');
             }
@@ -483,6 +537,16 @@ impl Value {
 }
 
 /// `2.0` reste `2.0` (et non `2`) pour distinguer les décimaux des entiers.
+/// Nombre maximal de nœuds écrits par un affichage (au-delà : `…`).
+const INSPECT_BUDGET: usize = 1_000_000;
+
+/// État d'un affichage : profondeur, conteneurs du chemin courant, nœuds restants.
+struct Inspect {
+    depth: usize,
+    path: Vec<usize>,
+    budget: usize,
+}
+
 /// Écriture la plus courte qui redonne exactement le nombre : `3.0`, `0.1`, `1e300`,
 /// `5e-324`, `1.2345678901234568e17` (notation scientifique pour les très grands et très
 /// petits nombres), `NaN`, `inf`.

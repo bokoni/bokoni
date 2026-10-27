@@ -225,6 +225,9 @@ optimisations (lexer à la demande, interning des noms courts) n'ont apporté qu
   chaîne répétée au-delà de 2 Gio, intervalle converti en liste au-delà de 2^27
   éléments ; `map` / `filter` / `each` / `reduce` / `find` parcourent un intervalle
   sans le copier
+- Structures cycliques et très partagées : affichage `[…]` pour un cycle, au plus un
+  million de nœuds affichés ; égalité par bisimulation (une paire de conteneurs revue
+  compte comme égale) : termine, et en temps borné par le nombre de paires distinctes
 - Messages d'erreur bornés : seule une fenêtre de 120 caractères d'une longue ligne est
   affichée
 - `Value` implémente `Drop` (libération itérative) : depuis Rust, lier ses champs par

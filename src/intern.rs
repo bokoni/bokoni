@@ -278,6 +278,7 @@ impl Hasher for FxHasher {
 
 pub type FxBuild = BuildHasherDefault<FxHasher>;
 pub type FxHashMap<K, V> = HashMap<K, V, FxBuild>;
+pub type FxHashSet<T> = std::collections::HashSet<T, FxBuild>;
 
 #[cfg(test)]
 mod tests {
