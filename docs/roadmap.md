@@ -355,7 +355,6 @@ namespaces, `trait` for shared behavior.
 No design decision needed:
 
 - Free local functions that capture themselves (reference cycle).
-- `for` without copying the list it walks.
 - Typed registers for globals, not only locals.
 
 ## Decisions that commit the JIT
@@ -410,6 +409,7 @@ optimizations (on-demand lexer, interning of short names) only brought a few %.
 
 - Reference cycles: a local function that captures itself is never freed (global
   functions are, when the `Engine` is dropped).
-- A `for` loop copies the list it walks before starting (safe, but costly for a very
-  large list).
+- A `for` loop over a list does not copy it: the loop copies what it has left only when
+  the list is modified (`<<`, `push`, `pop`, `xs[i] = v`) while it walks it. A list
+  modified from Rust (`Value::List`) during a loop is seen modified.
 - A typed register is only used for a local variable; globals (top level) stay dynamic.

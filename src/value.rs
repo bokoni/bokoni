@@ -634,6 +634,7 @@ fn has_nested(v: &mut Value) -> bool {
         }),
         Value::Iter(rc) => Rc::get_mut(rc).is_some_and(|c| match c.get_mut() {
             crate::vm::IterState::Values(items) => any(items.as_slice().iter()),
+            crate::vm::IterState::List(..) => true,
             _ => false,
         }),
         _ => false,
@@ -703,10 +704,15 @@ fn take_children(v: &mut Value, out: &mut Vec<Value>) {
             }
         }
         Value::Iter(rc) => {
-            if let Some(cell) = Rc::get_mut(rc)
-                && let crate::vm::IterState::Values(items) = cell.get_mut()
-            {
-                items.for_each(&mut push);
+            if let Some(cell) = Rc::get_mut(rc) {
+                match std::mem::replace(
+                    cell.get_mut(),
+                    crate::vm::IterState::Values(Vec::new().into_iter()),
+                ) {
+                    crate::vm::IterState::Values(items) => items.for_each(&mut push),
+                    crate::vm::IterState::List(l, _) => push(Value::List(l)),
+                    _ => {}
+                }
             }
         }
         _ => {}

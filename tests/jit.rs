@@ -1019,3 +1019,59 @@ end
     same(&format!("{src}\nhalf(1)"));
     same(&format!("{src}\nhalf(0)"));
 }
+
+#[test]
+fn for_sees_the_list_as_it_was() {
+    // The list is not copied when the loop starts: modified during the loop (by the loop
+    // itself, by a function, by an inner loop), the loop still sees it as it was.
+    let src = "let xs = [1, 2, 3]
+let seen = []
+for x in xs
+  seen << x
+  if x == 1
+    xs << 10
+    xs[2] = 30
+  end
+end
+def grow(l)
+  l << 99
+  l.pop()
+  l.pop()
+end
+let ys = [1, 2, 3, 4]
+let total = 0
+for y in ys
+  total += y
+  grow(ys)
+end
+let zs = [1, 2]
+let pairs = []
+for a in zs
+  for b in zs
+    pairs << a * 10 + b
+    zs << 0 if a == 1 and b == 1
+  end
+end
+let ws = [5, 6, 7]
+for w in ws
+  break if w == 6
+end
+ws << 8
+for w in ws
+  ws[0] = 0
+  total += w
+end
+def typed(xs: [int]): int
+  let t = 0
+  for x in xs
+    xs << x if x < 3
+    t += x
+  end
+  t
+end
+[seen, xs, total, pairs, ws, typed([1, 2, 3, 4]), typed([5])]";
+    assert_eq!(
+        same(src),
+        "[[1, 2, 3], [1, 2, 30, 10], 36, [11, 12, 21, 22, 20], [0, 6, 7, 8], 10, 5]"
+    );
+}

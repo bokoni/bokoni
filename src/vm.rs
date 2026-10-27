@@ -47,10 +47,67 @@ impl CallArgs {
     }
 }
 
-/// State of a `for` loop iterator (elements copied when the loop starts).
+/// State of a `for` loop iterator: the loop sees the elements as they were when it
+/// started.
 pub enum IterState {
     Values(std::vec::IntoIter<Value>),
     Range(std::ops::RangeInclusive<i64>),
+    /// Over a list, not copied: (list, next index). Before the list is modified, the
+    /// rest of it is copied (`Values`, see [`before_list_write`]).
+    List(Rc<RefCell<Vec<Value>>>, usize),
+}
+
+thread_local! {
+    /// Iterators over a list not copied (`IterState::List`): (address of the list,
+    /// iterator).
+    static LIST_ITERS: RefCell<Vec<(usize, std::rc::Weak<RefCell<IterState>>)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Iterator over `l`, without copying it: registered, so that it copies the rest before
+/// `l` is modified.
+fn list_iter(l: &Rc<RefCell<Vec<Value>>>) -> Value {
+    let it = Rc::new(RefCell::new(IterState::List(l.clone(), 0)));
+    LIST_ITERS.with(|iters| {
+        let mut iters = iters.borrow_mut();
+        // Those that ended (their register reused) are forgotten from time to time.
+        if iters.len() >= 32 {
+            iters.retain(|(_, w)| w.strong_count() > 0);
+        }
+        iters.push((Rc::as_ptr(l) as usize, Rc::downgrade(&it)));
+    });
+    Value::Iter(it)
+}
+
+/// To call before modifying list `l` (`<<`, `push`, `pop`, `xs[i] = v`): the loops
+/// that walk it copy what they have left, so they see it as it was.
+#[inline]
+pub(crate) fn before_list_write(l: &Rc<RefCell<Vec<Value>>>) {
+    LIST_ITERS.with(|iters| {
+        let Ok(mut iters) = iters.try_borrow_mut() else {
+            return;
+        };
+        if iters.is_empty() {
+            return;
+        }
+        let p = Rc::as_ptr(l) as usize;
+        if !iters.iter().any(|(q, _)| *q == p) {
+            return;
+        }
+        iters.retain(|(q, w)| {
+            if *q != p {
+                return w.strong_count() > 0;
+            }
+            if let Some(it) = w.upgrade()
+                && let Ok(mut st) = it.try_borrow_mut()
+                && let IterState::List(list, i) = &*st
+            {
+                let rest: Vec<Value> = list.borrow().get(*i..).unwrap_or_default().to_vec();
+                *st = IterState::Values(rest.into_iter());
+            }
+            false
+        });
+    });
 }
 
 const RED_ZONE: usize = 256 * 1024;
@@ -921,10 +978,7 @@ impl Runtime {
                             }
                         },
                         Fallback::None => {
-                            return rt_err(
-                                format!("`{}` is not defined", self.name(*name)),
-                                span,
-                            );
+                            return rt_err(format!("`{}` is not defined", self.name(*name)), span);
                         }
                     },
                 };
@@ -1168,8 +1222,10 @@ impl Runtime {
             }
             Instr::IterNew { dst, src, keys } => {
                 let v = reg!(*src).clone();
-                let it = self.iter_new(&v, *keys, span)?;
-                reg!(*dst) = Value::Iter(Rc::new(RefCell::new(it)));
+                reg!(*dst) = match &v {
+                    Value::List(l) => list_iter(l),
+                    _ => Value::Iter(Rc::new(RefCell::new(self.iter_new(&v, *keys, span)?))),
+                };
             }
             Instr::CaseTest(d, p, v) => {
                 let hit = match (&reg!(*p), &reg!(*v)) {
@@ -1216,7 +1272,10 @@ impl Runtime {
                         _ => {
                             let n = self.name(self.globals.at(p).name).to_string();
                             return type_err(
-                                format!("`{n}` is not the class `{}` was compiled with", self.name(t.name)),
+                                format!(
+                                    "`{n}` is not the class `{}` was compiled with",
+                                    self.name(t.name)
+                                ),
                                 span,
                             );
                         }
@@ -1447,7 +1506,9 @@ impl Runtime {
             spec = specialization(proto, regs)?;
             &spec
         } else if proto.untyped() {
-            spec = untyped_spec(proto, |k| proto.params.get(k).map(|p| &regs[p.reg as usize]))?;
+            spec = untyped_spec(proto, |k| {
+                proto.params.get(k).map(|p| &regs[p.reg as usize])
+            })?;
             if !fits_params(&spec, regs) {
                 return None;
             }
@@ -1531,10 +1592,7 @@ impl Runtime {
         match (&slot.value, slot.mutable) {
             (None, _) => {
                 let n = self.name(n).to_string();
-                rt_err(
-                    format!("`{n}` is not declared: use `let {n} = …`"),
-                    span,
-                )
+                rt_err(format!("`{n}` is not declared: use `let {n} = …`"), span)
             }
             (Some(_), false) => rt_err(
                 format!(
@@ -1598,6 +1656,7 @@ impl Runtime {
     fn set_index(&mut self, r: &Value, i: &Value, v: Value, span: Span) -> R<()> {
         match r {
             Value::List(l) => {
+                before_list_write(l);
                 let mut l = l.borrow_mut();
                 let pos = list_index(i, l.len(), span)?;
                 l[pos] = v;
@@ -2164,22 +2223,29 @@ fn specialization(proto: &Rc<Proto>, regs: &[Value]) -> Option<Rc<Proto>> {
 /// Copy of `proto` (parameters not annotated) typed by its arguments (`arg(k)`): simple
 /// values, strings, lists of simple values. `None` if one is of another type.
 #[cfg(feature = "jit")]
-fn untyped_spec<'a>(proto: &Rc<Proto>, arg: impl Fn(usize) -> Option<&'a Value>) -> Option<Rc<Proto>> {
+fn untyped_spec<'a>(
+    proto: &Rc<Proto>,
+    arg: impl Fn(usize) -> Option<&'a Value>,
+) -> Option<Rc<Proto>> {
     // A copy already made (no allocation on every call).
     let kind_fits = |v: &Value, t: &RtType| match (t, v) {
         (RtType::Int, Value::Int(_))
         | (RtType::Float, Value::Float(_))
         | (RtType::Bool, Value::Bool(_))
         | (RtType::Str, Value::Str(_)) => true,
-        (RtType::List(e), Value::List(l)) => {
-            l.borrow().first().is_some_and(|x| simple_ty(x).as_ref() == Some(&**e))
-        }
+        (RtType::List(e), Value::List(l)) => l
+            .borrow()
+            .first()
+            .is_some_and(|x| simple_ty(x).as_ref() == Some(&**e)),
         _ => false,
     };
     for (tys, p) in proto.specs.borrow().iter() {
-        let same = proto.params.iter().zip(tys).enumerate().all(|(k, (prm, t))| {
-            prm.ty.is_some() || arg(k).is_some_and(|v| kind_fits(v, t))
-        });
+        let same = proto
+            .params
+            .iter()
+            .zip(tys)
+            .enumerate()
+            .all(|(k, (prm, t))| prm.ty.is_some() || arg(k).is_some_and(|v| kind_fits(v, t)));
         if same {
             return Some(p.clone());
         }
@@ -2278,6 +2344,11 @@ pub(crate) fn iter_next(regs: &mut [Value], iter: Reg, dst: Reg) -> bool {
     let next = match &mut *it.borrow_mut() {
         IterState::Values(v) => v.next(),
         IterState::Range(r) => r.next().map(Value::Int),
+        IterState::List(l, i) => {
+            let v = l.borrow().get(*i).cloned();
+            *i += 1;
+            v
+        }
     };
     match next {
         Some(v) => {

@@ -85,10 +85,7 @@ impl Runtime {
             },
             Value::Object(_) | Value::Variant(..) => self.object_field(r, name, access, span),
             _ if self.methods.contains_key(&name) => rt_err(
-                format!(
-                    "`{n}` is a method: write `.{n}()`",
-                    n = self.name(name)
-                ),
+                format!("`{n}` is a method: write `.{n}()`", n = self.name(name)),
                 span,
             ),
             _ => type_err(
@@ -126,7 +123,8 @@ impl Runtime {
             }
             Value::Str(s) => {
                 let chars: Vec<char> = s.chars().collect();
-                Ok(pos(chars.len())?.map_or(Value::Nil, |p| Value::Str(chars[p].to_string().into())))
+                Ok(pos(chars.len())?
+                    .map_or(Value::Nil, |p| Value::Str(chars[p].to_string().into())))
             }
             Value::Tuple(t) => Ok(pos(t.len())?.map_or(Value::Nil, |p| t[p].clone())),
             _ => type_err(
@@ -187,10 +185,7 @@ impl Runtime {
                 match s.len().checked_mul(*n as usize) {
                     Some(len) if len <= MAX_ALLOC => Value::Str(s.repeat(*n as usize).into()),
                     _ => {
-                        return rt_err(
-                            format!("string too long: {} × {n} bytes", s.len()),
-                            span,
-                        );
+                        return rt_err(format!("string too long: {} × {n} bytes", s.len()), span);
                     }
                 }
             }
@@ -232,6 +227,7 @@ impl Runtime {
             }
 
             (Push, Value::List(list), _) => {
+                crate::vm::before_list_write(list);
                 list.borrow_mut().push(r.clone());
                 l.clone()
             }
@@ -315,11 +311,7 @@ impl Runtime {
         use Method as M;
         let Some(&(m, mname)) = self.methods.get(&name) else {
             return type_err(
-                format!(
-                    "{} has no method `{}`",
-                    recv.type_name(),
-                    self.name(name)
-                ),
+                format!("{} has no method `{}`", recv.type_name(), self.name(name)),
                 span,
             );
         };
@@ -490,11 +482,13 @@ impl Runtime {
             }
             (M::Push, Value::List(l)) => {
                 n(1)?;
+                crate::vm::before_list_write(l);
                 l.borrow_mut().push(args[0].clone());
                 Ok(recv.clone())
             }
             (M::Pop, Value::List(l)) => {
                 n(0)?;
+                crate::vm::before_list_write(l);
                 Ok(l.borrow_mut().pop().unwrap_or(Value::Nil))
             }
             (M::First, Value::List(l)) => {
@@ -777,10 +771,7 @@ fn iter_values(v: &Value, span: Span) -> R<Vec<Value>> {
         && r.len() > MAX_ALLOC / std::mem::size_of::<Value>()
     {
         return rt_err(
-            format!(
-                "range too large to turn into a list ({} elements)",
-                r.len()
-            ),
+            format!("range too large to turn into a list ({} elements)", r.len()),
             span,
         );
     }

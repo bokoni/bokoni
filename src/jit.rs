@@ -1030,6 +1030,7 @@ extern "C" fn bk_list_push(list: *const Value, bits: u64, kind: i32) -> i32 {
             return 1;
         };
         let v = from_bits(kind_of_code(kind), bits);
+        crate::vm::before_list_write(l);
         match l.try_borrow_mut() {
             Ok(mut l) => {
                 l.push(v);
@@ -1048,6 +1049,7 @@ extern "C" fn bk_list_set(list: *const Value, i: i64, bits: u64, kind: i32) -> i
         let Value::List(l) = &*list else {
             return 1;
         };
+        crate::vm::before_list_write(l);
         let Ok(mut l) = l.try_borrow_mut() else {
             return 1;
         };
@@ -1061,8 +1063,8 @@ extern "C" fn bk_list_set(list: *const Value, i: i64, bits: u64, kind: i32) -> i
     }
 }
 
-/// Copy of the list `src` into the slot `dst` (a `for` over a list that may change, as
-/// the interpreter does); `nil` if it is not a list.
+/// Copy of the list `src` into the slot `dst` (a `for` over a list that may change: it
+/// sees the list as it was, like the interpreter's); `nil` if it is not a list.
 extern "C" fn bk_list_snapshot(dst: *mut Value, src: *const Value) {
     // SAFETY: `dst` is a slot of the native frame, `src` a live value.
     unsafe {
