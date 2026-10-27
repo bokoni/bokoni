@@ -90,6 +90,8 @@ pub enum TokenKind {
     Semi,
     Pipe,
     Question,
+    /// `??`
+    QuestionQuestion,
     FatArrow,
 
     // Operators
@@ -131,6 +133,7 @@ impl TokenKind {
                 | LBrace
                 | AtLBracket
                 | FatArrow
+                | QuestionQuestion
                 | Eq
                 | EqEq
                 | NotEq
@@ -227,6 +230,7 @@ impl TokenKind {
             Semi => "`;`",
             Pipe => "`|`",
             Question => "`?`",
+            QuestionQuestion => "`??`",
             FatArrow => "`=>`",
             Eq => "`=`",
             EqEq => "`==`",
@@ -651,6 +655,7 @@ impl Lexer<'_> {
             (b',', _) => (Comma, 1),
             (b';', _) => (Semi, 1),
             (b'|', _) => (Pipe, 1),
+            (b'?', b'?') => (QuestionQuestion, 2),
             (b'?', _) => (Question, 1),
             (b'.', b'.') if self.peek_at(2) == b'.' => (DotDotDot, 3),
             (b'.', b'.') => (DotDot, 2),

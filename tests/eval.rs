@@ -170,6 +170,18 @@ fn control_flow() {
         "=> \"b\""
     );
     assert_eq!(run("unless false\n  1\nend"), "=> 1");
+    // `c ? a : b` (nested to the right), `a ?? b` (`b` only for `nil`, `a` evaluated
+    // once), next to the `?` variants.
+    assert_eq!(
+        run("let n = 0\n[n > 0 ? \"pos\" : n == 0 ? \"zero\" : \"neg\", true ?\n  1 : 2]"),
+        "=> [\"zero\", 1]"
+    );
+    assert_eq!(
+        run("let xs = [1]\nlet k = 0\ndef f(): int?\n  k += 1\n  nil\nend\n[xs[3]? ?? 9, xs[0]? ?? 9, false ?? 1, f() ?? 2, k, nil ?? 1 + 1, nil ?? 0 > 5, \"7\".to_i?() ?? 0]"),
+        "=> [9, 1, false, 2, 1, 2, false, 7]"
+    );
+    assert!(err("true ? 1").1.contains("between the two values of `? :`"));
+    assert!(err("let x: int = false ? 1 : \"a\"").1.contains("expected type `int`"));
     assert_eq!(run("let x = 5\nx = 0 if x > 3\nx"), "=> 0");
     assert_eq!(
         run(

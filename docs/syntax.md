@@ -253,6 +253,8 @@ else
 end
 
 let short = if ok then "yes" else "no" end
+let size = large ? "200Gi" : "20Gi"     # same, as an operator (`?` after a space)
+let sign = n < 0 ? "-" : n == 0 ? "0" : "+"
 
 let kind = case port
   when 80, 443 then "web"
@@ -364,8 +366,12 @@ handled.
 1e300.to_i?()                  # nil   (too large for an `int`)
 xs[10]?                        # nil when out of bounds (also for a `str`, a tuple)
 
-let port = s.to_i?() or 80
+let port = s.to_i?() ?? 80     # `a ?? b`: `b` only if `a` is `nil`
+let port = s.to_i?() or 80     # `or`: also replaces `false`
 ```
+
+`??` evaluates its left side once; it binds tighter than comparisons and looser than
+arithmetic (`n ?? 0 + 1` is `n ?? (0 + 1)`, `n ?? 0 > 5` is `(n ?? 0) > 5`).
 
 A wrong type is still an error (`xs["a"]?`). The other built-in methods already return
 `nil` when there is nothing to return: `first()`, `last()`, `pop()`, `min()`, `max()`,

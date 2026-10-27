@@ -275,6 +275,8 @@ impl Tracker {
 enum Infix {
     Bin(BinOp),
     Range(bool),
+    /// `a ?? b`
+    Coalesce,
 }
 
 /// Binding power of binary operators: (left, right).
@@ -284,6 +286,8 @@ fn infix_bp(kind: TokenKind) -> Option<(u8, u8, Infix)> {
     Some(match kind {
         T::Or => (2, 3, Bin(BinOp::Or)),
         T::And => (4, 5, Bin(BinOp::And)),
+        // Below arithmetic and ranges, above comparisons: `n ?? 0 > 5` compares.
+        T::QuestionQuestion => (9, 10, Coalesce),
         T::EqEq => (8, 9, Bin(BinOp::Eq)),
         T::NotEq => (8, 9, Bin(BinOp::Ne)),
         T::Lt => (8, 9, Bin(BinOp::Lt)),
@@ -1932,7 +1936,11 @@ impl Parser<'_, '_> {
 
     fn expr_inner(&mut self) -> Result<ExprId> {
         self.enter()?;
-        let lhs = self.binary(0)?;
+        let mut lhs = self.binary(0)?;
+        // `cond ? a : b` (a `?` attached to what precedes is `to_i?`, `xs[i]?`).
+        if self.at(T::Question) && self.tok().span.start > self.prev_end {
+            lhs = self.ternary(lhs)?;
+        }
         let e = match assign_op(self.peek()) {
             Some(op) => {
                 if !self.ast.is_assignable(lhs) {
@@ -1956,6 +1964,71 @@ impl Parser<'_, '_> {
         Ok(e)
     }
 
+    /// `cond ? a : b` after `cond`: an `if`.
+    fn ternary(&mut self, cond: ExprId) -> Result<ExprId> {
+        self.bump();
+        self.skip_newlines();
+        let a = self.expr()?;
+        self.expect(T::Colon, "between the two values of `? :`")?;
+        let b = self.expr()?;
+        let span = self.span(cond).to(self.span(b));
+        let (then, else_) = (
+            expr_block(a, self.span(a)),
+            Some(expr_block(b, self.span(b))),
+        );
+        Ok(self
+            .ast
+            .push_control(Control::If(If { cond, then, else_ }), span))
+    }
+
+    /// `a ?? b`: `b` if `a` is `nil` (evaluated once), otherwise `a`; as
+    /// `begin let t = a; if t == nil then b else t end end`.
+    fn coalesce(&mut self, a: ExprId, b: ExprId, span: Span) -> ExprId {
+        let t = self.interner.intern("#coalesced");
+        let (sa, sb) = (self.span(a), self.span(b));
+        let read = |p: &mut Self| p.mk(ExprKind::Ident(t), sa);
+        let lhs = read(self);
+        let nil = self.mk(ExprKind::Nil, sa);
+        let cond = self.mk(ExprKind::Binary(BinOp::Eq, lhs, nil), sa);
+        let other = read(self);
+        let test = self.ast.push_control(
+            Control::If(If {
+                cond,
+                then: expr_block(b, sb),
+                else_: Some(expr_block(other, sa)),
+            }),
+            span,
+        );
+        let body = Block {
+            span,
+            stmts: vec![
+                Stmt {
+                    kind: StmtKind::Let(Box::new(Let {
+                        pattern: Pattern::Name(t, sa),
+                        ty: None,
+                        value: a,
+                    })),
+                    span: sa,
+                    vis: Visibility::Public,
+                },
+                Stmt {
+                    kind: StmtKind::Expr(test),
+                    span,
+                    vis: Visibility::Public,
+                },
+            ],
+        };
+        self.ast.push_control(
+            Control::Begin(Begin {
+                body,
+                rescues: Vec::new(),
+                else_: None,
+                ensure: None,
+            }),
+            span,
+        )
+    }
+
     fn binary(&mut self, min_bp: u8) -> Result<ExprId> {
         // Nested prefix operators (`- - - x`): recursion that does not go through `expr`.
         stacker::maybe_grow(RED_ZONE, STACK_GROW, || self.binary_inner(min_bp))
@@ -1975,6 +2048,10 @@ impl Parser<'_, '_> {
             let rhs = self.binary(r_bp)?;
             let span = self.span(lhs).to(self.span(rhs));
             let node = match op {
+                Infix::Coalesce => {
+                    lhs = self.coalesce(lhs, rhs, span);
+                    continue;
+                }
                 Infix::Bin(op) => ExprKind::Binary(op, lhs, rhs),
                 Infix::Range(inclusive) => ExprKind::Range {
                     lo: lhs,
