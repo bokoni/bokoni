@@ -320,6 +320,10 @@ namespaces, `trait` for shared behavior.
       remembered and done by the interpreter in the new code (a call that turned out
       polymorphic, an inlined method redefined…); interpreted after 4 places; a
       redefinition of what the code depends on forgets them
+- [x] Functions and lambdas without annotations (lambdas without captured variables):
+      a copy per types of the arguments (`Proto::specialize_params`), like `forall`; a
+      result not annotated is any value (boxed in the caller's slot, a `Guard` reads
+      it)
 - [x] Strings in native code: `str` parameters, results, fields, list elements,
       literals (the function's constants, not copied), `+`, comparisons, interpolation
       of strings and simple values, `len()` — the interpreter's operations, called by

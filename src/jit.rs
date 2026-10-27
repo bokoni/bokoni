@@ -1,9 +1,9 @@
 //! Native compilation (JIT) with Cranelift.
 //!
-//! Compiled functions are those whose parameters and return are annotated `int`, `float`
-//! or `bool`, and whose body uses only arithmetic, comparisons, branches and calls to other
-//! compilable functions (recursion included). Everything else runs in the interpreter: same
-//! result, only slower.
+//! Compiled functions are those whose parameters are of known types: annotated, or found
+//! from the arguments of a call (a copy per types, for a parameter not annotated or a
+//! `forall` type parameter). What the body does that is not compiled is done by the
+//! interpreter; same result in every case, only slower.
 //!
 //! - The IR's `value` registers are typed by an analysis: the result of calling a `: int`
 //!   function is an `int`, and so on. If a register cannot be typed, the function is not
@@ -853,6 +853,18 @@ extern "C" fn bk_binary(
     }
 }
 
+/// A native value into the slot `out` (result of a function whose result is not
+/// annotated).
+extern "C" fn bk_box_into(out: *mut Value, bits: u64, kind: i32) {
+    // SAFETY: `out` is a value slot of the caller; for a reference, `bits` is a live value.
+    unsafe {
+        *out = match kind {
+            4 => Value::Nil,
+            k => from_bits(kind_of_code(k), bits),
+        };
+    }
+}
+
 /// Truthiness of a value (`if v`, `not v`).
 extern "C" fn bk_truthy(v: *const Value) -> i8 {
     // SAFETY: `v` is null or a live value.
@@ -1120,8 +1132,8 @@ pub struct Jit {
     list_fns: [FuncId; 3],
     /// `bk_str_add`, `bk_str_cmp`, `bk_str_len`, `bk_concat`.
     str_fns: [FuncId; 4],
-    /// `bk_call_boxed`, `bk_binary`, `bk_truthy`, `bk_global`.
-    boxed_fns: [FuncId; 4],
+    /// `bk_call_boxed`, `bk_binary`, `bk_truthy`, `bk_global`, `bk_box_into`.
+    boxed_fns: [FuncId; 5],
     /// Calls through the interpreter (addresses held by native code).
     #[allow(clippy::vec_box)]
     boxed_calls: Vec<Box<BoxedCall>>,
@@ -1216,11 +1228,20 @@ fn native_ty(rt: &RtType) -> Option<RegTy> {
     }
 }
 
+/// Native type of the result of `q`: its annotation, or any value (not annotated).
+fn ret_jty(anns: &mut Vec<RtType>, q: &Proto) -> JTy {
+    match &q.ret {
+        Some(t) => value_jty(anns, &t.ty),
+        None => JTy::Boxed,
+    }
+}
+
 /// Native signature of a function (parameters and return), otherwise `None`.
 /// For a method (not `init`): `self` first.
 fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
     let method = p.kind == ProtoKind::Method && !p.name.ends_with(".init");
-    if !(p.kind == ProtoKind::Function || method) || !p.captures.is_empty() || p.ncells != 0 {
+    let function = matches!(p.kind, ProtoKind::Function | ProtoKind::Lambda);
+    if !(function || method) || !p.captures.is_empty() || p.ncells != 0 {
         return None;
     }
     let mut params = Vec::new();
@@ -1233,7 +1254,12 @@ fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
         }
         params.push(native_ty(&prm.ty.as_ref()?.ty)?);
     }
-    Some((params, native_ty(&p.ret.as_ref()?.ty)?))
+    // Not annotated: any value (in the caller's slot).
+    let ret = match &p.ret {
+        Some(t) => native_ty(&t.ty)?,
+        None => RegTy::Value,
+    };
+    Some((params, ret))
 }
 
 /// Annotation of parameter `i`.
@@ -1752,7 +1778,7 @@ impl Analysis<'_> {
                         return None;
                     }
                 }
-                let ret = value_jty(&mut self.anns, &m.ret.as_ref()?.ty);
+                let ret = ret_jty(&mut self.anns, &m);
                 self.targets.insert(
                     ins as *const Instr as usize,
                     Target {
@@ -1871,6 +1897,30 @@ impl Analysis<'_> {
                 match g(*f)? {
                     JTy::Callee(slot) => {
                         let mut callee = global_proto(self.globals, slot)?;
+                        // Parameters not annotated: its copy for the types of the arguments.
+                        if callee.untyped() {
+                            let anns = &self.anns;
+                            let tys = (0..callee.params.len())
+                                .map(|k| match &callee.params[k].ty {
+                                    Some(t) => Some((*t.ty).clone()),
+                                    None if k < site.npos as usize => {
+                                        Some(match g(site.start + k as u32)? {
+                                            JTy::Int => RtType::Int,
+                                            JTy::Float => RtType::Float,
+                                            JTy::Bool => RtType::Bool,
+                                            JTy::Str => RtType::Str,
+                                            JTy::Obj(a) => anns[a as usize].clone(),
+                                            JTy::List(a) if elem_ok(&anns[a as usize]) => {
+                                                RtType::List(Box::new(anns[a as usize].clone()))
+                                            }
+                                            _ => return None,
+                                        })
+                                    }
+                                    None => None,
+                                })
+                                .collect::<Option<Vec<_>>>()?;
+                            callee = callee.specialize_params(&tys);
+                        }
                         if callee.is_generic() {
                             let anns = &self.anns;
                             let arg = |k: usize| {
@@ -1920,7 +1970,7 @@ impl Analysis<'_> {
                                 return None;
                             }
                         }
-                        value_jty(&mut self.anns, &callee.ret.as_ref()?.ty)
+                        ret_jty(&mut self.anns, &callee)
                     }
                     JTy::Ctor(slot) => {
                         let info = global_type(self.globals, slot)?;
@@ -1984,7 +2034,7 @@ fn analyze(
     for prm in &p.params {
         start[prm.reg as usize] = Lat::T(value_jty(&mut an.anns, &prm.ty.as_ref()?.ty));
     }
-    let ret_jty = value_jty(&mut an.anns, &p.ret.as_ref()?.ty);
+    let ret_jty = ret_jty(&mut an.anns, p);
     let nb = p.blocks.len();
     let mut entry: Vec<Option<Vec<Lat>>> = vec![None; nb];
     entry[0] = Some(start);
@@ -2033,6 +2083,21 @@ fn analyze(
                 Term::IfIntK { a, .. } => g(*a) == Some(JTy::Int),
                 Term::Return { reg, .. } => match ret {
                     RegTy::Float => num(*reg),
+                    // Not annotated: any value (boxed when returned).
+                    _ if ret_jty == JTy::Boxed => matches!(
+                        g(*reg),
+                        Some(
+                            JTy::Int
+                                | JTy::Float
+                                | JTy::Bool
+                                | JTy::Nil
+                                | JTy::Obj(_)
+                                | JTy::List(_)
+                                | JTy::Str
+                                | JTy::This
+                                | JTy::Boxed
+                        )
+                    ),
                     _ => g(*reg) == Some(ret_jty),
                 },
                 Term::IterNext { iter, dst, .. } => match g(*iter) {
@@ -2193,6 +2258,7 @@ impl Jit {
         builder.symbol("bk_binary", bk_binary as *const u8);
         builder.symbol("bk_truthy", bk_truthy as *const u8);
         builder.symbol("bk_global", bk_global as *const u8);
+        builder.symbol("bk_box_into", bk_box_into as *const u8);
         builder.symbol("bk_str_cmp", bk_str_cmp as *const u8);
         builder.symbol("bk_str_len", bk_str_len as *const u8);
         builder.symbol("bk_concat", bk_concat as *const u8);
@@ -2326,15 +2392,22 @@ impl Jit {
             ),
             ("bk_truthy", &[ptr][..], types::I8),
             ("bk_global", &[ptr, types::I32, ptr][..], types::I32),
+            (
+                "bk_box_into",
+                &[ptr, types::I64, types::I32][..],
+                types::INVALID,
+            ),
         ] {
             let mut sig = module.make_signature();
             for t in params {
                 sig.params.push(AbiParam::new(*t));
             }
-            sig.returns.push(AbiParam::new(ret));
+            if ret != types::INVALID {
+                sig.returns.push(AbiParam::new(ret));
+            }
             boxed_fns.push(module.declare_function(name, Linkage::Import, &sig).ok()?);
         }
-        let boxed_fns: [FuncId; 4] = boxed_fns.try_into().ok()?;
+        let boxed_fns: [FuncId; 5] = boxed_fns.try_into().ok()?;
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr));
         sig.params.push(AbiParam::new(ptr));
@@ -2583,7 +2656,7 @@ impl Jit {
             .declare_func_in_func(self.list_fn, &mut ctx.func);
         let [this_fields_fn, method_fn] = self.this_fns;
         let [push_fn, set_fn, snapshot_fn] = self.list_fns;
-        let [call_boxed_ref, binary_ref, truthy_ref, global_ref] = self
+        let [call_boxed_ref, binary_ref, truthy_ref, global_ref, box_ref] = self
             .boxed_fns
             .map(|f| self.module.declare_func_in_func(f, &mut ctx.func));
         let [str_add_ref, str_cmp_ref, str_len_ref, concat_ref] = self
@@ -4078,6 +4151,23 @@ impl Jit {
                     let c = bx.ins().icmp_imm_s(int_cc(*op), x, *k);
                     bx.ins()
                         .brif(c, blocks[*then as usize], &[], blocks[*else_ as usize], &[]);
+                }
+                // Result not annotated, of a simple type (or `nil`): a value in the slot.
+                Term::Return { reg, .. }
+                    if p.ret.is_none()
+                        && matches!(
+                            tyof!(*reg),
+                            Some(JTy::Int | JTy::Float | JTy::Bool | JTy::Nil)
+                        ) =>
+                {
+                    let out = out_param.ok_or(())?;
+                    let (bits, kind) = boxed_word!(bx, *reg);
+                    let k = bx.ins().iconst(types::I32, dkind_code(kind));
+                    bx.ins().call(box_ref, &[out, bits, k]);
+                    drop_slots!(bx);
+                    let ok = bx.ins().iconst(types::I32, 0);
+                    let zero = bx.ins().iconst(types::I64, 0);
+                    bx.ins().return_(&[ok, zero]);
                 }
                 Term::Return { reg, .. } => {
                     let mut v = bx.use_var(uvar!(*reg));

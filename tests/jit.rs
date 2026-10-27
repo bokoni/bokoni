@@ -84,11 +84,19 @@ fn programs_match_and_are_compiled() {
     for f in ["fib", "even", "odd", "collatz"] {
         assert!(e.is_native(f), "`{f}` should be compiled");
     }
-    // Not compiled: unannotated parameter, unannotated return, built-in function.
-    e.eval("def untyped(x) = x + 1\nuntyped(1)\ndef noret(x: int) = x\nnoret(1)\ndef pr(x: int): int\n  print(x)\n  x\nend").unwrap();
+    // Compiled too: an unannotated parameter (a copy per type of its argument), an
+    // unannotated return (any value), a built-in function (called through the
+    // interpreter).
+    e.set_output(|_| {});
+    e.eval("def untyped(x) = x + 1\nuntyped(1)\ndef noret(x: int) = x\nnoret(1)\ndef pr(x: int): int\n  print(x)\n  x\nend\npr(1)").unwrap();
     for f in ["untyped", "noret", "pr"] {
-        assert!(!e.is_native(f), "`{f}` should not be compiled");
+        assert!(e.is_native(f), "`{f}` should be compiled");
     }
+    // One copy per type; the same results and errors.
+    same(
+        "def u(x) = x + 1\ndef run(n: int): float\n  let t = 0.0\n  for i in 0...n\n    t += u(i) + u(i * 0.5)\n  end\n  t\nend\n[u(1), u(1.5), run(10)]",
+    );
+    same("def u(x) = x + 1\nu(\"a\")");
 }
 
 #[test]

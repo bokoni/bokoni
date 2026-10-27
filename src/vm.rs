@@ -1376,6 +1376,17 @@ impl Runtime {
         args: &[Value],
         span: Span,
     ) -> Option<R> {
+        if !self.jit_enabled {
+            return None;
+        }
+        // Parameters not annotated: the copy for these arguments.
+        let spec;
+        let proto = if proto.untyped() {
+            spec = untyped_spec(proto, |k| args.get(k))?;
+            &spec
+        } else {
+            proto
+        };
         // Not borrowed during the call: a resumption may mark it interpreted.
         let (entry, n, ret) = {
             let state = proto.jit.borrow();
@@ -1434,6 +1445,12 @@ impl Runtime {
         let spec;
         let proto = if proto.is_generic() {
             spec = specialization(proto, regs)?;
+            &spec
+        } else if proto.untyped() {
+            spec = untyped_spec(proto, |k| proto.params.get(k).map(|p| &regs[p.reg as usize]))?;
+            if !fits_params(&spec, regs) {
+                return None;
+            }
             &spec
         } else if method && !proto.class_params.is_empty() {
             let args: Vec<Value> = proto
@@ -2144,6 +2161,45 @@ fn specialization(proto: &Rc<Proto>, regs: &[Value]) -> Option<Rc<Proto>> {
     fits_params(&spec, regs).then_some(spec)
 }
 
+/// Copy of `proto` (parameters not annotated) typed by its arguments (`arg(k)`): simple
+/// values, strings, lists of simple values. `None` if one is of another type.
+#[cfg(feature = "jit")]
+fn untyped_spec<'a>(proto: &Rc<Proto>, arg: impl Fn(usize) -> Option<&'a Value>) -> Option<Rc<Proto>> {
+    // A copy already made (no allocation on every call).
+    let kind_fits = |v: &Value, t: &RtType| match (t, v) {
+        (RtType::Int, Value::Int(_))
+        | (RtType::Float, Value::Float(_))
+        | (RtType::Bool, Value::Bool(_))
+        | (RtType::Str, Value::Str(_)) => true,
+        (RtType::List(e), Value::List(l)) => {
+            l.borrow().first().is_some_and(|x| simple_ty(x).as_ref() == Some(&**e))
+        }
+        _ => false,
+    };
+    for (tys, p) in proto.specs.borrow().iter() {
+        let same = proto.params.iter().zip(tys).enumerate().all(|(k, (prm, t))| {
+            prm.ty.is_some() || arg(k).is_some_and(|v| kind_fits(v, t))
+        });
+        if same {
+            return Some(p.clone());
+        }
+    }
+    let tys = proto
+        .params
+        .iter()
+        .enumerate()
+        .map(|(k, p)| match &p.ty {
+            Some(t) => Some((*t.ty).clone()),
+            None => match arg(k)? {
+                Value::Str(_) => Some(RtType::Str),
+                Value::List(l) => Some(RtType::List(Box::new(simple_ty(l.borrow().first()?)?))),
+                v => simple_ty(v),
+            },
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(proto.specialize_params(&tys))
+}
+
 /// The arguments in `regs` are exactly of the types of the parameters of typed copy
 /// `spec` (`int` for an `int`, a list of `int` for an `[int]`…).
 #[cfg(feature = "jit")]
@@ -2154,7 +2210,7 @@ fn fits_params(spec: &Proto, regs: &[Value]) -> bool {
             | (RtType::Float, Value::Float(_))
             | (RtType::Bool, Value::Bool(_)) => true,
             (RtType::List(e), Value::List(l)) => l.borrow().iter().all(|x| fits(x, e)),
-            (RtType::Any, _) => true,
+            (RtType::Str, Value::Str(_)) | (RtType::Any, _) => true,
             _ => false,
         }
     }

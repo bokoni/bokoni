@@ -624,6 +624,47 @@ impl Proto {
         self.kind == ProtoKind::Function && self.decl.as_ref().is_some_and(|d| !d.forall.is_empty())
     }
 
+    /// Function or lambda (without captured variables) with parameters not annotated: the
+    /// typed JIT compiles a copy per types of its arguments (`specialize_params`).
+    pub fn untyped(&self) -> bool {
+        matches!(self.kind, ProtoKind::Function | ProtoKind::Lambda)
+            && self.spec.is_none()
+            && self.captures.is_empty()
+            && self.ncells == 0
+            && !self.is_generic()
+            && self.params.iter().any(|p| p.ty.is_none())
+    }
+
+    /// Copy of this function with its parameters not annotated typed `tys` (one per
+    /// parameter; the annotated ones keep theirs), created once per `tys`.
+    pub fn specialize_params(self: &Rc<Self>, tys: &[RtType]) -> Rc<Proto> {
+        if let Some((_, p)) = self.specs.borrow().iter().find(|(k, _)| k == tys) {
+            return p.clone();
+        }
+        let p = self.copy_with(
+            |k, prm| match &prm.ty {
+                Some(t) => Some(t.clone()),
+                None => Some(TypeRef {
+                    ty: Rc::new(tys[k].clone()),
+                    shown: "any".into(),
+                    span: prm.span,
+                    expr: Rc::new(TypeExpr {
+                        kind: crate::ast::TypeKind::Named(Vec::new()),
+                        span: prm.span,
+                    }),
+                }),
+            },
+            |t| t.clone(),
+            Spec {
+                names: Vec::new(),
+                tys: tys.to_vec(),
+                origin: Rc::downgrade(self),
+            },
+        );
+        self.specs.borrow_mut().push((tys.to_vec(), p.clone()));
+        p
+    }
+
     /// Type arguments of this `forall` function for a call, each found from a parameter
     /// written `T` or `[T]` (`arg(k)`: type of argument `k`); `None` if one is unknown.
     pub fn type_args(&self, arg: &dyn Fn(usize) -> Option<RtType>) -> Option<Vec<RtType>> {
@@ -673,19 +714,41 @@ impl Proto {
             ty: Rc::new(subst_rt(&t.expr, &t.ty, names, tys)),
             ..t.clone()
         };
-        let p = Rc::new(Proto {
+        let p = self.copy_with(
+            |_, prm| prm.ty.as_ref().map(sub),
+            sub,
+            Spec {
+                names: names.to_vec(),
+                tys: tys.to_vec(),
+                origin: Rc::downgrade(self),
+            },
+        );
+        self.specs.borrow_mut().push((tys.to_vec(), p.clone()));
+        p
+    }
+
+    /// Copy of this function (same code) with the annotations of its parameters given by
+    /// `param`, the others (return, body) by `ann`.
+    fn copy_with(
+        &self,
+        param: impl Fn(usize, &ParamProto) -> Option<TypeRef>,
+        ann: impl Fn(&TypeRef) -> TypeRef,
+        spec: Spec,
+    ) -> Rc<Proto> {
+        Rc::new(Proto {
             name: self.name.clone(),
             script: self.script.clone(),
             kind: self.kind,
             params: self
                 .params
                 .iter()
-                .map(|p| ParamProto {
-                    ty: p.ty.as_ref().map(sub),
+                .enumerate()
+                .map(|(k, p)| ParamProto {
+                    ty: param(k, p),
                     ..p.clone()
                 })
                 .collect(),
-            ret: self.ret.as_ref().map(sub),
+            ret: self.ret.as_ref().map(&ann),
             regs: self.regs.clone(),
             ncells: self.ncells,
             captures: self.captures.clone(),
@@ -693,7 +756,7 @@ impl Proto {
             consts: self.consts.clone(),
             calls: self.calls.clone(),
             shapes: self.shapes.clone(),
-            types: self.types.iter().map(sub).collect(),
+            types: self.types.iter().map(&ann).collect(),
             records: self.records.clone(),
             children: self.children.clone(),
             decls: self.decls.clone(),
@@ -710,14 +773,8 @@ impl Proto {
             specs: Default::default(),
             class_params: self.class_params.clone(),
             deopted: Default::default(),
-            spec: Some(Rc::new(Spec {
-                names: names.to_vec(),
-                tys: tys.to_vec(),
-                origin: Rc::downgrade(self),
-            })),
-        });
-        self.specs.borrow_mut().push((tys.to_vec(), p.clone()));
-        p
+            spec: Some(Rc::new(spec)),
+        })
     }
 
     /// Readable text of the IR (and of its nested functions).
