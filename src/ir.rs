@@ -101,6 +101,8 @@ pub struct Proto {
     /// Instructions (block, index) where its native code resumed in the interpreter:
     /// done by the interpreter when it is recompiled.
     pub deopted: std::cell::RefCell<Vec<(u32, u32)>>,
+    /// A loop of the main program, outlined (`outline.rs`): not shown in call stacks.
+    pub outlined: bool,
 }
 
 /// Type parameters of a typed copy of a function, and their types.
@@ -774,6 +776,7 @@ impl Proto {
             class_params: self.class_params.clone(),
             deopted: Default::default(),
             spec: Some(Rc::new(spec)),
+            outlined: self.outlined,
         })
     }
 

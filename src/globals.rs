@@ -20,7 +20,9 @@ pub struct GlobalSlot {
 
 #[derive(Default)]
 pub struct Globals {
-    slots: Vec<GlobalSlot>,
+    /// Boxed: a slot does not move (native code reads and writes it by its address).
+    #[allow(clippy::vec_box)]
+    slots: Vec<Box<GlobalSlot>>,
     index: FxHashMap<Symbol, u32>,
     /// Declared modules, by qualified name (`Http`, `Http::Client`): their members are
     /// the globals `Http::name`.
@@ -36,12 +38,12 @@ impl Globals {
             return i;
         }
         let i = self.slots.len() as u32;
-        self.slots.push(GlobalSlot {
+        self.slots.push(Box::new(GlobalSlot {
             name,
             value: None,
             mutable: true,
             watchers: Vec::new(),
-        });
+        }));
         self.index.insert(name, i);
         i
     }
@@ -89,6 +91,20 @@ impl Globals {
     #[inline]
     pub fn at(&self, i: u32) -> &GlobalSlot {
         &self.slots[i as usize]
+    }
+
+    /// Number of slots.
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Address of slot `i`: it does not change.
+    pub(crate) fn slot_ptr(&self, i: u32) -> *const GlobalSlot {
+        &*self.slots[i as usize]
     }
 
     pub fn get(&self, name: Symbol) -> Option<Value> {

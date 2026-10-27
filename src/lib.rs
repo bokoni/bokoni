@@ -23,6 +23,7 @@ pub mod lexer;
 pub mod macros;
 pub mod objects;
 pub mod ops;
+pub mod outline;
 pub mod parser;
 pub mod printer;
 pub mod reflect;

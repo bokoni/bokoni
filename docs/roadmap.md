@@ -348,6 +348,20 @@ namespaces, `trait` for shared behavior.
 - [x] Macros kept by the engine: usable by later scripts and by the files that
       `require` the one declaring them
 
+### v0.17 — Main program in native code
+
+- [x] `for` over a list without copying it (copied lazily, only if modified during the
+      loop): a loop over 10^6 elements, peak memory 78 MB → 32 MB
+- [x] Loops of the main program outlined into hidden functions (`outline.rs`): the
+      registers read from before the loop are their parameters, compiled like any
+      function typed for its arguments; not shown in call stacks
+- [x] Globals in native code: a global of a simple type read and written in place (its
+      tag checked, otherwise resumed in the interpreter; slots no longer move), an object
+      global of the class of its value (its methods called directly, the class checked on
+      every read); `global = v` the interpreter's assignment otherwise. A top-level loop
+      summing into a global: 0.25 s → 0.03 s (same as in a function); a method called on a
+      global object in a loop: ×2 to ×14
+
 ### Next
 
 - Macros: calls without parentheses, named arguments.
@@ -355,7 +369,6 @@ namespaces, `trait` for shared behavior.
 No design decision needed:
 
 - Free local functions that capture themselves (reference cycle).
-- Typed registers for globals, not only locals.
 
 ## Decisions that commit the JIT
 
@@ -412,4 +425,6 @@ optimizations (on-demand lexer, interning of short names) only brought a few %.
 - A `for` loop over a list does not copy it: the loop copies what it has left only when
   the list is modified (`<<`, `push`, `pop`, `xs[i] = v`) while it walks it. A list
   modified from Rust (`Value::List`) during a loop is seen modified.
-- A typed register is only used for a local variable; globals (top level) stay dynamic.
+- Globals are typed in native code (by their value, checked on every read) only in the
+  loops of the main program and the functions compiled natively; the interpreter keeps
+  them dynamic. A global list read in native code is any value.

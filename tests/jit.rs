@@ -1075,3 +1075,45 @@ end
         "[[1, 2, 3], [1, 2, 30, 10], 36, [11, 12, 21, 22, 20], [0, 6, 7, 8], 10, 5]"
     );
 }
+
+#[test]
+fn loops_of_the_main_program() {
+    // Outlined into functions compiled natively, globals read in place: same results.
+    for src in [
+        "let t = 0\nfor i in 0...1000\n  t += i % 7\nend\nt",
+        // A global that changes type during the loop (resumed in the interpreter).
+        "let t = 0\nfor i in 0...100\n  t += 1\n  t = 0.5 if i == 50\nend\nt",
+        "let t = 0\nlet s = \"\"\nfor i in 0...20\n  if i == 10\n    t = \"x\"\n  end\n  s = \"#{t}\"\nend\n[t, s]",
+        // `break`, `next`, nested loops, `while`, a list, a register read after.
+        "let n = 0\nlet k = 0\nwhile k < 50\n  k += 1\n  next if k % 3 == 0\n  for j in 0..k\n    n += j\n    break if j > 5\n  end\nend\n[n, k]",
+        "let xs = [3, 1, 2]\nlet t = 0\nfor x in xs\n  t = t * 10 + x\nend\nt",
+        "print(\"a\")\nlet t = 1.5\nfor i in 0...10\n  t = t * 2.0\nend\nprint(t)\nt",
+        "let flag = false\nlet c = 0\nfor i in 0...10\n  flag = not flag\n  c += 1 if flag\nend\n[flag, c]",
+        "def f(x: int): int = x * 2\nlet t = 0\nfor i in 0...100\n  t += f(i)\nend\nt",
+        "let t = 0\nlet r = [for i in 0...3\n  t += i\nend, t]\nr",
+        // Errors: the global is up to date, the call stack is the main program's.
+        "let t = 0\nfor i in 0...10\n  t += 100 / (5 - i)\nend",
+        "def g(x) = x.nope()\nlet t = 0\nfor i in 0...10\n  t += 1\n  g(i) if i == 3\nend",
+        "const K = 1\nfor i in 0...3\n  K = i\nend",
+        "let t = 9223372036854775800\nfor i in 0...100\n  t += 1\nend",
+        // Objects: their methods called directly, the class checked on every read.
+        "class A\n  def init(@n: int)\n  end\n  def add(k: int): int\n    @n += k\n    @n\n  end\nend\nclass B < A\n  def add(k: int): int = 0\nend\nlet a = A(0)\nlet t = 0\nfor i in 0...100\n  t += a.add(i)\n  a = B(1) if i == 60\nend\n[t, a.add(1)]",
+        "class Acc(T)\n  def init(@sum: T)\n  end\n  def add(x: T): T\n    @sum = @sum + x\n    @sum\n  end\nend\nlet a = Acc(0.0)\nfor i in 0...100\n  a.add(i * 0.5)\nend\na.add(0.0)",
+    ] {
+        same(src);
+    }
+    // After an error, the global has the last value assigned.
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    assert!(
+        e.eval("let t = 0\nfor i in 0...10\n  t += 1\n  t = t / (5 - i)\nend")
+            .is_err()
+    );
+    assert_eq!(e.eval_as::<i64>("t").unwrap(), 2);
+    e.eval("let u = 0\nfor i in 0...100000\n  u += i\nend")
+        .unwrap();
+    assert_eq!(e.eval_as::<i64>("u").unwrap(), 4999950000);
+    // A global of a previous script.
+    e.eval("for i in 0...10\n  u -= i\nend").unwrap();
+    assert_eq!(e.eval_as::<i64>("u").unwrap(), 4999949955);
+}

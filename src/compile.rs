@@ -17,8 +17,8 @@ use crate::globals::Globals;
 use crate::intern::{FxBuild, FxHashMap, Interner, Symbol};
 use crate::ir::{
     Access, AnnotationIr, Annotations, Block as IrBlock, BlockId, CallSite, Capture, Decl,
-    EnumDeclIr, Fallback, FieldIr, Generics, Handler, Instr, ParamProto, Proto, ProtoKind, Reg, RegTy,
-    RtType, Script, Shape, Term, TypeDeclIr, TypeRef,
+    EnumDeclIr, Fallback, FieldIr, Generics, Handler, Instr, ParamProto, Proto, ProtoKind, Reg,
+    RegTy, RtType, Script, Shape, Term, TypeDeclIr, TypeRef,
 };
 use crate::span::Span;
 use crate::value::Value;
@@ -734,6 +734,7 @@ impl Compiler<'_> {
             class_params: f.class_params,
             spec: None,
             deopted: Default::default(),
+            outlined: false,
         })
     }
 
@@ -949,7 +950,12 @@ impl Compiler<'_> {
 
     /// Enclosing modules, innermost first.
     fn modules(&self) -> Vec<Symbol> {
-        self.fns[0].scopes.iter().rev().filter_map(|s| s.module).collect()
+        self.fns[0]
+            .scopes
+            .iter()
+            .rev()
+            .filter_map(|s| s.module)
+            .collect()
     }
 
     /// Module named by a path written here (`Http`, `Http::Client`): looked up in the
@@ -2992,10 +2998,7 @@ impl Compiler<'_> {
     fn self_value(&mut self, span: Span) -> Op {
         match self.resolve(SELF) {
             Some(_) => self.read_var(SELF, span),
-            None => self.fail(
-                "`self` and `@field` can only be used inside a method",
-                span,
-            ),
+            None => self.fail("`self` and `@field` can only be used inside a method", span),
         }
     }
 
@@ -3025,10 +3028,7 @@ impl Compiler<'_> {
                 }
             },
             None => {
-                self.fail(
-                    "`self` and `@field` can only be used inside a method",
-                    span,
-                );
+                self.fail("`self` and `@field` can only be used inside a method", span);
                 None
             }
         }

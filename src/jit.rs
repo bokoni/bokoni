@@ -42,6 +42,10 @@
 //!   checked on entry.
 //! - The interpreter calls native code directly (`Runtime::native_fast`) when the
 //!   arguments are exactly of its native types.
+//! - Globals: one of a simple type is read and written in place (its slot does not move;
+//!   its tag checked on every read, otherwise resumed in the interpreter), an object one
+//!   is of the class of its value at compile time (checked on every read). The loops of
+//!   the main program are outlined into functions (`outline.rs`) to be compiled.
 //!
 //! Internal calling convention: `fn(ctx, params…) -> (status, result)`, status 0 = success,
 //! 1 = error (described in `ctx`). Each function also has an entry point for Rust:
@@ -853,6 +857,67 @@ extern "C" fn bk_binary(
     }
 }
 
+/// Offsets in a `GlobalSlot` of its value and of its `mutable` flag.
+const GSLOT_VALUE: i32 = std::mem::offset_of!(crate::globals::GlobalSlot, value) as i32;
+const GSLOT_MUT: i32 = std::mem::offset_of!(crate::globals::GlobalSlot, mutable) as i32;
+
+/// Can native code read a global's `Option<Value>` as a `Value` (and `None` as a tag
+/// that owns something, never taken for a simple value)?
+fn inline_globals_ok() -> bool {
+    use crate::value::layout::{FIRST_HEAP_TAG, TAG_INT};
+    let tag = |v: &Option<Value>| unsafe { *(v as *const Option<Value> as *const u8) };
+    std::mem::size_of::<Option<Value>>() == std::mem::size_of::<Value>()
+        && tag(&Some(Value::Int(3))) == TAG_INT
+        && tag(&None) >= FIRST_HEAP_TAG
+        && std::mem::size_of::<bool>() == 1
+}
+
+/// Payload of global `slot` into `out` if its value has tag `tag` (`int`, `float`,
+/// `bool`): 0, otherwise 1 (resumed in the interpreter).
+extern "C" fn bk_global_word(ctx: *mut JitCtx, slot: u32, tag: i32, out: *mut u64) -> i32 {
+    // SAFETY: `out` is a word slot of the native frame; `ctx.rt` is valid.
+    unsafe {
+        let w = match (&(*(*ctx).rt).globals.at(slot).value, tag as u8) {
+            (Some(Value::Int(n)), TAG_INT) => *n as u64,
+            (Some(Value::Float(f)), TAG_FLOAT) => f.to_bits(),
+            (Some(Value::Bool(b)), TAG_BOOL) => *b as u64,
+            _ => return 1,
+        };
+        *out = w;
+        0
+    }
+}
+
+/// 1 if `v` is an object of class `info` (exactly), otherwise 0.
+extern "C" fn bk_obj_is(v: *const Value, info: *const crate::objects::TypeInfo) -> i32 {
+    // SAFETY: `v` is a slot of the native frame; `info` is kept alive by the JIT.
+    unsafe {
+        match &*v {
+            Value::Object(o) => o.try_borrow().is_ok_and(|o| Rc::as_ptr(&o.info) == info) as i32,
+            _ => 0,
+        }
+    }
+}
+
+/// `global = value` (the interpreter's assignment, its checks): 0, or 1 (its error,
+/// `JitCtx::pending`).
+extern "C" fn bk_assign_global(ctx: *mut JitCtx, slot: u32, w: u64, kind: i32, span: u64) -> i32 {
+    // SAFETY: the word is a value written by native code (`word_value`).
+    unsafe {
+        let rt = (*ctx).rt;
+        let v = word_value(rt, dkind_of_code(kind), w);
+        let span = Span::new(span as u32, (span >> 32) as u32);
+        match (*rt).set_global(slot, v, span) {
+            Ok(()) => 0,
+            Err(e) => {
+                (*ctx).pending = Some(e);
+                (*ctx).err = PENDING;
+                1
+            }
+        }
+    }
+}
+
 /// A native value into the slot `out` (result of a function whose result is not
 /// annotated).
 extern "C" fn bk_box_into(out: *mut Value, bits: u64, kind: i32) {
@@ -1147,6 +1212,9 @@ struct Compiled {
 
 pub struct Jit {
     module: JITModule,
+    /// `Option<Value>` has the layout of a `Value` (`None` has a tag of a value that owns
+    /// something): native code reads and writes globals of simple types in place.
+    inline_globals: bool,
     /// Allocated once (`Box::into_raw`), freed by `drop`: native code and resumptions
     /// in the interpreter reach it by its address.
     ctx: *mut JitCtx,
@@ -1171,7 +1239,7 @@ pub struct Jit {
     str_fns: [FuncId; 4],
     /// `bk_call_boxed`, `bk_binary`, `bk_truthy`, `bk_global`, `bk_box_into`,
     /// `bk_new_object`, `bk_init_done`.
-    boxed_fns: [FuncId; 7],
+    boxed_fns: [FuncId; 10],
     /// Calls through the interpreter (addresses held by native code).
     #[allow(clippy::vec_box)]
     boxed_calls: Vec<Box<BoxedCall>>,
@@ -1485,6 +1553,9 @@ struct Plan {
     /// Classes constructed natively (key: address of the `Call`): an object, then its
     /// `init` (the target) called directly.
     news: FxHashMap<usize, Rc<crate::objects::TypeInfo>>,
+    /// Globals read as objects of the class of their value at compile time (key: address
+    /// of the `GetGlobal`): that class, checked on every read.
+    global_objs: FxHashMap<usize, Rc<crate::objects::TypeInfo>>,
 }
 
 /// Type of an element of type `anns[a]`.
@@ -1510,6 +1581,7 @@ struct Analysis<'a> {
     /// See `Plan::news`. (key: address of the `Call`): an object, then its
     /// `init` (the target) called directly.
     news: FxHashMap<usize, Rc<crate::objects::TypeInfo>>,
+    global_objs: FxHashMap<usize, Rc<crate::objects::TypeInfo>>,
 }
 
 /// Function compiled and called directly; for a method, the type of `self` it is
@@ -1564,7 +1636,9 @@ impl Analysis<'_> {
     /// An instruction not compiled natively, done by the interpreter: calls (a function
     /// not compiled, a built-in, any method) and operations on their results
     /// (`JTy::Boxed`). `None`: not even that.
-    fn boxed(&mut self, ins: &Instr, cur: &[Lat]) -> Option<Option<JTy>> {
+    /// `forced`: resumed in the interpreter there before (a global read is not typed
+    /// by its value then).
+    fn boxed(&mut self, ins: &Instr, cur: &[Lat], forced: bool) -> Option<Option<JTy>> {
         use Instr::*;
         let g = |r: Reg| cur[r as usize].get();
         // Native values rebuilt as interpreter values.
@@ -1619,16 +1693,65 @@ impl Analysis<'_> {
             }
             Guard(_, a, t) if g(*a)? == JTy::Boxed => jty(*t),
             Not(_, a) if g(*a)? == JTy::Boxed => JTy::Bool,
-            // A global: a function called (its value read when calling), or a value.
+            // A global: a function called (its value read when calling), or a value: of
+            // the simple type of its current value (checked on every read), or any.
             GetGlobal(_, slot) => match &self.globals.at(*slot).value {
                 Some(Value::Function(_)) => return Some(Some(JTy::Callee(*slot))),
                 Some(Value::Type(_)) => return Some(Some(JTy::Ctor(*slot))),
+                Some(Value::Int(_)) if !forced => JTy::Int,
+                Some(Value::Float(_)) if !forced => JTy::Float,
+                Some(Value::Bool(_)) if !forced => JTy::Bool,
+                // An object: of the class of its value (its methods called directly).
+                Some(Value::Object(o)) if !forced => match self.global_obj(o) {
+                    Some((t, info)) => {
+                        self.global_objs.insert(ins as *const Instr as usize, info);
+                        t
+                    }
+                    None => JTy::Boxed,
+                },
                 _ => JTy::Boxed,
             },
+            SetGlobal(_, a) if word(g(*a)?) => return Some(None),
             _ => return None,
         };
         self.boxed.insert(ins as *const Instr as usize);
         Some(Some(t))
+    }
+
+    /// Type of object `o` read from a global: its class (the global slot that declares
+    /// it), with type arguments found from its fields (`Acc(T)`, `@sum: T` a `float`).
+    fn global_obj(
+        &mut self,
+        o: &Rc<std::cell::RefCell<crate::objects::Object>>,
+    ) -> Option<(JTy, Rc<crate::objects::TypeInfo>)> {
+        let o = o.borrow();
+        let info = o.info.clone();
+        let slot = (0..self.globals.len() as u32).find(
+            |&s| matches!(&self.globals.at(s).value, Some(Value::Type(t)) if Rc::ptr_eq(t, &info)),
+        )?;
+        let args: Vec<RtType> = match &info.generics {
+            Some(g) if !g.params.is_empty() => g
+                .params
+                .iter()
+                .map(|tp| {
+                    let (_, v) = info.fields.iter().zip(&o.fields).find(|(f, _)| {
+                        f.ty.as_ref().is_some_and(|t| {
+                            matches!(&t.expr.kind, crate::ast::TypeKind::Named(p) if p[..] == [tp.name])
+                        })
+                    })?;
+                    match v {
+                        Value::Int(_) => Some(RtType::Int),
+                        Value::Float(_) => Some(RtType::Float),
+                        Value::Bool(_) => Some(RtType::Bool),
+                        _ => None,
+                    }
+                })
+                .collect::<Option<_>>()
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let ann = RtType::Named(slot, self.globals.at(slot).name, args.into());
+        Some((value_jty(&mut self.anns, &ann), info))
     }
 
     fn sig_of(&self, slot: u32) -> Option<(Vec<RegTy>, RegTy)> {
@@ -2118,6 +2241,7 @@ fn analyze(
         targets: FxHashMap::default(),
         boxed: Default::default(),
         news: FxHashMap::default(),
+        global_objs: FxHashMap::default(),
         this: this.clone(),
     };
     // Typed IR registers: their type does not change.
@@ -2156,7 +2280,7 @@ fn analyze(
                 let t = match native {
                     Some(t) => t,
                     // Not compiled natively: done by the interpreter, if possible.
-                    None => an.boxed(ins, &cur)?,
+                    None => an.boxed(ins, &cur, forced)?,
                 };
                 let d = reads_writes(p, ins)?.1;
                 if let (Some(d), Some(t)) = (d, t) {
@@ -2245,6 +2369,7 @@ fn analyze(
         ctors: an.ctors,
         boxed: an.boxed,
         news: an.news,
+        global_objs: an.global_objs,
         anns: an.anns,
         targets: an.targets,
         this,
@@ -2269,6 +2394,7 @@ fn reads_writes(p: &Proto, ins: &Instr) -> Option<(Vec<Reg>, Option<Reg>)> {
             (vec![*a, *b], Some(*d))
         }
         IterNew { dst, src, .. } => (vec![*src], Some(*dst)),
+        SetGlobal(_, a) => (vec![*a], None),
         List(d, start, n) => ((*start..*start + *n).collect(), Some(*d)),
         FieldAt(d, a, _) => (vec![*a], Some(*d)),
         SetFieldAt { obj, src, .. } => (vec![*obj, *src], None),
@@ -2358,6 +2484,9 @@ impl Jit {
         builder.symbol("bk_binary", bk_binary as *const u8);
         builder.symbol("bk_truthy", bk_truthy as *const u8);
         builder.symbol("bk_global", bk_global as *const u8);
+        builder.symbol("bk_global_word", bk_global_word as *const u8);
+        builder.symbol("bk_obj_is", bk_obj_is as *const u8);
+        builder.symbol("bk_assign_global", bk_assign_global as *const u8);
         builder.symbol("bk_box_into", bk_box_into as *const u8);
         builder.symbol("bk_new_object", bk_new_object as *const u8);
         builder.symbol("bk_init_done", bk_init_done as *const u8);
@@ -2501,6 +2630,17 @@ impl Jit {
             ),
             ("bk_new_object", &[ptr, ptr][..], types::INVALID),
             ("bk_init_done", &[ptr, ptr, types::I64][..], types::I32),
+            (
+                "bk_global_word",
+                &[ptr, types::I32, types::I32, ptr][..],
+                types::I32,
+            ),
+            ("bk_obj_is", &[ptr, ptr][..], types::I32),
+            (
+                "bk_assign_global",
+                &[ptr, types::I32, types::I64, types::I32, types::I64][..],
+                types::I32,
+            ),
         ] {
             let mut sig = module.make_signature();
             for t in params {
@@ -2511,7 +2651,7 @@ impl Jit {
             }
             boxed_fns.push(module.declare_function(name, Linkage::Import, &sig).ok()?);
         }
-        let boxed_fns: [FuncId; 7] = boxed_fns.try_into().ok()?;
+        let boxed_fns: [FuncId; 10] = boxed_fns.try_into().ok()?;
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr));
         sig.params.push(AbiParam::new(ptr));
@@ -2540,6 +2680,7 @@ impl Jit {
         let mem_fns: [FuncId; 4] = mem.try_into().ok()?;
         Some(Jit {
             module,
+            inline_globals: inline_globals_ok(),
             ctx: Box::into_raw(Box::new(JitCtx {
                 depth: 0,
                 max_depth: 0,
@@ -2768,6 +2909,9 @@ impl Jit {
             box_ref,
             new_ref,
             init_done_ref,
+            global_word_ref,
+            obj_is_ref,
+            set_global_ref,
         ] = self
             .boxed_fns
             .map(|f| self.module.declare_func_in_func(f, &mut ctx.func));
@@ -2864,7 +3008,11 @@ impl Jit {
             called
                 || matches!(
                     i,
-                    Instr::Bin(BinOp::Push, ..) | Instr::SetIndex(..) | Instr::SetFieldAt { .. }
+                    Instr::Bin(BinOp::Push, ..)
+                        | Instr::SetIndex(..)
+                        | Instr::SetFieldAt { .. }
+                        // (Drops the global's old value.)
+                        | Instr::SetGlobal(..)
                 )
         });
         let mut written = vec![false; nregs];
@@ -3664,12 +3812,106 @@ impl Jit {
                         let r = bx.ins().icmp_imm_s(IntCC::Equal, t, 0);
                         bx.def_var(dvar!(*d), r);
                     }
+                    // A global of a simple type (that of its value at compile time): its
+                    // payload if it still has that type, otherwise resumed in the
+                    // interpreter.
+                    GetGlobal(d, slot)
+                        if plan.boxed.contains(&key)
+                            && matches!(dty, Some(JTy::Int | JTy::Float | JTy::Bool)) =>
+                    {
+                        use crate::value::layout::{TAG_BOOL, TAG_FLOAT, TAG_INT};
+                        let (tag, ty) = match dty {
+                            Some(JTy::Int) => (TAG_INT, types::I64),
+                            Some(JTy::Float) => (TAG_FLOAT, types::F64),
+                            _ => (TAG_BOOL, types::I8),
+                        };
+                        let v = if self.inline_globals {
+                            // In place: the slot does not move.
+                            let at = globals.slot_ptr(*slot) as i64 + GSLOT_VALUE as i64;
+                            let at = bx.ins().iconst(types::I64, at);
+                            let t = bx.ins().load(types::I8, MemFlagsData::new(), at, 0);
+                            let bad = bx.ins().icmp_imm_s(IntCC::NotEqual, t, tag as i64);
+                            bail!(bx, bad);
+                            bx.ins().load(ty, MemFlagsData::new(), at, PAYLOAD)
+                        } else {
+                            let s = bx.ins().iconst(types::I32, *slot as i64);
+                            let t = bx.ins().iconst(types::I32, tag as i64);
+                            let out = bx.ins().stack_addr(types::I64, dout, 0);
+                            let call = bx.ins().call(global_word_ref, &[ctxv, s, t, out]);
+                            let bad = bx.inst_results(call)[0];
+                            bail!(bx, bad);
+                            bx.ins().stack_load(types::I64, ty, dout, 0)
+                        };
+                        bx.def_var(dvar!(*d), v);
+                    }
+                    SetGlobal(slot, a) => {
+                        let (w, k) = boxed_word!(bx, *a);
+                        // A simple value over a simple value of a variable: written in place
+                        // (nothing to drop, no native code depends on it); otherwise the
+                        // interpreter's assignment.
+                        let tag = match tyof!(*a) {
+                            Some(JTy::Int) => Some(TAG_INT),
+                            Some(JTy::Float) => Some(TAG_FLOAT),
+                            Some(JTy::Bool) => Some(TAG_BOOL),
+                            _ => None,
+                        };
+                        let done = bx.create_block();
+                        if let (true, Some(tag)) = (self.inline_globals, tag) {
+                            let base = globals.slot_ptr(*slot) as i64;
+                            let at = bx.ins().iconst(types::I64, base + GSLOT_VALUE as i64);
+                            let mutable = bx.ins().iconst(types::I64, base + GSLOT_MUT as i64);
+                            let m = bx.ins().load(types::I8, MemFlagsData::new(), mutable, 0);
+                            let old = bx.ins().load(types::I8, MemFlagsData::new(), at, 0);
+                            let simple = bx.ins().icmp_imm_u(
+                                IntCC::UnsignedLessThan,
+                                old,
+                                FIRST_HEAP_TAG as i64,
+                            );
+                            let m = bx.ins().icmp_imm_u(IntCC::NotEqual, m, 0);
+                            let ok = bx.ins().band(m, simple);
+                            let fast = bx.create_block();
+                            let slow = bx.create_block();
+                            bx.ins().brif(ok, fast, &[], slow, &[]);
+                            bx.switch_to_block(fast);
+                            let t = bx.ins().iconst(types::I8, tag as i64);
+                            bx.ins().store(MemFlagsData::new(), t, at, 0);
+                            bx.ins().store(MemFlagsData::new(), w, at, PAYLOAD);
+                            bx.ins().jump(done, &[]);
+                            bx.switch_to_block(slow);
+                        }
+                        let s = bx.ins().iconst(types::I32, *slot as i64);
+                        let k = bx.ins().iconst(types::I32, dkind_code(k));
+                        let sp = bx
+                            .ins()
+                            .iconst(types::I64, span.start as i64 | ((span.end as i64) << 32));
+                        let call = bx.ins().call(set_global_ref, &[ctxv, s, w, k, sp]);
+                        let status = bx.inst_results(call)[0];
+                        let failed = bx.create_block();
+                        bx.ins().brif(status, failed, &[], done, &[]);
+                        bx.switch_to_block(failed);
+                        let none = bx.ins().iconst(types::I64, -1);
+                        bx.ins().jump(fail, &[none.into()]);
+                        bx.switch_to_block(done);
+                    }
                     GetGlobal(d, slot) if plan.boxed.contains(&key) => {
                         let out = own!(bx, *d);
+                        let checked = plan.global_objs.get(&key);
                         let s = bx.ins().iconst(types::I32, *slot as i64);
                         let call = bx.ins().call(global_ref, &[ctxv, s, out]);
                         let failed = bx.inst_results(call)[0];
                         bail!(bx, failed);
+                        // Read as an object of a class: checked (otherwise resumed in the
+                        // interpreter).
+                        if let Some(info) = checked {
+                            if !self.known_types.iter().any(|t| Rc::ptr_eq(t, info)) {
+                                self.known_types.push(info.clone());
+                            }
+                            let ip = bx.ins().iconst(types::I64, Rc::as_ptr(info) as i64);
+                            let call = bx.ins().call(obj_is_ref, &[out, ip]);
+                            let is = bx.inst_results(call)[0];
+                            let bad = bx.ins().icmp_imm_s(IntCC::Equal, is, 0);
+                            bail!(bx, bad);
+                        }
                         bx.def_var(dvar!(*d), out);
                     }
                     Int(d, n) => {

@@ -338,7 +338,7 @@ impl Runtime {
     /// Error leaving `proto`: source and call added to the trace.
     #[cold]
     fn traced(&self, mut e: Error, proto: &Proto, span: Span) -> Error {
-        if proto.kind != ProtoKind::Main {
+        if proto.kind != ProtoKind::Main && !proto.outlined {
             e = attach_src(e, &proto.script);
             if e.trace.len() < 16 {
                 e.trace.push((proto.name.to_string(), span));
@@ -1586,7 +1586,7 @@ impl Runtime {
 
     // ─── Runtime helpers ─────────────────────────────────────────────────────
 
-    fn set_global(&mut self, g: u32, v: Value, span: Span) -> R<()> {
+    pub(crate) fn set_global(&mut self, g: u32, v: Value, span: Span) -> R<()> {
         let slot = self.globals.at(g);
         let n = slot.name;
         match (&slot.value, slot.mutable) {

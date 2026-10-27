@@ -389,14 +389,23 @@ impl Engine {
         } else {
             None
         };
-        crate::compile::compile(
+        let mut main = crate::compile::compile(
             &program,
             &script,
             &mut self.rt.interner,
             &mut self.rt.globals,
             prims.as_ref(),
         )
-        .map_err(with_src)
+        .map_err(with_src)?;
+        // Loops of the main program as functions, for the typed JIT.
+        if cfg!(feature = "jit")
+            && self.rt.jit_enabled
+            && let Some(p) = Rc::get_mut(&mut main)
+        {
+            let name = self.rt.interner.intern("_");
+            crate::outline::outline_loops(p, name);
+        }
+        Ok(main)
     }
 
     /// IR of the code (the representation the interpreter runs), as readable text.
