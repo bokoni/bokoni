@@ -43,6 +43,9 @@ pub struct TypeInfo {
     pub methods: FxHashMap<Symbol, Rc<Proto>>,
     pub script: Rc<Script>,
     pub annotations: crate::ir::Annotations,
+    /// Every field has a simple type (`int`, `str`…, checked when assigned): its objects
+    /// refer to no container, they cannot be part of a cycle (see `gc.rs`).
+    pub acyclic: bool,
 }
 
 /// A method to be defined by a class: declared `abstract` by a trait or a class.
@@ -215,10 +218,12 @@ impl Runtime {
             .into_iter()
             .map(|v| v.unwrap_or(Value::Nil))
             .collect();
-        Ok(Value::Object(Rc::new(RefCell::new(Object {
+        let v = Value::Object(Rc::new(RefCell::new(Object {
             info: info.clone(),
             fields,
-        }))))
+        })));
+        crate::gc::track(&v);
+        Ok(v)
     }
 
     /// Construction without a block where each field is given once: no default value to
@@ -281,10 +286,12 @@ impl Runtime {
             .into_iter()
             .map(|v| v.expect("every field is given"))
             .collect();
-        Ok(Value::Object(Rc::new(RefCell::new(Object {
+        let v = Value::Object(Rc::new(RefCell::new(Object {
             info: info.clone(),
             fields,
-        }))))
+        })));
+        crate::gc::track(&v);
+        Ok(v)
     }
 
     fn construct_reported(&mut self, info: &Rc<TypeInfo>, span: Span, name: Symbol) -> R {
@@ -512,6 +519,7 @@ impl Runtime {
             fields,
         }));
         let this = Value::Object(obj.clone());
+        crate::gc::track(&this);
         if let Some(c) = block {
             let f = Value::Function(Rc::new(crate::value::Function::Script(Closure {
                 proto: c.proto.clone(),
@@ -528,10 +536,7 @@ impl Runtime {
             None => {
                 if !args.pos.is_empty() {
                     return rt_err(
-                        format!(
-                            "`{}` has no `init`: use named arguments",
-                            info.name
-                        ),
+                        format!("`{}` has no `init`: use named arguments", info.name),
                         span,
                     );
                 }

@@ -176,6 +176,11 @@ impl HashMap {
         Some(v)
     }
 
+    /// Its values (the hash consumed).
+    pub(crate) fn into_values(self) -> impl Iterator<Item = Value> {
+        self.entries.into_iter().map(|(_, v)| v)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &(HashKey, Value)> {
         self.entries.iter()
     }
@@ -218,7 +223,9 @@ impl Value {
     }
 
     pub fn list(items: Vec<Value>) -> Value {
-        Value::List(Rc::new(RefCell::new(items)))
+        let v = Value::List(Rc::new(RefCell::new(items)));
+        crate::gc::track(&v);
+        v
     }
 
     /// Type name, as written in annotations.
@@ -591,9 +598,18 @@ impl Drop for Value {
     fn drop(&mut self) {
         // Common case (number, string, shared container or one without nested containers):
         // ordinary drop, nothing to do here.
-        if is_container(self) && has_nested(self) {
-            drop_deep(self);
+        if is_container(self) {
+            drop_container(self);
         }
+    }
+}
+
+/// A container dropped: taken apart without recursion if it holds containers and this
+/// is its last owner. (Out of line: dropping values stays small everywhere.)
+#[inline(never)]
+fn drop_container(v: &mut Value) {
+    if has_nested(v) {
+        drop_deep(v);
     }
 }
 
@@ -608,31 +624,36 @@ fn drop_deep(v: &mut Value) {
     }
 }
 
-/// `v` is the sole owner of a container that itself holds a container (`Rc::get_mut`:
-/// uniqueness and access without a borrow check).
+/// The contents of `rc` if `v` is its sole owner (other references, if any, are weak:
+/// those of the cycle collector, which does not use them meanwhile).
 #[inline]
+fn sole<T>(rc: &Rc<RefCell<T>>) -> Option<std::cell::RefMut<'_, T>> {
+    if Rc::strong_count(rc) == 1 {
+        rc.try_borrow_mut().ok()
+    } else {
+        None
+    }
+}
+
+/// `v` is the sole owner of a container that itself holds a container.
 fn has_nested(v: &mut Value) -> bool {
     fn any<'a>(mut xs: impl Iterator<Item = &'a Value>) -> bool {
         xs.any(is_container)
     }
     match v {
-        Value::List(rc) => Rc::get_mut(rc).is_some_and(|c| any(c.get_mut().iter())),
+        Value::List(rc) => sole(rc).is_some_and(|c| any(c.iter())),
         Value::Tuple(rc) => Rc::get_mut(rc).is_some_and(|c| any(c.iter())),
-        Value::Hash(rc) => {
-            Rc::get_mut(rc).is_some_and(|c| any(c.get_mut().entries.iter().map(|(_, x)| x)))
-        }
-        Value::Record(rc) => {
-            Rc::get_mut(rc).is_some_and(|c| any(c.get_mut().fields.iter().map(|(_, x)| x)))
-        }
-        Value::Object(rc) => Rc::get_mut(rc).is_some_and(|c| any(c.get_mut().fields.iter())),
+        Value::Hash(rc) => sole(rc).is_some_and(|c| any(c.entries.iter().map(|(_, x)| x))),
+        Value::Record(rc) => sole(rc).is_some_and(|c| any(c.fields.iter().map(|(_, x)| x))),
+        Value::Object(rc) => sole(rc).is_some_and(|c| any(c.fields.iter())),
         Value::Function(rc) => Rc::get_mut(rc).is_some_and(|f| match f {
             Function::Script(c) => c
                 .upvals
-                .iter_mut()
-                .any(|u| Rc::get_mut(u).is_some_and(|u| is_container(u.get_mut()))),
+                .iter()
+                .any(|u| sole(u).is_some_and(|u| is_container(&u))),
             _ => false,
         }),
-        Value::Iter(rc) => Rc::get_mut(rc).is_some_and(|c| match c.get_mut() {
+        Value::Iter(rc) => sole(rc).is_some_and(|c| match &*c {
             crate::vm::IterState::Values(items) => any(items.as_slice().iter()),
             crate::vm::IterState::List(..) => true,
             _ => false,
@@ -666,8 +687,8 @@ fn take_children(v: &mut Value, out: &mut Vec<Value>) {
     };
     match v {
         Value::List(rc) => {
-            if let Some(cell) = Rc::get_mut(rc) {
-                cell.get_mut().drain(..).for_each(&mut push);
+            if let Some(mut c) = sole(rc) {
+                c.drain(..).for_each(&mut push);
             }
         }
         Value::Tuple(rc) => {
@@ -678,35 +699,34 @@ fn take_children(v: &mut Value, out: &mut Vec<Value>) {
             }
         }
         Value::Hash(rc) => {
-            if let Some(cell) = Rc::get_mut(rc) {
-                let h = cell.get_mut();
+            if let Some(mut h) = sole(rc) {
                 h.index.clear();
                 h.entries.drain(..).for_each(|(_, x)| push(x));
             }
         }
         Value::Record(rc) => {
-            if let Some(cell) = Rc::get_mut(rc) {
-                cell.get_mut().fields.drain(..).for_each(|(_, x)| push(x));
+            if let Some(mut c) = sole(rc) {
+                c.fields.drain(..).for_each(|(_, x)| push(x));
             }
         }
         Value::Object(rc) => {
-            if let Some(cell) = Rc::get_mut(rc) {
-                cell.get_mut().fields.drain(..).for_each(&mut push);
+            if let Some(mut c) = sole(rc) {
+                c.fields.drain(..).for_each(&mut push);
             }
         }
         Value::Function(rc) => {
             if let Some(Function::Script(c)) = Rc::get_mut(rc) {
-                for cell in c.upvals.iter_mut() {
-                    if let Some(cell) = Rc::get_mut(cell) {
-                        push(std::mem::replace(cell.get_mut(), Value::Nil));
+                for cell in c.upvals.iter() {
+                    if let Some(mut cell) = sole(cell) {
+                        push(std::mem::replace(&mut *cell, Value::Nil));
                     }
                 }
             }
         }
         Value::Iter(rc) => {
-            if let Some(cell) = Rc::get_mut(rc) {
+            if let Some(mut c) = sole(rc) {
                 match std::mem::replace(
-                    cell.get_mut(),
+                    &mut *c,
                     crate::vm::IterState::Values(Vec::new().into_iter()),
                 ) {
                     crate::vm::IterState::Values(items) => items.for_each(&mut push),

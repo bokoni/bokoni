@@ -521,6 +521,7 @@ extern "C" fn bk_build(dst: *mut Value, args: *const u64, plan: *const BuildPlan
                 Value::List(Rc::new(std::cell::RefCell::new(items)))
             }
         };
+        crate::gc::track(&v);
         *dst = v;
     }
 }
@@ -1080,9 +1081,9 @@ extern "C" fn bk_cells_init(cells: *mut crate::vm::Cell, n: u64) {
     // SAFETY: `cells` is a frame slot of `n` cells, not initialized.
     unsafe {
         for i in 0..n as usize {
-            cells
-                .add(i)
-                .write(Rc::new(std::cell::RefCell::new(Value::Uninit)));
+            let c = Rc::new(std::cell::RefCell::new(Value::Uninit));
+            crate::gc::track_cell(&c);
+            cells.add(i).write(c);
         }
     }
 }
@@ -1101,7 +1102,9 @@ extern "C" fn bk_cells_drop(cells: *mut crate::vm::Cell, n: u64) {
 extern "C" fn bk_cell_new(cells: *mut crate::vm::Cell, c: u32) {
     // SAFETY: as for `bk_cells_drop`.
     unsafe {
-        *cells.add(c as usize) = Rc::new(std::cell::RefCell::new(Value::Uninit));
+        let cell = Rc::new(std::cell::RefCell::new(Value::Uninit));
+        crate::gc::track_cell(&cell);
+        *cells.add(c as usize) = cell;
     }
 }
 
@@ -1131,6 +1134,7 @@ extern "C" fn bk_closure(
             upvals,
             ctx: (*(*ctx).rt).no_ctx.clone(),
         })));
+        crate::gc::track(&*out);
     }
 }
 
@@ -1271,6 +1275,7 @@ extern "C" fn bk_new_object(info: *const crate::objects::TypeInfo, out: *mut Val
             info,
             fields: vec![Value::Uninit; n],
         })));
+        crate::gc::track(&*out);
     }
 }
 

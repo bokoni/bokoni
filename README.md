@@ -84,6 +84,10 @@ let s: i64 = engine.call_as("square", (7,))?;        // 49
 Arguments and return values are converted automatically (`i64`, `f64`, `bool`, `String`,
 `Vec<T>`, `Option<T>`, `Value`…); a function may return `Result<T, E: Display>`.
 
+Values are reference counted; reference cycles (a closure that captures itself, objects
+that point to each other) are freed by a cycle collector, run automatically
+(`engine.collect_cycles()` to run it now).
+
 The script's declarations and their annotations can be read from Rust:
 
 ```rust

@@ -14,6 +14,7 @@ pub mod check;
 pub mod compile;
 pub mod diagnostic;
 pub mod engine;
+pub mod gc;
 pub mod globals;
 pub mod intern;
 pub mod ir;

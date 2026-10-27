@@ -110,6 +110,9 @@ pub(crate) fn before_list_write(l: &Rc<RefCell<Vec<Value>>>) {
     });
 }
 
+/// Calls between two checks of whether a collection of cycles is due.
+const GC_CALLS: u32 = 1024;
+
 const RED_ZONE: usize = 256 * 1024;
 const STACK_GROW: usize = 2 * 1024 * 1024;
 /// The stack is only checked once every `STACK_CHECK` call levels: the red zone easily
@@ -141,6 +144,8 @@ pub struct Runtime {
     concat_buf: String,
     /// Errors kept by `rescue` / `ensure` handlers, by call (`Term::Reraise`).
     pub(crate) caught: Vec<Option<Error>>,
+    /// Calls left before checking whether a collection of cycles is due.
+    gc_calls: u32,
     #[cfg(feature = "jit")]
     pub(crate) jit: Option<crate::jit::Jit>,
     /// Error raised while running baseline native code, waiting to be propagated.
@@ -191,6 +196,7 @@ impl Runtime {
             jit_eager: false,
             concat_buf: String::new(),
             caught: Vec::new(),
+            gc_calls: GC_CALLS,
             #[cfg(feature = "jit")]
             jit: None,
             #[cfg(feature = "jit")]
@@ -311,6 +317,13 @@ impl Runtime {
                 ),
                 span,
             );
+        }
+        // A safe point (no value is held other than by its references): every so often,
+        // a collection of cycles if due.
+        self.gc_calls = self.gc_calls.wrapping_sub(1);
+        if self.gc_calls == 0 {
+            self.gc_calls = GC_CALLS;
+            crate::gc::maybe_collect();
         }
         self.depth += 1;
         let mut regs = self.frames.pop().unwrap_or_default();
@@ -479,11 +492,11 @@ impl Runtime {
         caught: Option<Vec<Option<Error>>>,
     ) -> R {
         // (Resumption of native code: its cells, shared with the lambdas it created.)
-        let mut cells: Vec<Cell> = cells.unwrap_or_else(|| {
-            (0..proto.ncells)
-                .map(|_| Rc::new(RefCell::new(Value::Uninit)))
-                .collect()
-        });
+        let mut cells: Vec<Cell> = match cells {
+            Some(c) => c,
+            None if proto.ncells == 0 => Vec::new(),
+            None => new_cells(proto.ncells),
+        };
         #[cfg(feature = "jit")]
         if b0 == 0
             && k0 == 0
@@ -700,7 +713,10 @@ impl Runtime {
                 let v = reg!(*a).clone();
                 self.set_global(*g, v, span)?;
             }
-            Instr::NewCell(c) => cells[*c as usize] = Rc::new(RefCell::new(Value::Uninit)),
+            Instr::NewCell(c) => {
+                cells[*c as usize] = Rc::new(RefCell::new(Value::Uninit));
+                crate::gc::track_cell(&cells[*c as usize]);
+            }
             Instr::GetCell(d, c) => {
                 let v = cells[*c as usize].borrow().clone();
                 reg!(*d) = init_check(v, span)?;
@@ -1078,6 +1094,7 @@ impl Runtime {
                     h.insert(key, regs[*s as usize + 2 * k + 1].clone());
                 }
                 reg!(*d) = Value::Hash(Rc::new(RefCell::new(h)));
+                crate::gc::track(&reg!(*d));
             }
             Instr::Record(d, s, r) => {
                 let names = &proto.records[*r as usize];
@@ -1087,6 +1104,7 @@ impl Runtime {
                     .map(|(k, n)| (*n, regs[*s as usize + k].clone()))
                     .collect();
                 reg!(*d) = Value::Record(Rc::new(RefCell::new(Record { fields })));
+                crate::gc::track(&reg!(*d));
             }
             Instr::Range {
                 dst,
@@ -1229,6 +1247,7 @@ impl Runtime {
                     upvals: ups,
                     ctx: ctx.clone(),
                 })));
+                crate::gc::track(&reg!(*d));
             }
             Instr::IterNew { dst, src, keys } => {
                 let v = reg!(*src).clone();
@@ -2209,7 +2228,26 @@ impl TypeInfo {
                 r.by
             ));
         }
+        // (A simple type: what it holds refers to no container.)
+        fn simple(t: &RtType) -> bool {
+            match t {
+                RtType::Int
+                | RtType::Float
+                | RtType::Str
+                | RtType::Bool
+                | RtType::Nil
+                | RtType::LitStr(_)
+                | RtType::LitInt(_) => true,
+                RtType::Optional(x) => simple(x),
+                RtType::Union(xs) | RtType::Tuple(xs) => xs.iter().all(simple),
+                _ => false,
+            }
+        }
+        let acyclic = fields
+            .iter()
+            .all(|f| f.ty.as_ref().is_some_and(|t| simple(&t.ty)));
         Ok(TypeInfo {
+            acyclic,
             name,
             kind: t.kind,
             parent,
@@ -2375,6 +2413,19 @@ pub(crate) fn iter_next(regs: &mut [Value], iter: Reg, dst: Reg) -> bool {
         }
         None => false,
     }
+}
+
+/// `n` cells not initialized yet (variables captured by lambdas), registered for the
+/// cycle collector. (Out of line: the interpreter's loop stays small.)
+#[inline(never)]
+fn new_cells(n: u32) -> Vec<Cell> {
+    (0..n)
+        .map(|_| {
+            let c = Rc::new(RefCell::new(Value::Uninit));
+            crate::gc::track_cell(&c);
+            c
+        })
+        .collect()
 }
 
 /// Next element of a `for` iterator.

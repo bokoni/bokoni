@@ -66,8 +66,9 @@ impl Default for Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         // Global functions capture the global scope that contains them:
-        // break that cycle to free the memory.
+        // break that cycle to free the memory; then the cycles of values.
         self.rt.globals.clear();
+        crate::gc::collect();
     }
 }
 
@@ -317,7 +318,17 @@ impl Engine {
     /// Like [`eval`](Self::eval), naming the script for error messages.
     pub fn eval_named(&mut self, src: &str, name: &str) -> Result<Value, Errors> {
         let main = self.compile(src, name)?;
-        Ok(self.rt.run(&main)?)
+        let r = self.rt.run(&main);
+        crate::gc::maybe_collect();
+        Ok(r?)
+    }
+
+    /// Frees the values only reachable from reference cycles (a closure that captures
+    /// itself, objects that point to each other…), now. Also done automatically, after a
+    /// script and during one, when many values were created. Returns how many containers
+    /// were freed.
+    pub fn collect_cycles(&mut self) -> usize {
+        crate::gc::collect()
     }
 
     /// Parses a script: the program and the script (its source followed by the code its

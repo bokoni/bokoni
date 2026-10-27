@@ -385,13 +385,21 @@ namespaces, `trait` for shared behavior.
       `x is T` by a helper; the errors kept given to the interpreter on a resumption. A
       loop with a `rescue`: ×3 when 1 turn in 10 fails, ×20 or more otherwise
 
+### v0.18 — Reference cycles collected
+
+- [x] Cycle collector (`gc.rs`, the algorithm of CPython's): the containers created
+      (lists, hashes, records, objects, cells of captured variables) registered by weak
+      references; those only reachable from cycles are emptied, which frees them. Safe
+      by construction (a container that cannot be read, or referenced by a value not
+      registered, counts as referenced from outside). Run after a script, and at a
+      function call once enough containers were created (threshold growing with the
+      survivors); `Engine::collect_cycles()` from Rust. Objects whose fields all have
+      simple types are not registered (they cannot be in a cycle). No measurable cost
+      on the benchmarks.
+
 ### Next
 
 - Macros: calls without parentheses, named arguments.
-
-No design decision needed:
-
-- Free local functions that capture themselves (reference cycle).
 
 ## Decisions that commit the JIT
 
@@ -443,8 +451,9 @@ optimizations (on-demand lexer, interning of short names) only brought a few %.
 
 ## Known limitations (v0.1)
 
-- Reference cycles: a local function that captures itself is never freed (global
-  functions are, when the `Engine` is dropped).
+- Reference cycles are freed by a collection (see v0.18), not as soon as they become
+  unreachable; a cycle through a value the host built (`Value::List` from Rust) or
+  through a closure also referenced elsewhere is kept.
 - A `for` loop over a list does not copy it: the loop copies what it has left only when
   the list is modified (`<<`, `push`, `pop`, `xs[i] = v`) while it walks it. A list
   modified from Rust (`Value::List`) during a loop is seen modified.
