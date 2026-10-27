@@ -85,8 +85,8 @@ JIT's job (direct calls, unboxed values).
       that calls it, which is recompiled when needed
 - [x] Compilation on the first call; a function called only once but that loops
       benefits too
-- [x] Insufficient native stack (very deep recursion): the call is redone by the
-      interpreter (safe: compiled functions have no side effects)
+- [x] Insufficient native stack (very deep recursion): resumed in the interpreter,
+      whose stack grows on the heap (v0.14)
 - [x] Cargo feature `jit` (on by default); `Engine::set_jit(false)`, `bokoni --no-jit`
 - [ ] Compile more: methods, lists, strings, calls into the interpreter from native code
       (boxed values)
@@ -126,7 +126,7 @@ Times include compilation.
 - [x] Typed JIT: parameters of a declared type (`def dot(a: V, b: V): float`), passed by
       pointer; the object's type is checked once on entry, fields are read directly at
       their offset; passed as is to native functions with the same annotation
-- [x] Unverified assumption (redeclared type): the call is redone by the interpreter;
+- [x] Unverified assumption (redeclared type): resumed in the interpreter (v0.14);
       redeclaring the type recompiles the function for the new layout
 - [x] Liveness analysis: a `nil` that is never read (value of a `while`) no longer
       prevents typed compilation
@@ -288,6 +288,19 @@ namespaces, `trait` for shared behavior.
 - [x] Type arguments kept in compiled annotations (`a: Acc(int)`), ignored by the
       run-time checks: typed native code calls the copy of the methods for them
       directly (checked on entry of the copy); 0.13 s → 0.02 s on a typed loop
+
+### v0.14 — JIT without abandons, side effects in native code
+
+- [x] Resumption in the interpreter where an assumption does not hold, instead of
+      redoing the whole call: the live registers (liveness analysis) are written to a
+      buffer, `bk_resume` rebuilds the interpreter's registers (`for` iterators
+      included) and runs the rest of the function from that instruction; a typed copy
+      resumes as the function written (`Spec::origin`); a result of another type than
+      the native one is passed to the native caller, which resumes after the call
+- [ ] Lists modified in native code (`xs << x`, `xs[i] = v`, list fields)
+- [ ] Native calls to methods that write fields
+- [ ] Inlining of small functions and getters
+- [ ] Strings in native code
 
 ### Next
 

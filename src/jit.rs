@@ -10,14 +10,18 @@
 //!   compiled.
 //! - Same rules as the interpreter: overflow, division by zero and call depth are checked,
 //!   with the same messages and the same call stack.
+//! - When an assumption does not hold (value of another type, index out of bounds,
+//!   method redefined, native stack nearly full), the native code is not abandoned: the
+//!   interpreter resumes at that instruction, with the registers rebuilt (`DeoptSite`,
+//!   `bk_resume`), and its result is the function's. Nothing is redone.
 //! - A call to a global function is direct (native code → native code). If the global is
 //!   redefined, the calling code is invalidated, then recompiled when needed.
 //! - A method is compiled for the class that declares it: `self` is a pointer, its
 //!   annotated `int` / `float` / `bool` fields (`@x`) are read and written in place. A
 //!   call `obj.m()` from native code is direct, checked against a redefinition by the
-//!   object's class (otherwise abandoned). Native code must not abandon after a side
-//!   effect: a method that writes fields contains only arithmetic, branches and fields
-//!   (types checked on entry), and native code does not call it.
+//!   object's class (otherwise resumed in the interpreter). A method that writes fields
+//!   contains only arithmetic, branches and fields (types checked on entry), and native
+//!   code does not call it.
 //! - A `forall` function (its annotations `T` are `any` at run time) is compiled as a copy
 //!   typed for the arguments of a call (`T = int`, see `Proto::specialize`): one copy per
 //!   type, called directly by native code, or by the interpreter when the arguments fit.
@@ -63,7 +67,16 @@ pub struct JitCtx {
     pub err: i64,
     /// Call stack of the error (indices into the call table), most recent first.
     pub traces: Vec<u32>,
+    /// The runtime, for a resumption in the interpreter (`bk_resume`).
+    pub rt: *mut Runtime,
+    /// Error raised by the interpreter during a resumption (`err` = `PENDING`).
+    pub pending: Option<Error>,
+    /// Result of a resumption that does not fit the native result type (status 2).
+    pub returned: Option<Value>,
 }
+
+/// `JitCtx::err`: the error is in `JitCtx::pending`.
+const PENDING: i64 = -2;
 
 const DEPTH_OFFSET: i32 = 0;
 const MAX_DEPTH_OFFSET: i32 = 8;
@@ -73,10 +86,198 @@ const ERR_OFFSET: i32 = 16;
 enum ErrKind {
     Overflow,
     DivZero,
-    Depth,
-    /// An assumption of the native code did not hold (field of another type): the call is
-    /// redone by the interpreter.
-    Bail,
+}
+
+/// How to rebuild an interpreter register from the words written by native code at a
+/// resumption point.
+#[derive(Clone, Copy)]
+enum DKind {
+    Int,
+    Float,
+    Bool,
+    /// Address of a value (object, list, `self`): copied; null if not assigned yet.
+    Ref,
+    /// `for` iterator: address of the elements, count, position (3 words).
+    Iter,
+    /// Value of a global (function called, type constructed).
+    Global(u32),
+    Nil,
+    /// Result of the call just made (`JitCtx::returned`).
+    Returned,
+}
+
+/// Resumption point: an assumption of the native code does not hold (value of another
+/// type, index out of bounds, method redefined, native stack nearly full…). Rather than
+/// redoing the call (which would redo its side effects), the interpreter takes over at
+/// this instruction, with the registers rebuilt.
+struct DeoptSite {
+    proto: Rc<Proto>,
+    block: u32,
+    /// Instruction of the block (its number of instructions: the terminator).
+    instr: u32,
+    /// Register, how to rebuild it, offset of its words in the buffer.
+    regs: Vec<(Reg, DKind, u32)>,
+    ret: RegTy,
+}
+
+/// Registers live before each instruction (`[block][k]`, `k` = number of instructions:
+/// before the terminator): read later before being written. Only those are written at
+/// a resumption point (the others would stay alive for nothing in the native code).
+fn liveness(p: &Proto) -> Vec<Vec<Vec<bool>>> {
+    let n = p.regs.len();
+    let term_reads = |t: &Term| -> Vec<Reg> {
+        match t {
+            Term::Branch { cond, .. } => vec![*cond],
+            Term::IfInt { a, b, .. } => vec![*a, *b],
+            Term::IfIntK { a, .. } => vec![*a],
+            Term::Return { reg, .. } => vec![*reg],
+            Term::IterNext { iter, .. } => vec![*iter],
+            Term::Jump(_) | Term::Reraise(_) => vec![],
+        }
+    };
+    let mut live: Vec<Vec<Vec<bool>>> = p
+        .blocks
+        .iter()
+        .map(|b| vec![vec![false; n]; b.instrs.len() + 1])
+        .collect();
+    loop {
+        let mut changed = false;
+        for (bi, b) in p.blocks.iter().enumerate().rev() {
+            // Live after the terminator: live at the entry of the successors.
+            let mut cur = vec![false; n];
+            let mut t = b.term.clone();
+            for s in t.targets_mut() {
+                for (r, l) in live[*s as usize][0].iter().enumerate() {
+                    cur[r] |= *l;
+                }
+            }
+            if let Term::IterNext { dst, .. } = &b.term {
+                cur[*dst as usize] = false;
+            }
+            for r in term_reads(&b.term) {
+                cur[r as usize] = true;
+            }
+            let k = b.instrs.len();
+            if live[bi][k] != cur {
+                live[bi][k] = cur.clone();
+                changed = true;
+            }
+            for (k, ins) in b.instrs.iter().enumerate().rev() {
+                match reads_writes(p, ins) {
+                    Some((reads, write)) => {
+                        if let Some(w) = write {
+                            cur[w as usize] = false;
+                        }
+                        for r in reads {
+                            cur[r as usize] = true;
+                        }
+                    }
+                    // Not compiled: conservatively everything stays live.
+                    None => cur.iter_mut().for_each(|l| *l = true),
+                }
+                if live[bi][k] != cur {
+                    live[bi][k] = cur.clone();
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return live;
+        }
+    }
+}
+
+/// Resumption in the interpreter (see `DeoptSite`): rebuilds the registers from `buf`,
+/// runs the rest of the function, writes its result into `out` (its native type, or the
+/// value for an object or a list). 0: done; 1: error (in `JitCtx::pending`).
+extern "C" fn bk_resume(
+    ctx: *mut JitCtx,
+    site: *const DeoptSite,
+    buf: *const u64,
+    out: *mut u64,
+) -> i32 {
+    // SAFETY: `site` is kept alive by the `Jit`; `buf` holds the words described by the
+    // site, written just before the call; the addresses of `DKind::Ref` / `Iter` are
+    // values alive during the call; `ctx.rt` is the runtime running this native code.
+    // No reference to the context or the runtime is held while the interpreter runs
+    // (it may call native code again).
+    unsafe {
+        let site = &*site;
+        let p = &site.proto;
+        let rt = (*ctx).rt;
+        let mut regs: Vec<Value> = vec![Value::Nil; p.regs.len()];
+        for &(r, kind, off) in &site.regs {
+            let w = |j: u32| *buf.add((off + j) as usize);
+            regs[r as usize] = match kind {
+                DKind::Int => Value::Int(w(0) as i64),
+                DKind::Float => Value::Float(f64::from_bits(w(0))),
+                DKind::Bool => Value::Bool(w(0) & 0xff != 0),
+                DKind::Ref if w(0) == 0 => Value::Nil,
+                DKind::Ref => (*(w(0) as *const Value)).clone(),
+                DKind::Iter if w(0) == 0 => Value::Nil,
+                DKind::Iter => {
+                    let data = w(0) as *const Value;
+                    let rest: Vec<Value> = (w(2)..w(1))
+                        .map(|i| (*data.add(i as usize)).clone())
+                        .collect();
+                    Value::Iter(Rc::new(std::cell::RefCell::new(
+                        crate::vm::IterState::Values(rest.into_iter()),
+                    )))
+                }
+                DKind::Global(slot) => (*rt).globals.at(slot).value.clone().unwrap_or(Value::Nil),
+                DKind::Nil => Value::Nil,
+                DKind::Returned => (*ctx).returned.take().unwrap_or(Value::Nil),
+            };
+        }
+        // The assumption did not hold: interpreted from now on.
+        *p.jit.borrow_mut() = JitState::Rejected;
+        // A typed copy: the function as written runs (same code, its annotations `T`).
+        let origin = p.spec.as_ref().and_then(|s| s.origin.upgrade());
+        let p = origin.as_ref().unwrap_or(p);
+        let saved = (
+            (*ctx).depth,
+            (*ctx).max_depth,
+            (*ctx).err,
+            std::mem::take(&mut (*ctx).traces),
+        );
+        let r = (*rt).resume(p, &mut regs, site.block, site.instr, saved.0 as usize);
+        (*ctx).depth = saved.0;
+        (*ctx).max_depth = saved.1;
+        (*ctx).err = saved.2;
+        (*ctx).traces = saved.3;
+        (*ctx).rt = rt;
+        match r {
+            Ok(v) => match (site.ret, v) {
+                (RegTy::Int, Value::Int(i)) => {
+                    *out = i as u64;
+                    0
+                }
+                (RegTy::Float, Value::Float(f)) => {
+                    *out = f.to_bits();
+                    0
+                }
+                (RegTy::Bool, Value::Bool(b)) => {
+                    *out = b as u64;
+                    0
+                }
+                (RegTy::Value, v) => {
+                    *(out as *mut Value) = v;
+                    0
+                }
+                // A typed copy promises its type, the function as written may return
+                // another: the caller is resumed too, with this value.
+                (_, v) => {
+                    (*ctx).returned = Some(v);
+                    2
+                }
+            },
+            Err(e) => {
+                (*ctx).pending = Some(e);
+                (*ctx).err = PENDING;
+                1
+            }
+        }
+    }
 }
 
 struct ErrInfo {
@@ -299,7 +500,13 @@ struct Compiled {
 
 pub struct Jit {
     module: JITModule,
-    ctx: Box<JitCtx>,
+    /// Allocated once (`Box::into_raw`), freed by `drop`: native code and resumptions
+    /// in the interpreter reach it by its address.
+    ctx: *mut JitCtx,
+    /// Resumption points (addresses held by native code).
+    #[allow(clippy::vec_box)]
+    deopt_sites: Vec<Box<DeoptSite>>,
+    resume_fn: FuncId,
     errors: Vec<ErrInfo>,
     traces: Vec<TraceInfo>,
     /// Functions already compiled (key: address of the `Proto`).
@@ -319,8 +526,6 @@ pub struct Jit {
     /// Types whose layout native code knows (kept alive: their address serves as their
     /// identity).
     known_types: Vec<Rc<crate::objects::TypeInfo>>,
-    /// The last native call was abandoned (`ErrKind::Bail`).
-    pub bailed: bool,
     /// Symbol of the `len` method (lists).
     pub len_sym: crate::intern::Symbol,
     /// Helpers of the baseline code (`bk_step`, `bk_iter_next`, `bk_drop`).
@@ -1215,6 +1420,7 @@ impl Jit {
         builder.symbol("bk_obj_fields", bk_obj_fields as *const u8);
         builder.symbol("bk_this_fields", bk_this_fields as *const u8);
         builder.symbol("bk_method_is", bk_method_is as *const u8);
+        builder.symbol("bk_resume", bk_resume as *const u8);
         builder.symbol("bk_list_view", bk_list_view as *const u8);
         builder.symbol("bk_build", bk_build as *const u8);
         builder.symbol("bk_clone_into", bk_clone_into as *const u8);
@@ -1272,6 +1478,14 @@ impl Jit {
             .declare_function("bk_method_is", Linkage::Import, &sig)
             .ok()?;
         let mut sig = module.make_signature();
+        for _ in 0..4 {
+            sig.params.push(AbiParam::new(ptr));
+        }
+        sig.returns.push(AbiParam::new(types::I32));
+        let resume_fn = module
+            .declare_function("bk_resume", Linkage::Import, &sig)
+            .ok()?;
+        let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr));
         sig.params.push(AbiParam::new(ptr));
         sig.returns.push(AbiParam::new(types::I32));
@@ -1299,12 +1513,17 @@ impl Jit {
         let mem_fns: [FuncId; 4] = mem.try_into().ok()?;
         Some(Jit {
             module,
-            ctx: Box::new(JitCtx {
+            ctx: Box::into_raw(Box::new(JitCtx {
                 depth: 0,
                 max_depth: 0,
                 err: -1,
                 traces: Vec::new(),
-            }),
+                rt: std::ptr::null_mut(),
+                pending: None,
+                returned: None,
+            })),
+            deopt_sites: Vec::new(),
+            resume_fn,
             errors: Vec::new(),
             traces: Vec::new(),
             compiled: FxHashMap::default(),
@@ -1317,7 +1536,6 @@ impl Jit {
             mem_fns,
             build_plans: Vec::new(),
             known_types: Vec::new(),
-            bailed: false,
             len_sym: crate::intern::Symbol(u32::MAX),
             dyn_fns: None,
             fast_fns: Vec::new(),
@@ -1702,6 +1920,125 @@ impl Jit {
         }
         let out_param =
             (ret == RegTy::Value).then(|| bx.block_params(entry)[base + p.params.len()]);
+        // Resumption points: the registers known there are written into `dbuf`, then
+        // `bk_resume` runs the rest of the function in the interpreter; its result is
+        // this function's.
+        let dbuf = bx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            ((nregs * 3).max(1) * 8) as u32,
+            3,
+        ));
+        let dout = bx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            8,
+            3,
+        ));
+        let resume_ref = self.module.declare_func_in_func(self.resume_fn, bx.func);
+        let live = liveness(p);
+        macro_rules! deopt {
+            ($bx:expr, $cond:expr, $types:expr, $b:expr, $k:expr) => {
+                deopt!($bx, $cond, $types, $b, $k, None)
+            };
+            ($bx:expr, $cond:expr, $types:expr, $b:expr, $k:expr, $returned:expr) => {{
+                let returned: Option<Reg> = $returned;
+                let d = $bx.create_block();
+                let cont = $bx.create_block();
+                $bx.ins().brif($cond, d, &[], cont, &[]);
+                $bx.switch_to_block(d);
+                let buf = $bx.ins().stack_addr(types::I64, dbuf, 0);
+                let mut saved = Vec::new();
+                let mut off = 0u32;
+                let at = &live[$b][$k];
+                for (r, t) in $types.iter().enumerate() {
+                    let (r, Some(t)) = (r as Reg, *t) else {
+                        continue;
+                    };
+                    if returned == Some(r) || !at[r as usize] {
+                        continue;
+                    }
+                    let kind = match t {
+                        JTy::Int
+                        | JTy::Float
+                        | JTy::Bool
+                        | JTy::Obj(_)
+                        | JTy::List(_)
+                        | JTy::This => {
+                            let Some(&v) = vars.get(&(r, t)) else {
+                                continue;
+                            };
+                            let v = $bx.use_var(v);
+                            let bits = match t {
+                                JTy::Float => $bx.ins().bitcast(types::I64, MemFlagsData::new(), v),
+                                JTy::Bool => $bx.ins().uextend(types::I64, v),
+                                _ => v,
+                            };
+                            $bx.ins()
+                                .store(MemFlagsData::trusted(), bits, buf, (off * 8) as i32);
+                            match t {
+                                JTy::Int => DKind::Int,
+                                JTy::Float => DKind::Float,
+                                JTy::Bool => DKind::Bool,
+                                _ => DKind::Ref,
+                            }
+                        }
+                        JTy::Iter(_) => {
+                            let Some(iv) = iter_vars.get(&r) else {
+                                continue;
+                            };
+                            for (j, v) in iv.iter().enumerate() {
+                                let x = $bx.use_var(*v);
+                                $bx.ins().store(
+                                    MemFlagsData::trusted(),
+                                    x,
+                                    buf,
+                                    ((off + j as u32) * 8) as i32,
+                                );
+                            }
+                            DKind::Iter
+                        }
+                        JTy::Callee(s) | JTy::Ctor(s) => DKind::Global(s),
+                        JTy::Nil => DKind::Nil,
+                    };
+                    saved.push((r, kind, off));
+                    off += match kind {
+                        DKind::Iter => 3,
+                        DKind::Global(_) | DKind::Nil => 0,
+                        _ => 1,
+                    };
+                }
+                if let Some(r) = returned {
+                    saved.push((r, DKind::Returned, 0));
+                }
+                self.deopt_sites.push(Box::new(DeoptSite {
+                    proto: p.clone(),
+                    block: $b as u32,
+                    instr: $k as u32,
+                    regs: saved,
+                    ret,
+                }));
+                let site = &**self.deopt_sites.last().unwrap() as *const DeoptSite;
+                let sp = $bx.ins().iconst(types::I64, site as i64);
+                let outp = match out_param {
+                    Some(o) => o,
+                    None => $bx.ins().stack_addr(types::I64, dout, 0),
+                };
+                let call = $bx.ins().call(resume_ref, &[ctxv, sp, buf, outp]);
+                let status = $bx.inst_results(call)[0];
+                if nslots > 0 {
+                    let base = $bx.ins().stack_addr(types::I64, vals, 0);
+                    let n = $bx.ins().iconst(types::I64, nslots as i64);
+                    $bx.ins().call(drop_ref, &[base, n]);
+                }
+                let v = match ret {
+                    RegTy::Float => $bx.ins().stack_load(types::I64, types::F64, dout, 0),
+                    RegTy::Bool => $bx.ins().stack_load(types::I64, types::I8, dout, 0),
+                    RegTy::Int => $bx.ins().stack_load(types::I64, types::I64, dout, 0),
+                    RegTy::Value => $bx.ins().iconst(types::I64, 0),
+                };
+                $bx.ins().return_(&[status, v]);
+                $bx.switch_to_block(cont);
+            }};
+        }
         // Every register is defined from the entry (zero value).
         for v in iter_vars.values().flatten() {
             let z = bx.ins().iconst(types::I64, 0);
@@ -1720,8 +2057,16 @@ impl Jit {
             let t = plan.entry[0][prm.reg as usize].get().ok_or(())?;
             bx.def_var(vars[&(prm.reg, t)], a);
         }
+        // Resumption on entry: the parameters (and `self`) only.
+        let entry_types: Vec<Option<JTy>> = (0..nregs)
+            .map(|r| {
+                let param =
+                    p.params.iter().any(|q| q.reg as usize == r) || (r == 0 && plan.this.is_some());
+                param.then(|| plan.entry[0][r].get()).flatten()
+            })
+            .collect();
         // `self`: its fields (address checked on entry, as well as the type of the fields
-        // read: no abandon once a field is written).
+        // used).
         let mut this_fp = None;
         let mut this_checks = Vec::new();
         if let Some(info) = &plan.this {
@@ -1743,15 +2088,9 @@ impl Jit {
                 let ip = bx.ins().iconst(types::I64, Rc::as_ptr(info) as i64);
                 let call = bx.ins().call(this_fields_ref, &[obj, ip]);
                 let fp = bx.inst_results(call)[0];
-                // Null address: abandon before reading the fields.
+                // Null address: resumed in the interpreter before reading the fields.
                 let null = bx.ins().icmp_imm_s(IntCC::Equal, fp, 0);
-                err_sites.push((ErrKind::Bail, Span::default()));
-                let id = bx
-                    .ins()
-                    .iconst(types::I64, err_base + (err_sites.len() - 1) as i64);
-                let ok = bx.create_block();
-                bx.ins().brif(null, fail, &[id.into()], ok, &[]);
-                bx.switch_to_block(ok);
+                deopt!(bx, null, entry_types, 0, 0);
                 this_fp = Some(fp);
                 // Every field used (a field of type `T` may hold anything: its old value
                 // must also be simple to be overwritten).
@@ -1799,22 +2138,12 @@ impl Jit {
             fields_ptr.insert(prm.reg, fp);
         }
         for bad in this_checks {
-            err_sites.push((ErrKind::Bail, Span::default()));
-            let eid = err_base + (err_sites.len() - 1) as i64;
-            let cont = bx.create_block();
-            let id = bx.ins().iconst(types::I64, eid);
-            bx.ins().brif(bad, fail, &[id.into()], cont, &[]);
-            bx.switch_to_block(cont);
+            deopt!(bx, bad, entry_types, 0, 0);
         }
         let start = bx.create_block();
         for fp in entry_checks {
             let null = bx.ins().icmp_imm_s(IntCC::Equal, fp, 0);
-            err_sites.push((ErrKind::Bail, Span::default()));
-            let eid = err_base + (err_sites.len() - 1) as i64;
-            let cont = bx.create_block();
-            let id = bx.ins().iconst(types::I64, eid);
-            bx.ins().brif(null, fail, &[id.into()], cont, &[]);
-            bx.switch_to_block(cont);
+            deopt!(bx, null, entry_types, 0, 0);
         }
         bx.ins().jump(start, &[]);
         bx.switch_to_block(start);
@@ -1823,6 +2152,13 @@ impl Jit {
         // Current types (before the instruction) and type written by the instruction.
         let mut cur: Vec<Option<JTy>>;
         let mut dty: Option<JTy>;
+        // Position of the instruction being generated (resumption points).
+        let (mut site_b, mut site_k): (usize, usize);
+        macro_rules! bail {
+            ($bx:expr, $cond:expr) => {
+                deopt!($bx, $cond, cur, site_b, site_k)
+            };
+        }
         macro_rules! tyof {
             ($r:expr) => {
                 cur[$r as usize]
@@ -1855,7 +2191,7 @@ impl Jit {
                 let out = $bx.ins().stack_addr(types::I64, out_slot, 0);
                 let call = $bx.ins().call(list_ref, &[$list, out]);
                 let status = $bx.inst_results(call)[0];
-                check!($bx, status, ErrKind::Bail, $span);
+                bail!($bx, status);
                 let data = $bx.ins().load(types::I64, MemFlagsData::trusted(), out, 0);
                 let len = $bx.ins().load(types::I64, MemFlagsData::trusted(), out, 8);
                 (data, len)
@@ -1938,12 +2274,12 @@ impl Jit {
                     match t {
                         JTy::Int => {
                             let bad = $bx.ins().icmp_imm_s(IntCC::NotEqual, tag, TAG_INT as i64);
-                            check!($bx, bad, ErrKind::Bail, $span);
+                            bail!($bx, bad);
                             raw
                         }
                         JTy::Bool => {
                             let bad = $bx.ins().icmp_imm_s(IntCC::NotEqual, tag, TAG_BOOL as i64);
-                            check!($bx, bad, ErrKind::Bail, $span);
+                            bail!($bx, bad);
                             $bx.ins().ireduce(types::I8, raw)
                         }
                         _ => {
@@ -1951,7 +2287,7 @@ impl Jit {
                             let isi = $bx.ins().icmp_imm_s(IntCC::Equal, tag, TAG_INT as i64);
                             let ok = $bx.ins().bor(isf, isi);
                             let bad = $bx.ins().icmp_imm_s(IntCC::Equal, ok, 0);
-                            check!($bx, bad, ErrKind::Bail, $span);
+                            bail!($bx, bad);
                             let f = $bx.ins().bitcast(types::F64, MemFlagsData::new(), raw);
                             let i = $bx.ins().fcvt_from_sint(types::F64, raw);
                             $bx.ins().select(isf, f, i)
@@ -1965,6 +2301,7 @@ impl Jit {
             cur = plan.entry[bi].iter().map(|l| l.get()).collect();
             for (k, (ins, &span)) in b.instrs.iter().zip(&b.spans).enumerate() {
                 use Instr::*;
+                (site_b, site_k) = (bi, k);
                 dty = plan.defs[bi][k];
                 match ins {
                     Int(d, n) => {
@@ -2063,7 +2400,7 @@ impl Jit {
                         let pp = bx.ins().iconst(types::I64, Rc::as_ptr(declared) as i64);
                         let call = bx.ins().call(method_ref, &[obj, nm, pp]);
                         let other = bx.inst_results(call)[0];
-                        check!(bx, other, ErrKind::Bail, span);
+                        bail!(bx, other);
                         let mut args = vec![ctxv, obj];
                         for (k, pt) in cparams[1..].iter().enumerate() {
                             let r = site.start + k as u32;
@@ -2093,7 +2430,7 @@ impl Jit {
                             MAX_DEPTH_OFFSET,
                         );
                         let too_deep = bx.ins().icmp(IntCC::SignedGreaterThanOrEqual, depth, max);
-                        check!(bx, too_deep, ErrKind::Depth, span);
+                        bail!(bx, too_deep);
                         let d1 = bx.ins().iadd_imm_s(depth, 1);
                         bx.ins()
                             .store(MemFlagsData::trusted(), d1, ctxv, DEPTH_OFFSET);
@@ -2110,6 +2447,10 @@ impl Jit {
                         let cont = bx.create_block();
                         bx.ins().brif(status, failed, &[], cont, &[]);
                         bx.switch_to_block(failed);
+                        // 2: the called function, resumed in the interpreter, returned a
+                        // value of another type: resumed here too, after the call.
+                        let other = bx.ins().icmp_imm_s(IntCC::Equal, status, 2);
+                        deopt!(bx, other, cur, site_b, site_k + 1, Some(*dst));
                         let t = bx.ins().iconst(types::I32, tid);
                         bx.ins().call(trace_ref, &[ctxv, t]);
                         let none = bx.ins().iconst(types::I64, -1);
@@ -2133,7 +2474,7 @@ impl Jit {
                                 let call = bx.ins().call(fields_ref, &[obj, ip]);
                                 let fp = bx.inst_results(call)[0];
                                 let null = bx.ins().icmp_imm_s(IntCC::Equal, fp, 0);
-                                check!(bx, null, ErrKind::Bail, span);
+                                bail!(bx, null);
                                 fp
                             }
                         };
@@ -2145,7 +2486,7 @@ impl Jit {
                             _ => (crate::value::layout::TAG_BOOL, types::I8),
                         };
                         let bad = bx.ins().icmp_imm_s(IntCC::NotEqual, tag, want as i64);
-                        check!(bx, bad, ErrKind::Bail, span);
+                        bail!(bx, bad);
                         let v = bx.ins().load(
                             cty,
                             MemFlagsData::trusted(),
@@ -2167,7 +2508,7 @@ impl Jit {
                         let out = bx.ins().stack_addr(types::I64, out_slot, 0);
                         let call = bx.ins().call(field_ref, &[obj, cache, out]);
                         let status = bx.inst_results(call)[0];
-                        check!(bx, status, ErrKind::Bail, span);
+                        bail!(bx, status);
                         let bits = bx.ins().load(types::I64, MemFlagsData::trusted(), out, 0);
                         let v = match t {
                             RegTy::Float => bx.ins().bitcast(types::F64, MemFlagsData::new(), bits),
@@ -2303,7 +2644,7 @@ impl Jit {
                             MAX_DEPTH_OFFSET,
                         );
                         let too_deep = bx.ins().icmp(IntCC::SignedGreaterThanOrEqual, depth, max);
-                        check!(bx, too_deep, ErrKind::Depth, span);
+                        bail!(bx, too_deep);
                         let d1 = bx.ins().iadd_imm_s(depth, 1);
                         bx.ins()
                             .store(MemFlagsData::trusted(), d1, ctxv, DEPTH_OFFSET);
@@ -2321,6 +2662,10 @@ impl Jit {
                         let cont = bx.create_block();
                         bx.ins().brif(status, failed, &[], cont, &[]);
                         bx.switch_to_block(failed);
+                        // 2: the called function, resumed in the interpreter, returned a
+                        // value of another type: resumed here too, after the call.
+                        let other = bx.ins().icmp_imm_s(IntCC::Equal, status, 2);
+                        deopt!(bx, other, cur, site_b, site_k + 1, Some(*dst));
                         let t = bx.ins().iconst(types::I32, tid);
                         bx.ins().call(trace_ref, &[ctxv, t]);
                         let none = bx.ins().iconst(types::I64, -1);
@@ -2357,7 +2702,7 @@ impl Jit {
                         let from_end = bx.ins().iadd(i, len);
                         let pos = bx.ins().select(neg, from_end, i);
                         let out = bx.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, pos, len);
-                        check!(bx, out, ErrKind::Bail, span);
+                        bail!(bx, out);
                         let off = bx.ins().imul_imm_s(pos, crate::value::layout::SIZE as i64);
                         let addr = bx.ins().iadd(data, off);
                         let v = elem!(bx, addr, e, span);
@@ -2379,6 +2724,7 @@ impl Jit {
                 }
             }
             dty = plan.term_defs[bi];
+            (site_b, site_k) = (bi, b.instrs.len());
             match &b.term {
                 Term::Reraise(_) => unreachable!("function with handlers compiled"),
                 Term::Jump(t) => {
@@ -2465,10 +2811,10 @@ impl Jit {
                     let data = bx.use_var(dv);
                     let off = bx.ins().imul_imm_s(i, crate::value::layout::SIZE as i64);
                     let addr = bx.ins().iadd(data, off);
+                    // Checked first: a resumption sees the iterator before this element.
+                    let v = elem!(bx, addr, a, b.term_span);
                     let i1 = bx.ins().iadd_imm_s(i, 1);
                     bx.def_var(iv, i1);
-                    let span = b.term_span;
-                    let v = elem!(bx, addr, a, span);
                     if is_ref(dty) {
                         put_ref!(bx, *dst, v);
                     } else {
@@ -2576,21 +2922,24 @@ impl Jit {
         Ok(eid)
     }
 
-    /// Runs the native code. `depth`: current call depth.
+    /// Calls native code (`entry`, `n` parameters, result `ret`): `args`, one per native
+    /// parameter (`self` first for a method), alive during the call.
     ///
-    /// `None`: the native stack is too small for the requested depth; the call must be
-    /// redone by the interpreter (whose stack grows on the heap). This is safe: compiled
-    /// functions have no side effects.
-    /// `args`: one per native parameter (`self` first for a method), alive during the
-    /// call.
-    pub fn call<'a>(
-        &mut self,
-        code: &NativeCode,
+    /// # Safety
+    /// `jit` belongs to the runtime `rt`, both valid; the native code may call the runtime
+    /// back (resumption in the interpreter), which may call native code again: neither is
+    /// borrowed during the call.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn call<'a>(
+        jit: *mut Jit,
+        rt: *mut Runtime,
+        entry: usize,
+        n: usize,
+        ret: RegTy,
         args: impl IntoIterator<Item = &'a Value>,
         depth: usize,
         max_depth: usize,
-    ) -> Option<Result<Value, Error>> {
-        let n = code.params.len();
+    ) -> Result<Value, Error> {
         let mut raw = [0u64; 16];
         let mut heap = Vec::new();
         let buf: &mut [u64] = if n <= raw.len() {
@@ -2614,55 +2963,67 @@ impl Jit {
         let stack_cap = stacker::remaining_stack().map_or(usize::MAX, |r| {
             depth.saturating_add(r.saturating_sub(MARGIN) / FRAME)
         });
+        // Beyond: resumption in the interpreter, which grows the stack.
         let limit = max_depth.min(stack_cap);
-        self.ctx.depth = depth as i64;
-        self.ctx.max_depth = limit as i64;
-        self.ctx.err = -1;
-        self.ctx.traces.clear();
-        self.bailed = false;
-        let mut out = 0u64;
-        // Object or list returned: written directly into `result`.
-        let mut result = Value::Nil;
-        let out_ptr = match code.ret {
-            RegTy::Value => &mut result as *mut Value as *mut u64,
-            _ => &mut out as *mut u64,
-        };
-        // SAFETY: `entry` is an entry point generated by `define_entry` with this signature;
-        // the arguments have the expected number and types.
-        let f: extern "C" fn(*mut JitCtx, *const u64, *mut u64) -> i32 =
-            unsafe { std::mem::transmute(code.entry) };
-        let status = f(&mut *self.ctx, buf.as_ptr(), out_ptr);
-        if status == 0 {
-            return Some(Ok(match code.ret {
-                RegTy::Int => Value::Int(out as i64),
-                RegTy::Float => Value::Float(f64::from_bits(out)),
-                RegTy::Bool => Value::Bool(out & 1 == 1),
-                RegTy::Value => result,
-            }));
-        }
-        let info = &self.errors[self.ctx.err as usize];
-        if matches!(info.kind, ErrKind::Bail) {
-            self.bailed = true;
-            return None;
-        }
-        if matches!(info.kind, ErrKind::Depth) && limit < max_depth {
-            return None;
-        }
-        let msg = match info.kind {
-            ErrKind::Overflow => "integer overflow".to_string(),
-            ErrKind::DivZero => "division by zero".to_string(),
-            ErrKind::Depth => {
-                format!("too many nested calls ({max_depth}): infinite recursion?")
+        // SAFETY: see above; the context is only reached through its address.
+        unsafe {
+            let ctx = (*jit).ctx;
+            (*ctx).depth = depth as i64;
+            (*ctx).max_depth = limit as i64;
+            (*ctx).err = -1;
+            (*ctx).traces.clear();
+            (*ctx).rt = rt;
+            (*ctx).pending = None;
+            let mut out = 0u64;
+            // Object or list returned: written directly into `result`.
+            let mut result = Value::Nil;
+            let out_ptr = match ret {
+                RegTy::Value => &mut result as *mut Value as *mut u64,
+                _ => &mut out as *mut u64,
+            };
+            // `entry` is an entry point generated by `define_entry` with this signature;
+            // the arguments have the expected number and types.
+            let f: extern "C" fn(*mut JitCtx, *const u64, *mut u64) -> i32 =
+                std::mem::transmute(entry);
+            let status = f(ctx, buf.as_ptr(), out_ptr);
+            if status == 2 {
+                return Ok((*ctx).returned.take().unwrap_or(Value::Nil));
             }
-            ErrKind::Bail => unreachable!(),
-        };
-        let mut e = Error::runtime(msg, info.span);
-        e.src = Some((info.script.name.clone(), info.script.src.clone()));
-        for &t in self.ctx.traces.iter().take(16) {
-            let t = &self.traces[t as usize];
-            e.trace.push((t.name.to_string(), t.span));
+            if status == 0 {
+                return Ok(match ret {
+                    RegTy::Int => Value::Int(out as i64),
+                    RegTy::Float => Value::Float(f64::from_bits(out)),
+                    RegTy::Bool => Value::Bool(out & 1 == 1),
+                    RegTy::Value => result,
+                });
+            }
+            let jit = &*jit;
+            let mut e = match (*ctx).err {
+                PENDING => (*ctx).pending.take().expect("error of a resumption"),
+                err => {
+                    let info = &jit.errors[err as usize];
+                    let msg = match info.kind {
+                        ErrKind::Overflow => "integer overflow",
+                        ErrKind::DivZero => "division by zero",
+                    };
+                    let mut e = Error::runtime(msg, info.span);
+                    e.src = Some((info.script.name.clone(), info.script.src.clone()));
+                    e
+                }
+            };
+            for &t in (*ctx).traces.iter().take(16) {
+                let t = &jit.traces[t as usize];
+                e.trace.push((t.name.to_string(), t.span));
+            }
+            Err(e)
         }
-        Some(Err(e))
+    }
+}
+
+impl Drop for Jit {
+    fn drop(&mut self) {
+        // SAFETY: allocated by `Box::into_raw` in `Jit::new`, freed once.
+        unsafe { drop(Box::from_raw(self.ctx)) };
     }
 }
 

@@ -405,14 +405,31 @@ impl Runtime {
     // ─── Execution ───────────────────────────────────────────────────────────
 
     fn exec(&mut self, proto: &Proto, upvals: &[Cell], ctx: &Rc<[u32]>, regs: &mut [Value]) -> R {
+        self.exec_at(proto, upvals, ctx, regs, 0, 0)
+    }
+
+    /// Runs `proto` from instruction `k0` of block `b0` (resumption of native code).
+    fn exec_at(
+        &mut self,
+        proto: &Proto,
+        upvals: &[Cell],
+        ctx: &Rc<[u32]>,
+        regs: &mut [Value],
+        b0: usize,
+        k0: usize,
+    ) -> R {
         let mut cells: Vec<Cell> = (0..proto.ncells)
             .map(|_| Rc::new(RefCell::new(Value::Uninit)))
             .collect();
         #[cfg(feature = "jit")]
-        if let Some(entry) = self.dyn_entry(proto) {
+        if b0 == 0
+            && k0 == 0
+            && let Some(entry) = self.dyn_entry(proto)
+        {
             return self.run_native(entry, proto, upvals, ctx, regs, &mut cells);
         }
-        let mut b = 0usize;
+        let mut b = b0;
+        let mut skip = k0;
         // This call's slots of caught errors: `self.caught[base..]`.
         let base = self.caught.len();
         macro_rules! reg {
@@ -422,7 +439,8 @@ impl Runtime {
         }
         'run: loop {
             let block = &proto.blocks[b];
-            for (ins, &span) in block.instrs.iter().zip(&block.spans) {
+            let first = std::mem::take(&mut skip);
+            for (ins, &span) in block.instrs.iter().zip(&block.spans).skip(first) {
                 if let Err(e) = self.step(proto, upvals, ctx, regs, &mut cells, ins, span) {
                     b = self.catch(proto, block, e, regs, base)?;
                     continue 'run;
@@ -1358,7 +1376,8 @@ impl Runtime {
         args: &[Value],
         span: Span,
     ) -> Option<R> {
-        let r = {
+        // Not borrowed during the call: a resumption may mark it interpreted.
+        let (entry, n, ret) = {
             let state = proto.jit.borrow();
             let JitState::Native(code) = &*state else {
                 return None;
@@ -1378,23 +1397,22 @@ impl Runtime {
             if !exact {
                 return None;
             }
-            let jit = self.jit.as_mut()?;
-            match jit.call(
-                code,
+            (code.entry, code.params.len(), code.ret)
+        };
+        let jit: *mut crate::jit::Jit = self.jit.as_mut()?;
+        let (depth, max) = (self.depth + 1, self.max_depth);
+        // SAFETY: `jit` belongs to this runtime; neither is borrowed during the call.
+        let r = unsafe {
+            crate::jit::Jit::call(
+                jit,
+                self,
+                entry,
+                n,
+                ret,
                 this.into_iter().chain(args),
-                self.depth + 1,
-                self.max_depth,
-            ) {
-                Some(r) => r,
-                None => {
-                    // Assumption failed: the function stays interpreted.
-                    if jit.bailed {
-                        drop(state);
-                        *proto.jit.borrow_mut() = JitState::Rejected;
-                    }
-                    return None;
-                }
-            }
+                depth,
+                max,
+            )
         };
         Some(r.map_err(|e| self.traced(e, proto, span)))
     }
@@ -1453,23 +1471,39 @@ impl Runtime {
             jit.len_sym = self.syms.len;
             jit.compile(proto, this, &mut self.globals);
         }
-        let state = proto.jit.borrow();
-        let JitState::Native(code) = &*state else {
-            return None;
+        let (entry, n, ret) = match &*proto.jit.borrow() {
+            JitState::Native(code) => (code.entry, code.params.len(), code.ret),
+            _ => return None,
         };
         let args: Vec<Value> = method
             .then(|| regs[0].clone())
             .into_iter()
             .chain(proto.params.iter().map(|p| regs[p.reg as usize].clone()))
             .collect();
-        let jit = self.jit.as_mut()?;
-        let r = jit.call(code, &args, self.depth, self.max_depth);
-        if r.is_none() && jit.bailed {
-            // Assumption failed: the function stays interpreted.
-            drop(state);
-            *proto.jit.borrow_mut() = JitState::Rejected;
-        }
-        r
+        let jit: *mut crate::jit::Jit = self.jit.as_mut()?;
+        let (depth, max) = (self.depth, self.max_depth);
+        // SAFETY: `jit` belongs to this runtime; neither is borrowed during the call.
+        Some(unsafe { crate::jit::Jit::call(jit, self, entry, n, ret, &args, depth, max) })
+    }
+
+    /// Resumption in the interpreter of native code (see `jit::DeoptSite`): `proto` runs
+    /// from instruction `instr` of block `block`, with the registers rebuilt, at call
+    /// depth `depth`.
+    #[cfg(feature = "jit")]
+    pub(crate) fn resume(
+        &mut self,
+        proto: &Rc<Proto>,
+        regs: &mut [Value],
+        block: u32,
+        instr: u32,
+        depth: usize,
+    ) -> R {
+        let saved = self.depth;
+        self.depth = depth;
+        let ctx = self.no_ctx.clone();
+        let r = self.exec_at(proto, &[], &ctx, regs, block as usize, instr as usize);
+        self.depth = saved;
+        r.map_err(|e| attach_src(e, &proto.script))
     }
 
     // ─── Runtime helpers ─────────────────────────────────────────────────────

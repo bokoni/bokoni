@@ -645,3 +645,40 @@ end
     assert_eq!(bad(true), bad(false));
     assert!(bad(true).contains("expected type `int`, got float"));
 }
+
+#[test]
+fn native_code_resumes_in_the_interpreter() {
+    // In the middle of a `for` over a list: an element whose class redefines the method
+    // called; the interpreter goes on from that element (not from the start).
+    let src = "class A
+  def init(@v: int)
+  end
+  def f(): int = @v
+end
+class B < A
+  def f(): int = @v * 100
+end
+def total(xs: [A]): int
+  let t = 0
+  let k = 0
+  for x in xs
+    k += 1
+    t += x.f() * k
+  end
+  t
+end
+[total([A(1), A(2), B(3), A(4)]), total([A(1), A(1)])]";
+    assert_eq!(same(src), "[921, 3]");
+    // Index out of bounds after a few iterations: the interpreter's error, its stack.
+    same(
+        "def g(xs: [int], n: int): int\n  let t = 0\n  for i in 0..n\n    t += xs[i]\n  end\n  t\nend\ndef h(): int = g([1, 2, 3], 5)\nh()",
+    );
+    // Deep recursion (beyond what the native stack allows at once) and infinite
+    // recursion: the same result and error.
+    same("def d(n: int): int = if n == 0 then 0 else 1 + d(n - 1) end\nd(900)");
+    same("def inf(n: int): int = inf(n + 1) + 1\ninf(0)");
+    // A typed copy (`T = int`) resumed returns a `float`: its native caller resumes too.
+    same(
+        "class Acc(T)\n  def init(@s: T)\n  end\n  def get(): T = @s\nend\ndef run(a: Acc(int)): int = a.get() + 1\nrun(Acc(2))",
+    );
+}

@@ -105,6 +105,8 @@ pub struct Proto {
 pub struct Spec {
     pub names: Vec<Symbol>,
     pub tys: Vec<RtType>,
+    /// The function copied (its annotations as written: what the interpreter runs).
+    pub origin: std::rc::Weak<Proto>,
 }
 
 impl Spec {
@@ -646,7 +648,7 @@ impl Proto {
     /// Copy of this `forall` function with its type parameters replaced by `tys` in the
     /// annotations of its parameters and its return (created once per `tys`). Same code:
     /// only the typed JIT, which reads the annotations, sees a difference.
-    pub fn specialize(&self, tys: &[RtType]) -> Rc<Proto> {
+    pub fn specialize(self: &Rc<Self>, tys: &[RtType]) -> Rc<Proto> {
         let names: Vec<Symbol> = self
             .decl
             .as_ref()
@@ -660,7 +662,7 @@ impl Proto {
 
     /// Same, for the parameters `names` (always the same ones for a given function: those
     /// of its class for a method).
-    pub fn specialize_as(&self, names: &[Symbol], tys: &[RtType]) -> Rc<Proto> {
+    pub fn specialize_as(self: &Rc<Self>, names: &[Symbol], tys: &[RtType]) -> Rc<Proto> {
         if let Some((_, p)) = self.specs.borrow().iter().find(|(k, _)| k == tys) {
             return p.clone();
         }
@@ -707,6 +709,7 @@ impl Proto {
             spec: Some(Rc::new(Spec {
                 names: names.to_vec(),
                 tys: tys.to_vec(),
+                origin: Rc::downgrade(self),
             })),
         });
         self.specs.borrow_mut().push((tys.to_vec(), p.clone()));
