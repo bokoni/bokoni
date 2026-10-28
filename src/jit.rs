@@ -3550,8 +3550,11 @@ impl Jit {
             if callee_refs.contains_key(&key) {
                 continue;
             }
-            let cid = self.compiled.get(&key).ok_or(())?.id;
-            let r = self.module.declare_func_in_func(cid, &mut ctx.func);
+            // (Not compilable: called through the interpreter, see `boxed_call`.)
+            let Some(c) = self.compiled.get(&key) else {
+                continue;
+            };
+            let r = self.module.declare_func_in_func(c.id, &mut ctx.func);
             callee_refs.insert(key, (r, q.proto.clone()));
         }
         let trace_ref = self
