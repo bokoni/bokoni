@@ -430,6 +430,15 @@ fn nil_tests_refine_types() {
             "def f(v: str): int\n  case v\n  when int then 1\n  else 2\n  end\nend",
             "this pattern (`int`) cannot match a value of type `str`",
         ),
+        // `if let a = @a`: a local copy, refined.
+        (
+            "class A\n  def init(@a: int?)\n  end\n  def f(): int\n    if let a = @a then a.upper() else 0 end\n  end\nend",
+            "`int` has no method `upper`",
+        ),
+        (
+            "class A\n  def init(@a: int | str)\n  end\n  def f(): int\n    if (let a = @a).is_a?(str) then a + 1 else a end\n  end\nend",
+            "`+` between `str` and `int`",
+        ),
         // `as(T)` that can never succeed.
         ("\"x\".as(int)", "`str` can never be `int`"),
         // `??` and `?.`: the type without `nil`, or optional.

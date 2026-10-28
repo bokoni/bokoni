@@ -435,6 +435,10 @@ namespaces, `trait` for shared behavior.
       `return`, `raise`, `break` or `next`, the opposite holds for the rest of the block
       (`return 0 if s.nil?` then `s.len()`); ended by an assignment and by a loop; local
       variables and parameters only (not `@a` fields, not inside a lambda)
+- [x] `if let a = @a` (not `nil` in `then`; `if let n = @n and n > 0`) and
+      `if (let a = @a).is_a?(T)`: a local copy declared for the whole `if`, refined
+      by the condition; fix: `let a = b` with `b: int?` was an `any` (`nil` widened in
+      a union), it is an `int?`
 - [x] Type reflection (Crystal's): `x.is_a?(T)` (refines too), `x.as(T)` (checked as
       an annotation: an error at run time, or before running if it can never be),
       `x.as?(T)` (`nil` if it is not a `T`), `x.responds_to?(name)` (refines to the

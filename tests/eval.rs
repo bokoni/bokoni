@@ -218,6 +218,13 @@ fn control_flow() {
         run("class U\n  def init(@n: str, @up: U?)\n  end\n  def n = @n\n  def up = @up\n  def hi(x: str): str = x + @n\nend\nlet a = U(\"a\", nil)\nlet b = U(\"b\", a)\nlet k = 0\ndef f(u: U?): U?\n  k += 1\n  u\nend\nlet none: U? = nil\nlet ps = [{x: 1}]\n[b.up?.n, a.up?.n, a.up?.up?.n, none?.up.n, none?.n ?? \"?\", f(b)?.hi(\"h\"), f(nil)?.hi(\"h\"), k, ps[0]?.x, ps[5]?.x, b\n  ?.up\n  ?.n]"),
         "=> [\"a\", nil, nil, nil, \"?\", \"hb\", nil, 2, 1, nil, \"a\"]"
     );
+    // `if let a = e`, `if (let a = e).is_a?(T)`: `a` for the whole `if`, `e` once.
+    assert_eq!(
+        run(&format!(
+            "{classes}class Home\n  def init(@n: int?, @pet: Animal?)\n  end\n  def next_n(): int\n    if let n = @n then n + 1 else 0 end\n  end\n  def big(): bool\n    if let n = @n and n > 10 then true else false end\n  end\n  def sound(): str\n    if (let p = @pet).is_a?(Dog)\n      p.bark\n    elsif let p = @pet\n      p.name\n    else\n      \"silence\"\n    end\n  end\nend\nlet a = Home(5, Dog())\nlet b = Home(nil, Animal())\nlet c = Home(20, nil)\nlet k = 0\ndef f()\n  k += 1\n  false\nend\n[a.next_n(), b.next_n(), a.big(), c.big(), a.sound(), b.sound(), c.sound(), if let x = f() then 1 else x end, k]"
+        )),
+        "=> [6, 0, false, true, \"woof\", \"animal\", \"silence\", false, 1]"
+    );
     // `a?[i]` (`c ?[1] : [2]`: a ternary).
     assert_eq!(
         run("let xs: [int]? = [1, 2]\nlet none: [int]? = nil\nlet h: {str => [int]}? = {\"a\" => [5]}\nlet c = true\n[xs?[0], none?[0], none?[0].abs(), xs?[1].abs(), h?[\"a\"]?[0], none?[0] ?? 9, c ?[1] : [2], xs?[5]?]"),

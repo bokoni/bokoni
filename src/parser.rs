@@ -86,6 +86,7 @@ pub fn parse_with(
         s_parts: Vec::new(),
         depth: 0,
         no_do: false,
+        lead: None,
         errors: Vec::new(),
         abort: false,
     };
@@ -141,6 +142,9 @@ struct Parser<'s, 'i> {
     depth: u32,
     /// In a `while` / `for` header, a `do` does not attach to the expression.
     no_do: bool,
+    /// The first operand of the expression being parsed, already read (`if let a = …`
+    /// is followed by the rest of the condition).
+    lead: Option<ExprId>,
     /// Reported errors; parsing goes on after each one.
     errors: Vec<Error>,
     /// Parsing stopped (premature end of source, too many errors).
@@ -614,6 +618,7 @@ impl Parser<'_, '_> {
     }
 
     fn restore(&mut self, s: Snapshot) {
+        self.lead = None;
         self.depth = s.depth;
         self.no_do = s.no_do;
         self.s_exprs.truncate(s.lens[0]);
@@ -1034,6 +1039,7 @@ impl Parser<'_, '_> {
             s_parts: Vec::new(),
             depth: self.depth,
             no_do: false,
+            lead: None,
             errors: Vec::new(),
             abort: false,
         };
@@ -2115,6 +2121,9 @@ impl Parser<'_, '_> {
     }
 
     fn prefix(&mut self) -> Result<ExprId> {
+        if let Some(e) = self.lead.take() {
+            return self.postfix(e);
+        }
         let start = self.tok().span;
         match self.peek() {
             T::Minus => {
@@ -2825,6 +2834,7 @@ impl Parser<'_, '_> {
 
     /// Rest of an `if` / `elsif` after the keyword.
     fn if_tail(&mut self, start: Span, opener: &str) -> Result<ExprId> {
+        let bound = self.bound_in_condition()?;
         let cond = self.condition(opener)?;
         let then = self.block(&[T::Elsif, T::Else, T::End])?;
         let else_ = match self.peek() {
@@ -2843,9 +2853,39 @@ impl Parser<'_, '_> {
             }
         };
         let span = self.span_from(start);
-        Ok(self
+        let test = self
             .ast
-            .push_control(Control::If(If { cond, then, else_ }), span))
+            .push_control(Control::If(If { cond, then, else_ }), span);
+        Ok(match bound {
+            Some((name, value)) => self.let_in(value, name, test, span),
+            None => test,
+        })
+    }
+
+    /// `if let a = e …` (the rest of the condition after `e`: `and` / `or`, or nothing:
+    /// `a` not `nil` nor `false`), `if (let a = e).is_a?(T) …`: `a` declared for the
+    /// whole `if`, the first operand of its condition (evaluated first: declared before
+    /// the `if`). A local copy of `@a` its tests refine.
+    fn bound_in_condition(&mut self) -> Result<Option<(Symbol, ExprId)>> {
+        let paren = self.at(T::LParen) && self.peek2() == T::Let;
+        if !paren && !self.at(T::Let) {
+            return Ok(None);
+        }
+        if paren {
+            self.bump();
+        }
+        self.bump();
+        let (name, name_span) = self.ident("after `let`")?;
+        self.expect(T::Eq, "after the name")?;
+        // (Without parentheses: up to `and` / `or`.)
+        let value = if paren { self.expr()? } else { self.binary(5)? };
+        let end = if paren {
+            self.expect(T::RParen, "to close the `let`")?.span
+        } else {
+            self.span(value)
+        };
+        self.lead = Some(self.mk(ExprKind::Ident(name), name_span.to(end)));
+        Ok(Some((name, value)))
     }
 
     /// Condition followed by `then` or a line end.

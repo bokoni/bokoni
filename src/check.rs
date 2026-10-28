@@ -172,7 +172,12 @@ impl Ty {
             Ty::Hash(k, v) => Ty::Hash(Box::new(k.widen()), Box::new(v.widen())),
             Ty::Record(fs) => Ty::Record(fs.into_iter().map(|(n, t)| (n, t.widen())).collect()),
             Ty::Tuple(ts) => Ty::Tuple(ts.into_iter().map(Ty::widen).collect()),
-            Ty::Union(ts) => union(ts.into_iter().map(Ty::widen).collect()),
+            // (`nil` in a union stays: `let a = b` with `b: int?` is an `int?`.)
+            Ty::Union(ts) => union(
+                ts.into_iter()
+                    .map(|t| if t == Ty::Nil { t } else { t.widen() })
+                    .collect(),
+            ),
             t => t,
         }
     }

@@ -69,6 +69,23 @@ end
 - For local variables and parameters, in the same function (not in a lambda); an
   assignment or a loop ends it. `a ?? b` has the type of `a` without `nil` (or `b`'s).
 
+A field (`@a`) is not refined: a method called in between may change it. Its tests are
+done on a local copy, which `if let` declares for the whole `if`:
+
+```ruby
+if let pet = @pet              # `pet` not `nil` (nor `false`)
+  pet.name
+end
+if let n = @count and n > 10   # the value stops before `and` / `or`
+  "many"
+end
+if (let p = @pet).is_a?(Dog)   # in parentheses: the first operand of the condition
+  p.bark
+elsif let p = @pet
+  p.name
+end
+```
+
 ### Type reflection
 
 As in Crystal, pseudo-methods that take a type (or a method name) and refine types:
