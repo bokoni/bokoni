@@ -2358,7 +2358,29 @@ impl Compiler<'_> {
                 self.emit(Instr::Concat(r, start, parts.len() as u32), span);
                 (r, RegTy::Value)
             }
-            ExprKind::Ident(name) => self.read_var(name, span),
+            ExprKind::Ident(name) => {
+                let v = self.read_var(name, span);
+                // Refined by a test: checked into a typed register (a variable in a
+                // register only, which nothing else can assign meanwhile).
+                if v.1 == RegTy::Value
+                    && let Some(&t) = self.prims.refined.get(&e.0)
+                    && matches!(
+                        self.resolve(name),
+                        Some((
+                            Var {
+                                store: Store::Reg(_),
+                                ..
+                            },
+                            _
+                        ))
+                    )
+                {
+                    let d = self.tmp(t);
+                    self.emit(Instr::Guard(d, v.0, t), span);
+                    return (d, t);
+                }
+                v
+            }
             ExprKind::SelfRef => self.self_value(span),
             ExprKind::IVar(name) => {
                 let Some(idx) = self.this_field(name, span) else {

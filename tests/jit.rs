@@ -1276,3 +1276,25 @@ fn global_lists_are_read_natively() {
     assert!(e.eval("xs = [0.5]\ntotal()").is_err());
     assert_eq!(e.eval_as::<i64>("xs = [4, 1]\ntotal()").unwrap(), 10);
 }
+
+#[test]
+fn refined_values_are_native() {
+    // A parameter of any value (`int?`, a union) and its tests: compiled, the variable
+    // read as an `int` where a test refined it.
+    let src = "def f(x: int?, n: int): int\n  let t = 0\n  let i = 0\n  while i < n\n    if x != nil\n      t += x * 2 + i\n    end\n    i += 1\n  end\n  t\nend\ndef g(v: int | str): int\n  if v.is_a?(int) then v + 1 else 0 end\nend\n";
+    assert_eq!(
+        same(&format!("{src}[f(3, 10), f(nil, 10), g(1), g(\"ab\")]")),
+        "[105, 0, 2, 0]"
+    );
+    let mut e = Engine::new();
+    e.eval(&format!("{src}f(3, 2)\nf(nil, 2)\ng(1)")).unwrap();
+    for f in ["f", "g"] {
+        assert!(e.is_native(f), "`{f}` should be compiled");
+    }
+    // Still checked by the interpreter: the argument, the result.
+    same("def f(x: int?): int = 1\ndef h(x: any): int?\n  x\nend\n[f(1), h(nil), h(2)]");
+    let mut e = Engine::new();
+    e.set_static_checks(false);
+    assert!(e.eval("def f(x: int?): int = 1\nf(\"s\")").is_err());
+    assert!(e.eval("def h(x: any): int?\n  x\nend\nh(\"s\")").is_err());
+}

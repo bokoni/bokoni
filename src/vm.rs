@@ -1505,6 +1505,8 @@ impl Runtime {
             }
             (code.entry, code.params.len(), code.ret)
         };
+        // (Simple types only, passed by value.)
+        let by_ref = 0;
         let jit: *mut crate::jit::Jit = self.jit.as_mut()?;
         let (depth, max) = (self.depth + 1, self.max_depth);
         // SAFETY: `jit` belongs to this runtime; neither is borrowed during the call.
@@ -1514,6 +1516,7 @@ impl Runtime {
                 self,
                 entry,
                 n,
+                by_ref,
                 ret,
                 this.into_iter().chain(args),
                 upvals,
@@ -1586,8 +1589,13 @@ impl Runtime {
             jit.len_sym = self.syms.len;
             jit.compile(proto, this, &mut self.globals, upvals);
         }
-        let (entry, n, ret) = match &*proto.jit.borrow() {
-            JitState::Native(code) => (code.entry, code.params.len(), code.ret),
+        let (entry, n, by_ref, ret) = match &*proto.jit.borrow() {
+            JitState::Native(code) => (
+                code.entry,
+                code.params.len(),
+                crate::jit::by_ref(&code.params)?,
+                code.ret,
+            ),
             _ => return None,
         };
         let args: Vec<Value> = method
@@ -1598,7 +1606,9 @@ impl Runtime {
         let jit: *mut crate::jit::Jit = self.jit.as_mut()?;
         let (depth, max) = (self.depth, self.max_depth);
         // SAFETY: `jit` belongs to this runtime; neither is borrowed during the call.
-        Some(unsafe { crate::jit::Jit::call(jit, self, entry, n, ret, &args, upvals, depth, max) })
+        Some(unsafe {
+            crate::jit::Jit::call(jit, self, entry, n, by_ref, ret, &args, upvals, depth, max)
+        })
     }
 
     /// Resumption in the interpreter of native code (see `jit::DeoptSite`): `proto` runs

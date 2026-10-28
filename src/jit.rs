@@ -1805,7 +1805,15 @@ fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
         if prm.has_default {
             return None;
         }
-        params.push(native_ty(&prm.ty.as_ref()?.ty)?);
+        // Any value (`x: int?`, `x: int | str`): pointer to it (`JTy::Boxed`), checked by
+        // the interpreter before the call. (Not a result: its annotation is checked by
+        // the interpreter.)
+        let t = &prm.ty.as_ref()?.ty;
+        params.push(if any_value(t) {
+            RegTy::Value
+        } else {
+            native_ty(t)?
+        });
     }
     // Not annotated: any value (in the caller's slot).
     let ret = match &p.ret {
@@ -1865,8 +1873,29 @@ fn intern_ann(anns: &mut Vec<RtType>, t: &RtType) -> u32 {
 }
 
 /// Native type of a value annotated `t` (`native_ty` accepts it).
+/// Parameters of native code passed as a pointer to their value (bit `k`: parameter
+/// `k`); `None` beyond 64 parameters.
+pub(crate) fn by_ref(params: &[RegTy]) -> Option<u64> {
+    if params.len() > 64 {
+        return None;
+    }
+    Some(
+        params
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| **t == RegTy::Value)
+            .fold(0, |m, (k, _)| m | 1 << k),
+    )
+}
+
+/// Annotation whose values are handled as values of any type in native code.
+fn any_value(t: &RtType) -> bool {
+    matches!(t, RtType::Any | RtType::Optional(_) | RtType::Union(_))
+}
+
 fn value_jty(anns: &mut Vec<RtType>, t: &RtType) -> JTy {
     match t {
+        t if any_value(t) => JTy::Boxed,
         RtType::Named(..) => JTy::Obj(intern_ann(anns, t)),
         RtType::Str => JTy::Str,
         RtType::List(e) => JTy::List(intern_ann(anns, e)),
@@ -2018,6 +2047,20 @@ struct Plan {
 
 /// Types of the operands of a `Bin` with a value of any type as a number (`JTy::Boxed`
 /// speculated: `int`, or `float` with a `float`); the others unchanged.
+/// `a == nil` with `a` a value of any type (`Some(true)`) or of a simple type
+/// (`Some(false)`: never `nil`).
+fn nil_test(ta: JTy, tb: JTy) -> Option<bool> {
+    let other = match (ta, tb) {
+        (JTy::Nil, t) | (t, JTy::Nil) => t,
+        _ => return None,
+    };
+    match other {
+        JTy::Boxed => Some(true),
+        JTy::Int | JTy::Float | JTy::Bool => Some(false),
+        _ => None,
+    }
+}
+
 fn spec_operands(ta: JTy, tb: JTy) -> (JTy, JTy) {
     let spec = |t: JTy, other: JTy| match (t, other) {
         (JTy::Boxed, JTy::Float) => JTy::Float,
@@ -2572,11 +2615,14 @@ impl Analysis<'_> {
             },
             Bin(op, _, a, b) => {
                 let (ta, tb) = (g(*a)?, g(*b)?);
+                // `x == nil`: its tag (constant for a simple type).
+                let nil_cmp = matches!(op, BinOp::Eq | BinOp::Ne) && nil_test(ta, tb).is_some();
                 // A value of any type (an element of a hash…) with a number: speculated
                 // to be a number too (its tag checked; otherwise resumed in the
                 // interpreter, and this instruction done by it after).
                 let (ta, tb) = spec_operands(ta, tb);
                 match (*op, ta, tb) {
+                    _ if nil_cmp => JTy::Bool,
                     (op, JTy::Int, JTy::Int) if is_arith(op) => JTy::Int,
                     (op, _, _) if is_arith(op) && numeric(ta) && numeric(tb) => JTy::Float,
                     (op, _, _) if is_cmp(op) && numeric(ta) && numeric(tb) => JTy::Bool,
@@ -5317,6 +5363,24 @@ impl Jit {
                     }
                     Bin(op, d, a, b2) => {
                         let (ta, tb) = (tyof!(*a), tyof!(*b2));
+                        if let (Some(t1), Some(t2)) = (ta, tb)
+                            && let Some(boxed) = nil_test(t1, t2)
+                        {
+                            let eq = *op == BinOp::Eq;
+                            let v = if boxed {
+                                // (The `nil` operand is never read.)
+                                let r = if t1 == JTy::Boxed { *a } else { *b2 };
+                                let p = bx.use_var(uvar!(r));
+                                let tag = bx.ins().load(types::I8, MemFlagsData::trusted(), p, 0);
+                                let cc = if eq { IntCC::Equal } else { IntCC::NotEqual };
+                                bx.ins()
+                                    .icmp_imm_u(cc, tag, crate::value::layout::TAG_NIL as i64)
+                            } else {
+                                bx.ins().iconst(types::I8, (!eq) as i64)
+                            };
+                            bx.def_var(dvar!(*d), v);
+                            continue;
+                        }
                         let (x, y) = (bx.use_var(uvar!(*a)), bx.use_var(uvar!(*b2)));
                         // A value of any type speculated to be a number: its payload.
                         let (sa, sb) = spec_operands(ta.ok_or(())?, tb.ok_or(())?);
@@ -5905,7 +5969,8 @@ impl Jit {
     }
 
     /// Calls native code (`entry`, `n` parameters, result `ret`): `args`, one per native
-    /// parameter (`self` first for a method), alive during the call.
+    /// parameter (`self` first for a method), alive during the call. `by_ref`: bit `k`
+    /// set for a parameter of type `RegTy::Value` (see `by_ref`).
     ///
     /// # Safety
     /// `jit` belongs to the runtime `rt`, both valid; the native code may call the runtime
@@ -5917,6 +5982,7 @@ impl Jit {
         rt: *mut Runtime,
         entry: usize,
         n: usize,
+        by_ref: u64,
         ret: RegTy,
         args: impl IntoIterator<Item = &'a Value>,
         env: &[crate::vm::Cell],
@@ -5931,8 +5997,10 @@ impl Jit {
             heap.resize(n, 0);
             &mut heap
         };
-        for (slot, v) in buf.iter_mut().zip(args) {
+        for (k, (slot, v)) in buf.iter_mut().zip(args).enumerate() {
             *slot = match v {
+                // Any value (`x: int?`): pointer to it.
+                v if k < 64 && by_ref >> k & 1 == 1 => v as *const Value as u64,
                 Value::Int(i) => *i as u64,
                 Value::Float(f) => f.to_bits(),
                 Value::Bool(b) => *b as u64,

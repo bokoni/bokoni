@@ -68,6 +68,8 @@ pub struct Prims {
     /// Field reads (`p.x`), by expression: annotated field of a `type`, whose value is
     /// checked on every construction and assignment.
     pub fields: FxHashMap<u32, RegTy>,
+    /// Variable reads (`x`), by expression: refined by a test (`if x != nil`).
+    pub refined: FxHashMap<u32, RegTy>,
 }
 
 fn prim(t: &Ty) -> Option<RegTy> {
@@ -2477,7 +2479,17 @@ impl Checker<'_> {
                     Ty::Any
                 }
             },
-            ExprKind::Ident(name) => self.ident(name, span),
+            ExprKind::Ident(name) => {
+                let t = self.ident(name, span);
+                // Refined to a simple type its variable does not have: read into a
+                // typed register.
+                if let Some(p) = prim(&t)
+                    && self.refined(name).is_some()
+                {
+                    self.prims.refined.insert(e.0, p);
+                }
+                t
+            }
             ExprKind::IVar(name) => self.ivar(name, span),
             ExprKind::Path(p) => self.path(ast.get(p), span),
 

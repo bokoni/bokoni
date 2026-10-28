@@ -444,6 +444,12 @@ namespaces, `trait` for shared behavior.
       `x.as?(T)` (`nil` if it is not a `T`), `x.responds_to?(name)` (refines to the
       types that have it); `T` any annotation type (`int | str`, `[int]`, a class, a
       trait, a generic type checked as its class)
+- [x] Refined types in native code: a variable the checker refined to `int`, `float`
+      or `bool` (`if x != nil … x * 2`) read into a typed register (its tag checked);
+      parameters of any value (`x: int?`, `x: int | str`, `x: any`) compiled (a
+      pointer to the argument, checked by the interpreter before the call); `x == nil`
+      on such a value is a test of its tag. A loop of 5 M turns over an `int?`
+      parameter: 0.09 s (baseline code) → under 0.01 s, as with an `int`
 - [x] `case` by type: `when int`, `when Animal`, `when int | str` (an `is_a?` of the
       subject, which is refined in that arm and, in the next ones and `else`, to the
       types left); not `nil` without `else` when every type is covered
