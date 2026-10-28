@@ -57,7 +57,7 @@ methods! {
     Replace = "replace", Chars = "chars", ToI = "to_i", ToF = "to_f",
     ToIOpt = "to_i?", ToFOpt = "to_f?",
     Abs = "abs", Floor = "floor", Ceil = "ceil", Round = "round", Sqrt = "sqrt",
-    Call = "call", ToList = "to_list", IsNil = "nil?",
+    Call = "call", ToList = "to_list", IsNil = "nil?", RespondsTo = "responds_to?",
 }
 
 impl Runtime {
@@ -307,6 +307,34 @@ impl Runtime {
         self.call_value(f, CallArgs::plain(args.into()), span)
     }
 
+    /// Has `v` a method `name` (`v.responds_to?(name)`)? Those of its class (for a
+    /// `type`, its fields too), of a record its fields, the built-in ones otherwise.
+    fn responds_to(&self, v: &Value, name: &str) -> bool {
+        use crate::check::*;
+        if UNIVERSAL_METHODS.contains(&name) {
+            return true;
+        }
+        let sym = self.interner.get(name);
+        match v {
+            Value::Object(o) => {
+                let o = o.borrow();
+                sym.is_some_and(|s| {
+                    o.info.methods.contains_key(&s)
+                        || (o.info.kind != crate::ast::TypeDeclKind::Class
+                            && o.info.fields.iter().any(|f| f.name == s))
+                })
+            }
+            Value::Record(r) => sym.is_some_and(|s| r.borrow().get(s).is_some()),
+            Value::Str(_) => STR_METHODS.contains(&name),
+            Value::Int(_) | Value::Float(_) => NUM_METHODS.contains(&name),
+            Value::List(_) => LIST_METHODS.contains(&name),
+            Value::Range(_) => RANGE_METHODS.contains(&name),
+            Value::Hash(_) => HASH_METHODS.contains(&name),
+            Value::Function(_) => name == "call",
+            _ => false,
+        }
+    }
+
     pub(crate) fn method(&mut self, recv: Value, name: Symbol, args: Vec<Value>, span: Span) -> R {
         use Method as M;
         let Some(&(m, mname)) = self.methods.get(&name) else {
@@ -329,6 +357,19 @@ impl Runtime {
             (M::IsNil, _) => {
                 n(0)?;
                 Ok(Value::Bool(matches!(recv, Value::Nil)))
+            }
+            (M::RespondsTo, _) => {
+                n(1)?;
+                match &args[0] {
+                    Value::Str(m) => Ok(Value::Bool(self.responds_to(&recv, m))),
+                    a => type_err(
+                        format!(
+                            "`responds_to?` expects a method name, got {}",
+                            a.type_label()
+                        ),
+                        span,
+                    ),
+                }
             }
 
             // ── Numbers

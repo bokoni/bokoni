@@ -458,6 +458,7 @@ impl Resolver<'_> {
                 true
             }
             ExprKind::Raise(v) => self.expr(v),
+            ExprKind::TypeTest(c) => self.expr(ast.type_test(c).value),
             ExprKind::Super(args) => {
                 self.refer(SELF);
                 self.args(args, None)
@@ -2715,6 +2716,33 @@ impl Compiler<'_> {
                 );
                 (dst, RegTy::Value)
             }
+            ExprKind::TypeTest(c) => {
+                let x = ast.type_test(c);
+                let v = self.expr(x.value);
+                let ty = self.type_idx(&x.ty);
+                match x.op {
+                    TypeOp::Is => {
+                        let d = self.tmp(RegTy::Bool);
+                        self.emit(Instr::IsType(d, v.0, ty), span);
+                        (d, RegTy::Bool)
+                    }
+                    // Checked as an annotation (`let x: T = …`).
+                    TypeOp::As => {
+                        let shape = self.shape(x.value);
+                        let dst = self.tmp(prim_of(&x.ty, self.i).unwrap_or(RegTy::Value));
+                        self.emit(
+                            Instr::Coerce {
+                                dst,
+                                src: v.0,
+                                ty,
+                                shape,
+                            },
+                            span,
+                        );
+                        (dst, self.f().regs[dst as usize])
+                    }
+                }
+            }
             ExprKind::Raise(v) => {
                 let v = self.expr(v);
                 let r = self.boxed(v, span);
@@ -3510,6 +3538,7 @@ fn visit(ast: &Ast, e: ExprId, f: &mut dyn FnMut(ExprId)) {
             }
         }
         ExprKind::Return(Some(x)) | ExprKind::Raise(x) => visit(ast, x, f),
+        ExprKind::TypeTest(c) => visit(ast, ast.type_test(c).value, f),
         ExprKind::Super(args) => {
             for a in ast.get(args) {
                 visit(ast, a.value, f);

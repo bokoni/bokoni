@@ -666,6 +666,17 @@ impl Printer<'_> {
                 self.args(args, None);
                 self.out.push(')');
             }
+            ExprKind::TypeTest(c) => {
+                let x = ast.type_test(c);
+                self.out.push_str(match x.op {
+                    TypeOp::Is => "(is_a? ",
+                    TypeOp::As => "(as ",
+                });
+                self.expr(x.value);
+                self.out.push(' ');
+                self.ty(&x.ty);
+                self.out.push(')');
+            }
             ExprKind::Raise(v) => {
                 self.out.push_str("(raise ");
                 self.expr(v);

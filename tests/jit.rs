@@ -1195,6 +1195,8 @@ fn hashes_records_tuples_in_native_code() {
         "def f(xs: [int?]): int\n  let t = 0\n  for x in xs\n    t += (x ?? 10) > 3 ? x ?? 1 : 100\n  end\n  t\nend\nf([1, nil, 5, nil, 2])",
         // `?.` in typed code.
         "class U\n  def init(@n: str, @up: U?)\n  end\n  def n = @n\n  def up = @up\nend\ndef label(u: U?): str = u?.up?.n ?? \"-\"\nlet a = U(\"a\", nil)\nlet b = U(\"b\", a)\nlet t = 0\nfor i in 0...200\n  t += label(i % 3 == 0 ? b : i % 3 == 1 ? a : nil).len()\nend\n[t, label(b), label(a), label(nil)]",
+        // `is_a?`, `as?` in a loop.
+        "def f(n: int): int\n  let t = 0\n  for i in 0...n\n    let v: int | str = i % 3 == 0 ? \"ab\" : i\n    t += v.is_a?(int) ? v : v.len()\n    t += v.as?(int) ?? 100\n  end\n  t\nend\nf(50)",
         // `for` with a pattern.
         "def f(ps: [(int, (int, int))]): int\n  let t = 0\n  for (i, (a, b)) in ps\n    t += i * a + b\n  end\n  t\nend\nf([(1, (2, 3)), (4, (5, 6))])",
         // A value of any type speculated to be a number: an `int`, a `float`, then not.

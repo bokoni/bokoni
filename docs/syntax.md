@@ -63,11 +63,45 @@ end
 ```
 
 - Tests: `x.nil?` (on any value), `x == nil`, `x != nil`, `if x` (not `nil` when
-  true), `not`, `unless`, `and` / `or` (also for their right side:
-  `x != nil and x > 0`); a branch that ends with `return`, `raise`, `break` or `next`
-  refines the rest of the block.
+  true), `x.is_a?(T)`, `x.responds_to?(name)` (see below), `not`, `unless`,
+  `and` / `or` (also for their right side: `x != nil and x > 0`); a branch that ends
+  with `return`, `raise`, `break` or `next` refines the rest of the block.
 - For local variables and parameters, in the same function (not in a lambda); an
   assignment or a loop ends it. `a ?? b` has the type of `a` without `nil` (or `b`'s).
+
+### Type reflection
+
+As in Crystal, pseudo-methods that take a type (or a method name) and refine types:
+
+```ruby
+def describe(v: int | str | Animal): str
+  if v.is_a?(int)
+    "number #{v + 1}"          # here `v` is `int`
+  elsif v.is_a?(str)
+    "text of #{v.len()}"       # here `v` is `str`
+  else
+    v.name                     # here `v` is `Animal`
+  end
+end
+
+let port = input.as?(int) ?? 8080
+let s = value.as(str)          # an error if `value` is not a `str`
+if x.responds_to?(len)
+  x.len()                      # here `x` has the types that have `len`
+end
+```
+
+| Pseudo-method          | Result                                                        |
+|------------------------|---------------------------------------------------------------|
+| `x.is_a?(T)`           | `x` is of type `T` (a subclass, a trait it includes, a member of a union `T`: also); refines `x` to `T` (`else`: without `T`) |
+| `x.as(T)`              | `x`, of type `T`: checked as an annotation (an error at run time, or before running if it can never be); `as` does not convert |
+| `x.as?(T)`             | `x` if it is a `T`, otherwise `nil`: `x.as?(int) ?? 0`         |
+| `x.responds_to?(name)` | `x` has that method (or, for a `type` or a record, that field); refines `x` to the types that have it |
+| `typeof(x)`            | the name of `x`'s type at run time (`"int"`)                   |
+
+`T` is any type of the annotations: `int`, `int | str`, `[int]`, `int?`, a class, a
+trait, a generic type (its arguments are not checked at run time: `Box(int)` is
+checked as a `Box`).
 
 Whatever is not certain is checked at run time. From Rust, static checking can be
 disabled (`engine.set_static_checks(false)`).

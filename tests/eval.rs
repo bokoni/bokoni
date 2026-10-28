@@ -181,6 +181,31 @@ fn control_flow() {
         "=> [9, 1, false, 2, 1, 2, false, 7]"
     );
     assert!(err("true ? 1").1.contains("between the two values of `? :`"));
+    // Type reflection: `is_a?`, `as`, `as?`, `responds_to?`.
+    let classes = "trait Greet\n  def hi(): str = \"hi\"\nend\nclass Animal\n  def name = \"animal\"\nend\nclass Dog < Animal\n  include Greet\n  def bark = \"woof\"\nend\ntype Point\n  x: int = 0\nend\ndef id(x) = x\nlet d = Dog()\n";
+    assert_eq!(
+        run(&format!(
+            "{classes}[d.is_a?(Dog), d.is_a?(Animal), d.is_a?(Greet), Animal().is_a?(Dog), 1.is_a?(int | str), nil.is_a?(int?), [1, \"a\"].is_a?([int]), [1].is_a?([int])]"
+        )),
+        "=> [true, true, true, false, true, true, false, true]"
+    );
+    assert_eq!(
+        run(&format!(
+            "{classes}let m: int | str = \"abc\"\nlet n: int? = nil\n[m.as(str).len(), id(1).as?(str), \"x\".as?(str), n.as?(int) ?? 7, d.as(Animal).name]"
+        )),
+        "=> [3, nil, \"x\", 7, \"animal\"]"
+    );
+    assert_eq!(
+        run(&format!(
+            "{classes}[1.responds_to?(abs), \"s\".responds_to?(abs), d.responds_to?(bark), d.responds_to?(hi), Animal().responds_to?(bark), Point().responds_to?(x), {{a: 1}}.responds_to?(a), [1].responds_to?(len), nil.responds_to?(nil?)]"
+        )),
+        "=> [true, false, true, true, false, true, true, true, true]"
+    );
+    assert!(
+        err("def id(x) = x\nid(\"x\").as(int)")
+            .1
+            .contains("expected type `int`, got str")
+    );
     // `a?.b`: `nil` for a `nil` `a`, the rest of the chain skipped, `a` evaluated once.
     assert_eq!(
         run("class U\n  def init(@n: str, @up: U?)\n  end\n  def n = @n\n  def up = @up\n  def hi(x: str): str = x + @n\nend\nlet a = U(\"a\", nil)\nlet b = U(\"b\", a)\nlet k = 0\ndef f(u: U?): U?\n  k += 1\n  u\nend\nlet none: U? = nil\nlet ps = [{x: 1}]\n[b.up?.n, a.up?.n, a.up?.up?.n, none?.up.n, none?.n ?? \"?\", f(b)?.hi(\"h\"), f(nil)?.hi(\"h\"), k, ps[0]?.x, ps[5]?.x, b\n  ?.up\n  ?.n]"),

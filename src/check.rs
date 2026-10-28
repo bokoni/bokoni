@@ -50,6 +50,7 @@ pub fn check(
         prims: Prims::default(),
         warnings: Vec::new(),
         deprecated_fns: FxHashMap::default(),
+        tested: FxHashMap::default(),
         deprecated_params: FxHashMap::default(),
         tparams: Vec::new(),
         tscope: Vec::new(),
@@ -312,9 +313,19 @@ struct Scope {
     refined: FxHashMap<Symbol, Ty>,
 }
 
-/// What a condition tells about a variable when it is true (or false): it is `nil`
-/// (`true`), or it is not (`false`).
-type Facts = Vec<(Symbol, bool)>;
+/// What a condition tells about variables when it is true (or false): for each, a
+/// property and whether it holds.
+type Facts = Vec<(Symbol, Fact, bool)>;
+
+#[derive(Clone)]
+enum Fact {
+    /// Is `nil`.
+    Nil,
+    /// Is of this type (`is_a?`).
+    Is(Ty),
+    /// Has this method (`responds_to?`).
+    Has(Symbol),
+}
 
 #[derive(Default)]
 struct FnCtx {
@@ -350,6 +361,8 @@ struct Checker<'a> {
     warnings: Vec<Error>,
     /// `@[Deprecated]` functions and methods (key: address of the signature).
     deprecated_fns: FxHashMap<usize, Dep>,
+    /// Type of each `x.is_a?(T)` checked (key: the expression), for the facts it gives.
+    tested: FxHashMap<u32, Ty>,
     /// `@[Deprecated]` parameters (key: address of the signature, parameter index).
     deprecated_params: FxHashMap<(usize, usize), Dep>,
     /// Every type parameter declared.
@@ -364,7 +377,7 @@ struct Checker<'a> {
 const UNKNOWN_TYPE: TypeId = usize::MAX;
 
 /// Built-in methods by receiver type (for suggestions).
-const STR_METHODS: &[&str] = &[
+pub(crate) const STR_METHODS: &[&str] = &[
     "len",
     "is_empty",
     "upper",
@@ -385,19 +398,21 @@ const STR_METHODS: &[&str] = &[
     "to_s",
     "inspect",
 ];
-const NUM_METHODS: &[&str] = &[
+/// Methods of every value.
+pub(crate) const UNIVERSAL_METHODS: &[&str] = &["to_s", "inspect", "nil?", "responds_to?"];
+pub(crate) const NUM_METHODS: &[&str] = &[
     "abs", "to_f", "to_i", "to_f?", "to_i?", "floor", "ceil", "round", "sqrt", "to_s", "inspect",
 ];
-const LIST_METHODS: &[&str] = &[
+pub(crate) const LIST_METHODS: &[&str] = &[
     "len", "is_empty", "push", "pop", "first", "last", "contains", "join", "reverse", "sort",
     "sum", "min", "max", "map", "filter", "each", "find", "any", "all", "reduce", "to_s",
     "inspect",
 ];
-const RANGE_METHODS: &[&str] = &[
+pub(crate) const RANGE_METHODS: &[&str] = &[
     "len", "contains", "to_list", "map", "filter", "each", "find", "any", "all", "reduce", "to_s",
     "inspect",
 ];
-const HASH_METHODS: &[&str] = &[
+pub(crate) const HASH_METHODS: &[&str] = &[
     "len", "is_empty", "keys", "values", "has", "get", "delete", "each", "to_s", "inspect",
 ];
 
@@ -826,7 +841,22 @@ impl Checker<'_> {
         let is_nil = |e: ExprId| matches!(ast.kind(e), ExprKind::Nil);
         match ast.kind(e) {
             // `if x`: not `nil` when true.
-            ExprKind::Ident(n) if truth => vec![(n, false)],
+            ExprKind::Ident(n) if truth => vec![(n, Fact::Nil, false)],
+            ExprKind::TypeTest(c) if ast.type_test(c).op == TypeOp::Is => {
+                match (var(ast.type_test(c).value), self.tested.get(&e.0)) {
+                    (Some(x), Some(t)) => vec![(x, Fact::Is(t.clone()), truth)],
+                    _ => vec![],
+                }
+            }
+            ExprKind::MethodCall {
+                recv, name, args, ..
+            } if self.name(name) == "responds_to?" => match (var(recv), ast.get(args)) {
+                (Some(x), [a]) => match ast.kind(a.value) {
+                    ExprKind::Str(m) => vec![(x, Fact::Has(m), truth)],
+                    _ => vec![],
+                },
+                _ => vec![],
+            },
             ExprKind::Unary(UnaryOp::Not, x) => self.facts(x, !truth),
             ExprKind::Binary(op @ (BinOp::Eq | BinOp::Ne), a, b) => {
                 let x = match (var(a), var(b)) {
@@ -834,13 +864,13 @@ impl Checker<'_> {
                     (_, Some(x)) if is_nil(a) => x,
                     _ => return vec![],
                 };
-                vec![(x, (op == BinOp::Eq) == truth)]
+                vec![(x, Fact::Nil, (op == BinOp::Eq) == truth)]
             }
             ExprKind::MethodCall {
                 recv, name, args, ..
-            } if self.name(name) == "nil?" && ast.get(args).is_empty() => {
-                var(recv).map(|x| vec![(x, truth)]).unwrap_or_default()
-            }
+            } if self.name(name) == "nil?" && ast.get(args).is_empty() => var(recv)
+                .map(|x| vec![(x, Fact::Nil, truth)])
+                .unwrap_or_default(),
             // Both true / both false.
             ExprKind::Binary(BinOp::And, a, b) if truth => {
                 let mut f = self.facts(a, true);
@@ -856,10 +886,10 @@ impl Checker<'_> {
         }
     }
 
-    /// Applies `facts` in the current scope: the variables' types without `nil`, or
-    /// `nil` (if their type allows it).
+    /// Applies `facts` in the current scope: the members of the variables' types for
+    /// which they hold (`T` itself for an `is_a?(T)` of a parent, or of `any`).
     fn refine(&mut self, facts: Facts) {
-        for (name, nil) in facts {
+        for (name, fact, holds) in facts {
             let Some((v, _)) = self.lookup(name) else {
                 continue;
             };
@@ -867,19 +897,65 @@ impl Checker<'_> {
                 continue;
             }
             let t = self.refined(name).unwrap_or_else(|| v.ty.clone());
-            let new = if nil {
-                if !(t.is_any() || t.members().contains(&Ty::Nil)) {
-                    continue;
-                }
-                Ty::Nil
-            } else {
-                let rest = t.members().iter().filter(|m| **m != Ty::Nil).cloned();
-                match union(rest.collect()) {
-                    Ty::Never => continue,
-                    t => t,
-                }
+            let new = match (&fact, holds) {
+                (Fact::Nil, true) if t.is_any() || t.members().contains(&Ty::Nil) => Ty::Nil,
+                (Fact::Nil, true) => continue,
+                (Fact::Is(target), true) if t.is_any() => target.clone(),
+                (Fact::Is(target), true) => union(
+                    t.members()
+                        .iter()
+                        .filter_map(|m| {
+                            if self.assignable(m, target) {
+                                Some(m.clone())
+                            } else if self.assignable(target, m) {
+                                Some(target.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                ),
+                _ if t.is_any() => continue,
+                _ => union(
+                    t.members()
+                        .iter()
+                        .filter(|m| self.fact_holds(m, &fact) == holds)
+                        .cloned()
+                        .collect(),
+                ),
             };
+            // (Impossible here: dead code, not refined.)
+            if new == Ty::Never {
+                continue;
+            }
             self.scopes.last_mut().unwrap().refined.insert(name, new);
+        }
+    }
+
+    /// Does `fact` hold for every value of type `m` (a member of a union)?
+    fn fact_holds(&self, m: &Ty, fact: &Fact) -> bool {
+        match fact {
+            Fact::Nil => *m == Ty::Nil,
+            Fact::Is(t) => self.assignable(m, t),
+            Fact::Has(name) => self.has_method(m, *name),
+        }
+    }
+
+    /// Does a value of type `t` have method `name` (`responds_to?`)?
+    fn has_method(&self, t: &Ty, name: Symbol) -> bool {
+        let n = self.name(name);
+        if UNIVERSAL_METHODS.contains(&n) {
+            return true;
+        }
+        match self.view(t.clone()) {
+            Ty::Object(id, _) => {
+                let d = &self.types[id];
+                d.methods.contains_key(&name)
+                    || (d.kind != TypeDeclKind::Class && d.fields.iter().any(|f| f.name == name))
+            }
+            Ty::Record(fs) => fs.iter().any(|(f, _)| *f == name),
+            Ty::Fn(_) => n == "call",
+            t => self.builtin_methods(&t).contains(&n),
         }
     }
 
@@ -2768,6 +2844,36 @@ impl Checker<'_> {
                     }
                 }
             }
+            ExprKind::TypeTest(c) => {
+                let x = ast.type_test(c);
+                let target = self.resolve(&x.ty);
+                match x.op {
+                    TypeOp::Is => {
+                        self.expr(x.value, None);
+                        self.tested.insert(e.0, target);
+                        Ty::Bool
+                    }
+                    TypeOp::As => {
+                        let v = self.expr(x.value, Some(&target));
+                        let v = self.view(v);
+                        let possible = v.is_any()
+                            || v.members().iter().any(|m| {
+                                m.is_any()
+                                    || self.assignable(m, &target)
+                                    || self.assignable(&target, m)
+                            });
+                        if !possible {
+                            let msg = format!(
+                                "`{}` can never be `{}`",
+                                self.show_v(&v),
+                                self.show(&target)
+                            );
+                            self.error(msg, span);
+                        }
+                        target
+                    }
+                }
+            }
             ExprKind::Raise(v) => {
                 let t = self.expr(v, None);
                 let ok = |t: &Ty| {
@@ -3780,6 +3886,10 @@ impl Checker<'_> {
             if !self.ast.get(args).is_empty() || block.is_some() {
                 self.error("`nil?` takes no arguments", span);
             }
+            return Ty::Bool;
+        }
+        // `x.responds_to?(name)` (its argument: the name, as a string).
+        if n == "responds_to?" {
             return Ty::Bool;
         }
         // Declared methods, function fields, enums.

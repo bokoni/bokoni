@@ -396,6 +396,29 @@ fn nil_tests_refine_types() {
             "def f(a: int?): int\n  unless a\n    raise \"none\"\n  end\n  let s: str = a\n  0\nend",
             "expected type `str`, got `int`",
         ),
+        // `is_a?`, `responds_to?`: in both branches, with `and`, after a `return`.
+        (
+            "def f(v: int | str): int\n  if v.is_a?(int)\n    v.len()\n  else\n    0\n  end\nend",
+            "`int` has no method `len`",
+        ),
+        (
+            "def f(v: int | str): int\n  if v.is_a?(int)\n    0\n  else\n    v + 1\n  end\nend",
+            "`+` between `str` and `int`",
+        ),
+        (
+            "def f(v: int | str): int\n  return v.len() unless v.is_a?(int)\n  v.upper()\nend",
+            "`int` has no method `upper`",
+        ),
+        (
+            "class A\n  def a = 1\nend\nclass B < A\n  def b = 2\nend\ndef f(x: A): int\n  if x.is_a?(B) then x.b + x.nope else x.a end\nend",
+            "`B` has no field `nope`",
+        ),
+        (
+            "def f(v: int | str): int\n  if v.responds_to?(abs) then v.len() else 0 end\nend",
+            "`int` has no method `len`",
+        ),
+        // `as(T)` that can never succeed.
+        ("\"x\".as(int)", "`str` can never be `int`"),
         // `??` and `?.`: the type without `nil`, or optional.
         (
             "def f(a: int?): int\n  let n = a ?? 0\n  let s: str = n\n  0\nend",
@@ -420,4 +443,7 @@ fn nil_tests_refine_types() {
         "def f(a: int?)\n  if a == nil\n    let g = || a + 1\n    a = 1\n    return g()\n  end\n  a\nend\nf(nil)",
     );
     ok("let a: int? = nil\nlet r = [a.nil?, 3.nil?, \"x\".nil?]\nr");
+    ok(
+        "def f(v: int | str): int\n  if v.is_a?(int)\n    v + 1\n  else\n    v.len()\n  end\nend\nf(1) + f(\"ab\")",
+    );
 }

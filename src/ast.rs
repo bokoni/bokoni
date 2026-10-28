@@ -190,6 +190,7 @@ impl Ast {
             Control::While(_) => ExprKind::While(id),
             Control::For(_) => ExprKind::For(id),
             Control::Begin(_) => ExprKind::Begin(id),
+            Control::TypeTest(_) => ExprKind::TypeTest(id),
         };
         self.controls.push(c);
         self.push(kind, span)
@@ -231,6 +232,13 @@ impl Ast {
         match self.control(id) {
             Control::Begin(x) => x,
             _ => unreachable!("ControlId does not refer to a `begin`"),
+        }
+    }
+
+    pub fn type_test(&self, id: ControlId) -> &TypeTest {
+        match self.control(id) {
+            Control::TypeTest(x) => x,
+            _ => unreachable!("ControlId does not refer to a type test"),
         }
     }
 
@@ -639,6 +647,8 @@ pub enum ExprKind {
     /// `begin … rescue … else … ensure … end`, also the body of a `def` or a `do`
     /// block that has `rescue` / `ensure` clauses.
     Begin(ControlId),
+    /// `x.is_a?(T)`, `x.as(T)`
+    TypeTest(ControlId),
     /// `raise value`
     Raise(ExprId),
     /// `super(args)`: the parent class's version of the current method.
@@ -703,4 +713,20 @@ pub enum Control {
     While(While),
     For(For),
     Begin(Begin),
+    TypeTest(TypeTest),
+}
+
+/// `value.is_a?(ty)` (`Is`) or `value.as(ty)` (`As`). (`as?` is parsed into an
+/// `is_a?`.)
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeTest {
+    pub value: ExprId,
+    pub ty: TypeExpr,
+    pub op: TypeOp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeOp {
+    Is,
+    As,
 }

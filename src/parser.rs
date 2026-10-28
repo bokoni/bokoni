@@ -2004,6 +2004,22 @@ impl Parser<'_, '_> {
         let lhs = self.mk(ExprKind::Ident(t), sa);
         let nil = self.mk(ExprKind::Nil, sa);
         let cond = self.mk(ExprKind::Binary(BinOp::Eq, lhs, nil), sa);
+        self.let_if(a, t, cond, if_nil, other, span)
+    }
+
+    /// `begin let t = a; if cond then yes else no end end` (`cond`, `yes` and `no` may
+    /// read `t`).
+    fn let_if(
+        &mut self,
+        a: ExprId,
+        t: Symbol,
+        cond: ExprId,
+        yes: ExprId,
+        no: ExprId,
+        span: Span,
+    ) -> ExprId {
+        let sa = self.span(a);
+        let (if_nil, other) = (yes, no);
         let test = self.ast.push_control(
             Control::If(If {
                 cond,
@@ -2151,6 +2167,13 @@ impl Parser<'_, '_> {
             let name_span = self.question_suffix(t.span);
             let name = self.intern(name_span);
             let span = span.to(name_span);
+            if self.at(T::LParen) {
+                match name_span.text(self.src) {
+                    "is_a?" | "as" | "as?" => return self.type_test(e, name_span),
+                    "responds_to?" => return self.responds_to(e, name_span),
+                    _ => {}
+                }
+            }
             if name_span != t.span && !self.at(T::LParen) {
                 let args = self.ast.alloc(&[]);
                 return Ok(self.mk(
@@ -2170,6 +2193,67 @@ impl Parser<'_, '_> {
                 self.found()
             ))
         }
+    }
+
+    /// `e.is_a?(T)`, `e.as(T)`, `e.as?(T)` (at the `(`): a type, not a value.
+    fn type_test(&mut self, e: ExprId, name: Span) -> Result<ExprId> {
+        let kw = name.text(self.src);
+        let open = self.bump().span;
+        self.skip_newlines();
+        let ty = self.type_expr(true)?;
+        self.skip_newlines();
+        self.expect(T::RParen, "to close the type")?;
+        let span = self.span_from(self.span(e));
+        let op = if kw == "as" { TypeOp::As } else { TypeOp::Is };
+        if kw != "as?" {
+            let test = TypeTest { value: e, ty, op };
+            return Ok(self.ast.push_control(Control::TypeTest(test), span));
+        }
+        // `e.as?(T)`: `begin let t = e; if t.is_a?(T) then t else nil end end`.
+        let t = self.interner.intern(&format!("#as{}", open.start));
+        let se = self.span(e);
+        let value = self.mk(ExprKind::Ident(t), se);
+        let cond = self
+            .ast
+            .push_control(Control::TypeTest(TypeTest { value, ty, op }), span);
+        let then = self.mk(ExprKind::Ident(t), se);
+        let nil = self.mk(ExprKind::Nil, span);
+        Ok(self.let_if(e, t, cond, then, nil, span))
+    }
+
+    /// `e.responds_to?(name)` (at the `(`): a call of `responds_to?` with the name as
+    /// a string.
+    fn responds_to(&mut self, e: ExprId, name: Span) -> Result<ExprId> {
+        self.bump();
+        self.skip_newlines();
+        let t = self.tok();
+        if t.kind != T::Ident && !is_keyword(t.kind) {
+            return self.error_here(format!(
+                "expected a method name in `responds_to?(…)`, found {}",
+                self.found()
+            ));
+        }
+        self.bump();
+        let m = self.question_suffix(t.span);
+        let sym = self.intern(m);
+        self.skip_newlines();
+        self.expect(T::RParen, "to close `responds_to?(…)`")?;
+        let arg = self.mk(ExprKind::Str(sym), m);
+        let args = self.ast.alloc(&[Arg {
+            name: None,
+            value: arg,
+        }]);
+        let span = self.span_from(self.span(e));
+        let method = self.intern(name);
+        Ok(self.mk(
+            ExprKind::MethodCall {
+                recv: e,
+                name: method,
+                args,
+                block: None,
+            },
+            span,
+        ))
     }
 
     fn postfix(&mut self, mut e: ExprId) -> Result<ExprId> {
