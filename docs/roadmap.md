@@ -419,6 +419,28 @@ namespaces, `trait` for shared behavior.
       arguments up to the end of the line), named arguments (`prop(host, kind: str)`),
       parameters with a default value, parameters after `*rest` given by name
 
+### v0.20 — Nil and type tests
+
+- [x] Patterns in `for`: `for (k, v) in [(1, "a"), …]`, `for {x, y} in points`,
+      nested (`for (i, (a, b)) in …`): a hidden variable destructured by a `let` at the
+      top of the body; typed and compiled like any `let`
+- [x] `cond ? a : b` (an `if`) and `a ?? b` (`a`, or `b` when `a` is `nil`, `a`
+      evaluated once): desugared by the parser, no new instruction
+- [x] Safe navigation `a?.b`, `a?.m(x)`: `nil` as soon as a link of the chain is
+      `nil`, the rest of the chain skipped; `a?.b ?? d`; a line starting with `?.`
+      continues the previous one
+- [x] Methods ending with `?` called without parentheses (`x.nil?`)
+- [x] The checker refines a variable's type by its tests: `x.nil?`, `x == nil`,
+      `x != nil`, `if x`, `not`, `unless`, `and` / `or`; after a branch ending with
+      `return`, `raise`, `break` or `next`, the opposite holds for the rest of the block
+      (`return 0 if s.nil?` then `s.len()`); ended by an assignment and by a loop; local
+      variables and parameters only (not `@a` fields, not inside a lambda)
+- [x] Type reflection (Crystal's): `x.is_a?(T)` (refines too), `x.as(T)` (checked as
+      an annotation: an error at run time, or before running if it can never be),
+      `x.as?(T)` (`nil` if it is not a `T`), `x.responds_to?(name)` (refines to the
+      types that have it); `T` any annotation type (`int | str`, `[int]`, a class, a
+      trait, a generic type checked as its class)
+
 ## Decisions that commit the JIT
 
 | Topic                    | v0.1 choice                                         |
