@@ -426,9 +426,9 @@ namespaces, `trait` for shared behavior.
       top of the body; typed and compiled like any `let`
 - [x] `cond ? a : b` (an `if`) and `a ?? b` (`a`, or `b` when `a` is `nil`, `a`
       evaluated once): desugared by the parser, no new instruction
-- [x] Safe navigation `a?.b`, `a?.m(x)`: `nil` as soon as a link of the chain is
-      `nil`, the rest of the chain skipped; `a?.b ?? d`; a line starting with `?.`
-      continues the previous one
+- [x] Safe navigation `a?.b`, `a?.m(x)`, `a?[i]`: `nil` as soon as a link of the
+      chain is `nil`, the rest of the chain skipped; `a?.b ?? d`; a line starting with
+      `?.` continues the previous one
 - [x] Methods ending with `?` called without parentheses (`x.nil?`)
 - [x] The checker refines a variable's type by its tests: `x.nil?`, `x == nil`,
       `x != nil`, `if x`, `not`, `unless`, `and` / `or`; after a branch ending with

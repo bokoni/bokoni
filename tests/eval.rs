@@ -218,6 +218,11 @@ fn control_flow() {
         run("class U\n  def init(@n: str, @up: U?)\n  end\n  def n = @n\n  def up = @up\n  def hi(x: str): str = x + @n\nend\nlet a = U(\"a\", nil)\nlet b = U(\"b\", a)\nlet k = 0\ndef f(u: U?): U?\n  k += 1\n  u\nend\nlet none: U? = nil\nlet ps = [{x: 1}]\n[b.up?.n, a.up?.n, a.up?.up?.n, none?.up.n, none?.n ?? \"?\", f(b)?.hi(\"h\"), f(nil)?.hi(\"h\"), k, ps[0]?.x, ps[5]?.x, b\n  ?.up\n  ?.n]"),
         "=> [\"a\", nil, nil, nil, \"?\", \"hb\", nil, 2, 1, nil, \"a\"]"
     );
+    // `a?[i]` (`c ?[1] : [2]`: a ternary).
+    assert_eq!(
+        run("let xs: [int]? = [1, 2]\nlet none: [int]? = nil\nlet h: {str => [int]}? = {\"a\" => [5]}\nlet c = true\n[xs?[0], none?[0], none?[0].abs(), xs?[1].abs(), h?[\"a\"]?[0], none?[0] ?? 9, c ?[1] : [2], xs?[5]?]"),
+        "=> [1, nil, nil, 2, 5, 9, [1], nil]"
+    );
     // A method ending with `?`, without parentheses.
     assert_eq!(
         run("class U\n  def ok? = true\nend\n[\"5\".to_i?, \"x\".to_i? ?? 0, U().ok?, \"5\".to_i?().abs()]"),

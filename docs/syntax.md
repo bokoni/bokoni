@@ -453,12 +453,14 @@ arithmetic (`n ?? 0 + 1` is `n ?? (0 + 1)`, `n ?? 0 > 5` is `(n ?? 0) > 5`).
 
 `a?.b`: `nil` if `a` is `nil`, otherwise `a.b`; the rest of the chain is then skipped
 too (`a?.b.c` is `nil` for a `nil` `a`), and the arguments of `a?.m(x)` are not
-evaluated. `xs[i]?.name`: `nil` out of bounds or for a `nil` element.
+evaluated. `xs?[i]` is the same for an index (`nil` if `xs` is `nil`; the `?`
+against both). `xs[i]?.name`: `nil` out of bounds or for a `nil` element.
 
 ```ruby
 user?.name ?? "anonymous"
 order.customer?.address?.city
 find(id)?.greet("hi")
+config?["port"] ?? 8080
 ```
 
 A method whose name ends with `?` can be called without parentheses (`s.to_i?`,

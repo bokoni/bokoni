@@ -2309,6 +2309,22 @@ impl Parser<'_, '_> {
                     let nil = self.mk(ExprKind::Nil, span);
                     return Ok(self.nil_test(e, t, nil, rest, span));
                 }
+                // `a?[i]…`: the same, for an index (`?` against `a` and `[`).
+                T::Question
+                    if self.tok().span.start == self.span(e).end
+                        && self.peek2() == T::LBracket
+                        && self
+                            .ahead
+                            .is_some_and(|t| t.span.start == self.tok().span.end) =>
+                {
+                    let at = self.bump().span.start;
+                    let t = self.interner.intern(&format!("#safe{at}"));
+                    let recv = self.mk(ExprKind::Ident(t), self.span(e));
+                    let rest = self.postfix(recv)?;
+                    let span = self.span(e).to(self.span(rest));
+                    let nil = self.mk(ExprKind::Nil, span);
+                    return Ok(self.nil_test(e, t, nil, rest, span));
+                }
                 T::ColonColon => {
                     let ExprKind::Ident(first) = self.ast.kind(e) else {
                         return self.error_at("`::` must follow a type name", self.span(e));
