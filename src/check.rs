@@ -2731,9 +2731,44 @@ impl Checker<'_> {
             ExprKind::Case(c) => {
                 let x = ast.case(c);
                 let subject = self.expr(x.subject, None);
+                let var = match ast.kind(x.subject) {
+                    ExprKind::Ident(n) => Some(n),
+                    _ => None,
+                };
+                // What the arms not taken tell: after an arm of types only (and `nil`),
+                // the subject is none of them.
+                let mut not_taken: Facts = Vec::new();
                 let mut arms = Vec::new();
                 for arm in &x.arms {
+                    let mut types = Vec::new();
+                    let mut only_types = true;
                     for &p in ast.get(arm.patterns) {
+                        if let Some(ty) = ast.type_pattern(p) {
+                            let target = self.resolve(ty);
+                            self.expr(p, None);
+                            let v = self.view(subject.clone());
+                            let possible = v.is_any()
+                                || v.members().iter().any(|m| {
+                                    m.is_any()
+                                        || self.assignable(m, &target)
+                                        || self.assignable(&target, m)
+                                });
+                            if !possible {
+                                let msg = format!(
+                                    "this pattern (`{}`) cannot match a value of type `{}`",
+                                    self.show(&target),
+                                    self.show_v(&subject)
+                                );
+                                self.error(msg, ast.span(p));
+                            }
+                            types.push(target);
+                            continue;
+                        }
+                        if matches!(ast.kind(p), ExprKind::Nil) {
+                            types.push(Ty::Nil);
+                        } else {
+                            only_types = false;
+                        }
                         let pt = self.expr(p, None);
                         // A pattern that can never equal the subject (widened types:
                         // `case 8080 when 80` is not reported).
@@ -2750,10 +2785,31 @@ impl Checker<'_> {
                             self.error(msg, ast.span(p));
                         }
                     }
-                    arms.push(self.block(&arm.body));
+                    let mut facts = not_taken.clone();
+                    if let (Some(v), true) = (var, only_types) {
+                        let t = union(types);
+                        facts.push((v, Fact::Is(t.clone()), true));
+                        not_taken.push((v, Fact::Is(t), false));
+                    }
+                    arms.push(self.block_with(&arm.body, facts));
                 }
+                // Without `else`: `nil` unless the arms cover every type of the subject.
+                let covered = var.is_some_and(|_| {
+                    let mut left = self.view(subject.clone());
+                    for (_, fact, _) in &not_taken {
+                        left = union(
+                            left.members()
+                                .iter()
+                                .filter(|m| !self.fact_holds(m, fact))
+                                .cloned()
+                                .collect(),
+                        );
+                    }
+                    !subject.is_any() && left == Ty::Never
+                });
                 arms.push(match &x.else_ {
-                    Some(b) => self.block(b),
+                    Some(b) => self.block_with(b, not_taken),
+                    None if covered => Ty::Never,
                     None => Ty::Nil,
                 });
                 union(arms)

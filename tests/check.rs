@@ -417,6 +417,19 @@ fn nil_tests_refine_types() {
             "def f(v: int | str): int\n  if v.responds_to?(abs) then v.len() else 0 end\nend",
             "`int` has no method `len`",
         ),
+        // `case` by type: each arm, the arms not taken, a pattern that cannot match.
+        (
+            "def f(v: int | str): int\n  case v\n  when int then v.len()\n  else 0\n  end\nend",
+            "`int` has no method `len`",
+        ),
+        (
+            "def f(v: int | str | nil): int\n  case v\n  when int, nil then 0\n  else v + 1\n  end\nend",
+            "`+` between `str` and `int`",
+        ),
+        (
+            "def f(v: str): int\n  case v\n  when int then 1\n  else 2\n  end\nend",
+            "this pattern (`int`) cannot match a value of type `str`",
+        ),
         // `as(T)` that can never succeed.
         ("\"x\".as(int)", "`str` can never be `int`"),
         // `??` and `?.`: the type without `nil`, or optional.
@@ -445,5 +458,9 @@ fn nil_tests_refine_types() {
     ok("let a: int? = nil\nlet r = [a.nil?, 3.nil?, \"x\".nil?]\nr");
     ok(
         "def f(v: int | str): int\n  if v.is_a?(int)\n    v + 1\n  else\n    v.len()\n  end\nend\nf(1) + f(\"ab\")",
+    );
+    // Every type covered: no `nil` without `else`.
+    ok(
+        "def f(v: int | str): int\n  case v\n  when int then v + 1\n  when str then v.len()\n  end\nend\nf(1) + f(\"ab\")",
     );
 }

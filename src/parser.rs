@@ -2018,7 +2018,6 @@ impl Parser<'_, '_> {
         no: ExprId,
         span: Span,
     ) -> ExprId {
-        let sa = self.span(a);
         let (if_nil, other) = (yes, no);
         let test = self.ast.push_control(
             Control::If(If {
@@ -2028,6 +2027,13 @@ impl Parser<'_, '_> {
             }),
             span,
         );
+        self.let_in(a, t, test, span)
+    }
+
+    /// `begin let t = a; body end`.
+    fn let_in(&mut self, a: ExprId, t: Symbol, body: ExprId, span: Span) -> ExprId {
+        let sa = self.span(a);
+        let test = body;
         let body = Block {
             span,
             stmts: vec![
@@ -2858,14 +2864,34 @@ impl Parser<'_, '_> {
 
     fn case_expr(&mut self) -> Result<ExprId> {
         let start = self.bump().span;
-        let subject = self.expr()?;
+        let mut subject = self.expr()?;
+        // Type patterns test a variable: the subject's, or a hidden one holding it.
+        let (var, hidden) = match self.ast.kind(subject) {
+            ExprKind::Ident(n) => (n, false),
+            _ => (self.interner.intern(&format!("#case{}", start.start)), true),
+        };
+        let mut typed = false;
         self.skip_newlines();
         let mut arms = Vec::new();
         while self.at(T::When) {
             let arm_start = self.bump().span;
             let base = self.s_exprs.len();
             loop {
-                let p = self.expr()?;
+                let p = if self.type_pattern_ahead() {
+                    // `when int`, `when Animal`: `subject.is_a?(T)`.
+                    typed = true;
+                    let ty = self.type_expr(true)?;
+                    let value = self.mk(ExprKind::Ident(var), ty.span);
+                    let span = ty.span;
+                    let test = TypeTest {
+                        value,
+                        ty,
+                        op: TypeOp::Is,
+                    };
+                    self.ast.push_control(Control::TypeTest(test), span)
+                } else {
+                    self.expr()?
+                };
                 self.s_exprs.push(p);
                 if !self.eat(T::Comma) {
                     break;
@@ -2898,14 +2924,41 @@ impl Parser<'_, '_> {
             None
         };
         let span = self.span_from(start);
-        Ok(self.ast.push_control(
+        let value = subject;
+        if typed && hidden {
+            subject = self.mk(ExprKind::Ident(var), self.span(value));
+        }
+        let case = self.ast.push_control(
             Control::Case(Case {
                 subject,
                 arms,
                 else_,
             }),
             span,
-        ))
+        );
+        Ok(if typed && hidden {
+            self.let_in(value, var, case, span)
+        } else {
+            case
+        })
+    }
+
+    /// Is the `when` pattern here a type? A built-in type's name or a capitalized name
+    /// (not an UPPERCASE constant), alone or in a union / with `?`: `int`, `Animal`,
+    /// `str | nil`. (`Color::Red`, `Point(1, 2)` are values.)
+    fn type_pattern_ahead(&mut self) -> bool {
+        if !self.at(T::Ident) {
+            return false;
+        }
+        let name = self.tok().span.text(self.src);
+        let builtin = matches!(name, "int" | "float" | "str" | "bool" | "any");
+        let capitalized =
+            name.starts_with(char::is_uppercase) && name.chars().any(char::is_lowercase);
+        (builtin || capitalized)
+            && matches!(
+                self.peek2(),
+                T::Comma | T::Then | T::Newline | T::Semi | T::Pipe | T::Question
+            )
     }
 
     /// Loop header expression: `do` forbidden, line end required.

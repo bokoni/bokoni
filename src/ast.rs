@@ -214,6 +214,18 @@ impl Ast {
         }
     }
 
+    /// The type of a `when` pattern that is a type (`when int`: parsed into an
+    /// `is_a?` of the subject, spanning the type only).
+    pub fn type_pattern(&self, p: ExprId) -> Option<&TypeExpr> {
+        match self.kind(p) {
+            ExprKind::TypeTest(c) => {
+                let x = self.type_test(c);
+                (self.span(x.value) == x.ty.span).then_some(&x.ty)
+            }
+            _ => None,
+        }
+    }
+
     pub fn while_(&self, id: ControlId) -> &While {
         match self.control(id) {
             Control::While(x) => x,

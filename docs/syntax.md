@@ -103,6 +103,26 @@ end
 trait, a generic type (its arguments are not checked at run time: `Box(int)` is
 checked as a `Box`).
 
+`case` tests types too: a `when` pattern that is a type is an `is_a?` of the subject,
+which is refined in that arm (and, in the arms after it and in `else`, to the types
+left):
+
+```ruby
+def describe(v: int | float | str | Animal | nil): str
+  case v
+  when int, float then "number #{v}"
+  when str then "text of #{v.len()}"
+  when nil then "nothing"
+  else v.name                  # here `v` is `Animal`
+  end
+end
+```
+
+- A type pattern: `int`, `float`, `str`, `bool`, `any` or a capitalized name
+  (`Animal`), alone or in a union (`int | str`) or with `?`. An UPPERCASE name
+  (`MAX`), `Color::Red` or `Point(1, 2)` is a value, compared as before.
+- Without `else`, a `case` whose arms cover every type of the subject is not `nil`.
+
 Whatever is not certain is checked at run time. From Rust, static checking can be
 disabled (`engine.set_static_checks(false)`).
 

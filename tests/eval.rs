@@ -201,6 +201,13 @@ fn control_flow() {
         )),
         "=> [true, false, true, true, false, true, true, true, true]"
     );
+    // `case` by type (`MAX`, `Color::Red`: values).
+    assert_eq!(
+        run(&format!(
+            "{classes}enum Color\n  Red\n  Blue\nend\nMAX = 3\ndef k(v) = case v\n  when int | float then \"num\"\n  when Dog then \"dog \" + v.bark\n  when Animal, nil then \"animal\"\n  when str then \"str\"\n  else \"other\"\nend\n[k(1), k(2.5), k(d), k(Animal()), k(nil), k(\"s\"), k(true), case 3 when MAX then 1 else 2 end, case Color::Blue when Color::Red then 1 when Color::Blue then 2 end, case [1].len() when int then \"i\" end]"
+        )),
+        "=> [\"num\", \"num\", \"dog woof\", \"animal\", \"animal\", \"str\", \"other\", 1, 2, \"i\"]"
+    );
     assert!(
         err("def id(x) = x\nid(\"x\").as(int)")
             .1

@@ -2639,8 +2639,14 @@ impl Compiler<'_> {
                     let body = self.new_block();
                     for &p in ast.get(arm.patterns) {
                         let pv = self.expr(p);
-                        let t = self.tmp(RegTy::Bool);
-                        self.emit(Instr::CaseTest(t, pv.0, subject.0), ast.span(p));
+                        // (A type pattern is already the test: `subject.is_a?(T)`.)
+                        let t = if ast.type_pattern(p).is_some() {
+                            pv.0
+                        } else {
+                            let t = self.tmp(RegTy::Bool);
+                            self.emit(Instr::CaseTest(t, pv.0, subject.0), ast.span(p));
+                            t
+                        };
                         let next = self.new_block();
                         self.term(
                             Term::Branch {

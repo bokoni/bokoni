@@ -440,6 +440,9 @@ namespaces, `trait` for shared behavior.
       `x.as?(T)` (`nil` if it is not a `T`), `x.responds_to?(name)` (refines to the
       types that have it); `T` any annotation type (`int | str`, `[int]`, a class, a
       trait, a generic type checked as its class)
+- [x] `case` by type: `when int`, `when Animal`, `when int | str` (an `is_a?` of the
+      subject, which is refined in that arm and, in the next ones and `else`, to the
+      types left); not `nil` without `else` when every type is covered
 
 ## Decisions that commit the JIT
 
