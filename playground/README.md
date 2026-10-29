@@ -1,7 +1,9 @@
 # Bokoni playground
 
 Write and run Bokoni in the browser: a [Monaco](https://github.com/microsoft/monaco-editor)
-editor, the interpreter compiled to WebAssembly, run in a worker.
+editor, the interpreter compiled to WebAssembly, run in a worker:
+**https://bokoni.github.io/bokoni/** (published by `.github/workflows/playground.yml` on
+every push to `main` that touches it).
 
 - `wasm/`: a small Rust crate around `bokoni` (without the JIT: native code cannot be
   generated inside WebAssembly). It exports `run` (runs a script) and `check` (static

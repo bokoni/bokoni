@@ -123,6 +123,8 @@ that contains itself is an error.
 
 ## Playground
 
+**Try it: https://bokoni.github.io/bokoni/**
+
 [`playground/`](playground/README.md): Bokoni in the browser (the interpreter compiled to
 WebAssembly, a Monaco editor, errors as one types). `cd playground/web && bun install &&
 bun run dev`.
