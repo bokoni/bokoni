@@ -2124,6 +2124,7 @@ impl Runtime {
         Ok(EnumInfo {
             name: self.name(e.name).into(),
             variants,
+            valued: e.repr.is_some() || e.explicit.iter().any(|&x| x),
             methods: e.methods.iter().cloned().collect(),
             script: script.clone(),
             annotations: e.annotations.clone(),

@@ -99,6 +99,8 @@ pub struct EnumInfo {
     pub name: Rc<str>,
     /// (name, value) of each variant.
     pub variants: Vec<(Symbol, Value)>,
+    /// Values given by the script (`enum E: str`, `A = 6`), not the variants' indices.
+    pub valued: bool,
     pub methods: FxHashMap<Symbol, Rc<Proto>>,
     pub script: Rc<Script>,
     pub annotations: crate::ir::Annotations,

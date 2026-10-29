@@ -107,6 +107,17 @@ engine.set_loader(|name, _from| match assets.get(name) {
 });
 ```
 
+With the `serde` feature, a value serializes into any `serde` format:
+
+```rust
+let v = engine.eval("{name: \"a\", tags: [1, 2]}")?;
+let json = serde_json::to_string(&engine.serializable(&v))?; // {"name":"a","tags":[1,2]}
+```
+
+Lists and tuples become sequences; hashes, records and objects (their fields) maps; an
+enum variant its value (`enum E: str`) or its name. A function, a range or a structure
+that contains itself is an error.
+
 ## Command line
 
 ```sh
@@ -127,6 +138,7 @@ cargo run -- --no-jit script.bk   # without native compilation
 
 ```sh
 cargo test                                       # tests (including every example in syntax.md)
+cargo test --features serde                      # with serialization
 cargo run --release --example bench_parser       # parser vs peg
 cargo run --release --example bench_interp       # execution speed (with / without JIT)
 cargo build --no-default-features                # without the JIT (platforms without Cranelift)

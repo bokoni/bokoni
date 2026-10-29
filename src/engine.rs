@@ -465,6 +465,16 @@ impl Engine {
         v.inspect(&self.rt.interner)
     }
 
+    /// `v` serializable with `serde`, into any format (`serde_json::to_string(…)`); see
+    /// `serialize`.
+    #[cfg(feature = "serde")]
+    pub fn serializable<'a>(&'a self, v: &'a Value) -> crate::serialize::Serializable<'a> {
+        crate::serialize::Serializable {
+            value: v,
+            interner: &self.rt.interner,
+        }
+    }
+
     /// Text of a value as `print` would show it.
     pub fn display(&self, v: &Value) -> String {
         v.to_display(&self.rt.interner)

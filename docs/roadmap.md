@@ -458,6 +458,10 @@ namespaces, `trait` for shared behavior.
       beside the tag (`repr(u8)`: a `bool`'s payload at byte 1). A list of 2 M
       integers: 149 MB → 102 MB of memory; a concatenation is a single allocation;
       speed otherwise unchanged. NaN-boxing (8 bytes) left aside: an `i64` does not fit
+- [x] Feature `serde`: `engine.serializable(&v)` serializes a value into any `serde`
+      format (sequences, maps with field names, a variant's value or name; hash keys of
+      their own type, left to the format); an error for a function, a range, a
+      structure that contains itself; deep nesting grows the stack
 
 ## Decisions that commit the JIT
 

@@ -17,6 +17,7 @@ cranelift-frontend = { version = "=0.136.2", optional = true }
 cranelift-jit = { version = "=0.136.2", optional = true }
 cranelift-module = { version = "=0.136.2", optional = true }
 cranelift-native = { version = "=0.136.2", optional = true }
+serde = { version = "1", optional = true }
 stacker = "0.1"
 
 [profile.release]
@@ -24,6 +25,7 @@ debug = 1
 
 [dev-dependencies]
 peg = "0.8"
+serde_json = "1"
 
 [features]
 default = ["jit"]
@@ -35,3 +37,5 @@ jit = [
     "dep:cranelift-module",
     "dep:cranelift-native",
 ]
+# Serialization of script values (`Engine::serializable`), into any `serde` format.
+serde = ["dep:serde"]

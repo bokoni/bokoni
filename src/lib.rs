@@ -28,6 +28,8 @@ pub mod outline;
 pub mod parser;
 pub mod printer;
 pub mod reflect;
+#[cfg(feature = "serde")]
+pub mod serialize;
 pub mod span;
 pub mod thin;
 pub mod value;
