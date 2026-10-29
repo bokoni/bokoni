@@ -421,6 +421,13 @@ impl Engine {
         Ok(main)
     }
 
+    /// Checks `src` without running it: syntax and static checks (the errors `eval` would
+    /// give before running), warnings kept for `take_warnings`. `name`: the script's name in
+    /// messages.
+    pub fn check(&mut self, src: &str, name: &str) -> Result<(), Errors> {
+        self.compile(src, name).map(|_| ())
+    }
+
     /// IR of the code (the representation the interpreter runs), as readable text.
     pub fn ir(&mut self, src: &str) -> Result<String, Errors> {
         let main = self.compile(src, "<ir>")?;

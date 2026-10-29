@@ -473,3 +473,16 @@ fn nil_tests_refine_types() {
         "def f(v: int | str): int\n  case v\n  when int then v + 1\n  when str then v.len()\n  end\nend\nf(1) + f(\"ab\")",
     );
 }
+
+#[test]
+fn check_without_running() {
+    let printed = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+    let mut e = Engine::new();
+    let out = printed.clone();
+    e.set_output(move |s| out.borrow_mut().push_str(s));
+    assert!(e.check("print(\"x\")\ndef f(a: int): int = a\nf(2)", "a.bk").is_ok());
+    let errs = e.check("print(\"x\")\nlet n: int = \"s\"", "b.bk").unwrap_err();
+    assert!(errs.0[0].message.contains("expected type `int`"));
+    assert!(errs.render("print(\"x\")\nlet n: int = \"s\"", "b.bk").contains("b.bk:2:14"));
+    assert_eq!(*printed.borrow(), "");
+}

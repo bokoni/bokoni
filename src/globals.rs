@@ -103,6 +103,7 @@ impl Globals {
     }
 
     /// Address of slot `i`: it does not change.
+    #[cfg(feature = "jit")]
     pub(crate) fn slot_ptr(&self, i: u32) -> *const GlobalSlot {
         &*self.slots[i as usize]
     }
