@@ -29,6 +29,7 @@ pub mod parser;
 pub mod printer;
 pub mod reflect;
 pub mod span;
+pub mod thin;
 pub mod value;
 pub mod vm;
 
@@ -38,4 +39,4 @@ pub use engine::{Engine, FromValue, IntoValue, Source};
 pub use reflect::{
     Annotation, DeclKind, EnumDesc, FieldDesc, FnDesc, ParamDesc, TypeDesc, VariantDesc,
 };
-pub use value::Value;
+pub use value::{Str, Value};

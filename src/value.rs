@@ -10,27 +10,30 @@ use std::cell::RefCell;
 use std::fmt::{self, Write};
 use std::rc::Rc;
 
-/// Fixed layout (`repr(C, u8)`): JIT native code reads the tag (byte 0) and the payload of
-/// base types (byte 8) directly. Base types (`nil`, `bool`, `int`, `float`) have tags 0 to 3
+pub use crate::thin::{Str, ThinRc, ThinWeak};
+
+/// Fixed layout (`repr(u8)`, 16 bytes): JIT native code reads the tag (byte 0) and the
+/// payload of base types directly (byte 8, byte 1 for `bool`). Base types (`nil`, `bool`, `int`, `float`) have tags 0 to 3
 /// and own nothing: copying or overwriting them needs no reference counting.
 #[derive(Clone)]
-#[repr(C, u8)]
+#[repr(u8)]
 pub enum Value {
     Nil,
     Bool(bool),
     Int(i64),
     Float(f64),
-    Str(Rc<str>),
+    Str(Str),
     List(Rc<RefCell<Vec<Value>>>),
     Hash(Rc<RefCell<HashMap>>),
     Record(Rc<RefCell<Record>>),
-    Tuple(Rc<[Value]>),
+    Tuple(ThinRc<Value>),
     Range(Rc<Range>),
     Function(Rc<Function>),
     /// Instance of a `type` or a `class`.
     Object(Rc<RefCell<Object>>),
-    /// Variant of an `enum` (`Protocol::Tcp`): the enum and the variant's index.
-    Variant(Rc<EnumInfo>, u32),
+    /// Variant of an `enum` (`Protocol::Tcp`): the variant's index and the enum (in
+    /// this order: the index fits beside the tag).
+    Variant(u32, Rc<EnumInfo>),
     /// A `type` / `class` itself (callable: construction).
     Type(Rc<TypeInfo>),
     /// An `enum` itself (`Protocol.values()`).
@@ -107,7 +110,7 @@ pub enum HashKey {
     Nil,
     Bool(bool),
     Int(i64),
-    Str(Rc<str>),
+    Str(Str),
 }
 
 impl HashKey {
@@ -257,7 +260,7 @@ impl Value {
     pub fn type_label(&self) -> String {
         match self {
             Value::Object(o) => o.borrow().info.name.to_string(),
-            Value::Variant(e, _) => e.name.to_string(),
+            Value::Variant(_, e) => e.name.to_string(),
             v => v.type_name().to_string(),
         }
     }
@@ -283,9 +286,10 @@ impl Value {
         let pair = |a: *const (), b: *const ()| (a as usize, b as usize);
         let key = match (self, other) {
             (List(a), List(b)) => Some(pair(Rc::as_ptr(a) as _, Rc::as_ptr(b) as _)),
-            (Tuple(a), Tuple(b)) => {
-                Some(pair(Rc::as_ptr(a) as *const (), Rc::as_ptr(b) as *const ()))
-            }
+            (Tuple(a), Tuple(b)) => Some(pair(
+                ThinRc::as_ptr(a) as *const (),
+                ThinRc::as_ptr(b) as *const (),
+            )),
             (Hash(a), Hash(b)) => Some(pair(Rc::as_ptr(a) as _, Rc::as_ptr(b) as _)),
             (Record(a), Record(b)) => Some(pair(Rc::as_ptr(a) as _, Rc::as_ptr(b) as _)),
             (Object(a), Object(b)) => Some(pair(Rc::as_ptr(a) as _, Rc::as_ptr(b) as _)),
@@ -349,7 +353,7 @@ impl Value {
                             .all(|(x, y)| x.equals_in(y, seen))
                 }
             }
-            (Variant(a, i), Variant(b, j)) => Rc::ptr_eq(a, b) && i == j,
+            (Variant(i, a), Variant(j, b)) => Rc::ptr_eq(a, b) && i == j,
             (Type(a), Type(b)) => Rc::ptr_eq(a, b),
             (Enum(a), Enum(b)) => Rc::ptr_eq(a, b),
             _ => false,
@@ -403,7 +407,7 @@ impl Value {
         cx.budget -= 1;
         let ptr = match self {
             Value::List(rc) => Some((Rc::as_ptr(rc) as *const () as usize, "[…]")),
-            Value::Tuple(rc) => Some((Rc::as_ptr(rc) as *const () as usize, "(…)")),
+            Value::Tuple(rc) => Some((ThinRc::as_ptr(rc) as *const () as usize, "(…)")),
             Value::Hash(rc) => Some((Rc::as_ptr(rc) as *const () as usize, "{…}")),
             Value::Record(rc) => Some((Rc::as_ptr(rc) as *const () as usize, "{…}")),
             Value::Object(rc) => Some((Rc::as_ptr(rc) as *const () as usize, "(…)")),
@@ -520,7 +524,7 @@ impl Value {
                 }
                 out.push(')');
             }
-            Value::Variant(e, idx) => {
+            Value::Variant(idx, e) => {
                 let name = e.variants[*idx as usize].0;
                 match i {
                     Some(i) => {
@@ -584,8 +588,20 @@ pub mod layout {
     pub const TAG_UNINIT: u8 = 15;
     /// Higher tags: the value owns a resource (reference counted).
     pub const FIRST_HEAP_TAG: u8 = 4;
+    /// Payload of `int` and `float`.
     pub const PAYLOAD: i32 = 8;
-    pub const SIZE: i32 = 24;
+    /// Payload of `bool` (`repr(u8)`: right after the tag).
+    pub const BOOL_PAYLOAD: i32 = 1;
+    pub const SIZE: i32 = 16;
+
+    /// Offset of the payload of a base type, by its tag.
+    pub const fn payload_of(tag: u8) -> i32 {
+        if tag == TAG_BOOL {
+            BOOL_PAYLOAD
+        } else {
+            PAYLOAD
+        }
+    }
 }
 
 /// Non-recursive drop: a very deeply nested structure (list of list of list…, 300,000
@@ -656,7 +672,7 @@ fn has_nested(v: &mut Value) -> bool {
     }
     match v {
         Value::List(rc) => sole(rc).is_some_and(|c| any(c.iter())),
-        Value::Tuple(rc) => sole_mut(rc).is_some_and(|c| any(c.iter())),
+        Value::Tuple(rc) => ThinRc::sole_mut(rc).is_some_and(|c| any(c.iter())),
         Value::Hash(rc) => sole(rc).is_some_and(|c| any(c.entries.iter().map(|(_, x)| x))),
         Value::Record(rc) => sole(rc).is_some_and(|c| any(c.fields.iter().map(|(_, x)| x))),
         Value::Object(rc) => sole(rc).is_some_and(|c| any(c.fields.iter())),
@@ -706,7 +722,7 @@ fn take_children(v: &mut Value, out: &mut Vec<Value>) {
             }
         }
         Value::Tuple(rc) => {
-            if let Some(items) = sole_mut(rc) {
+            if let Some(items) = ThinRc::sole_mut(rc) {
                 for x in items.iter_mut() {
                     push(std::mem::replace(x, Value::Nil));
                 }
@@ -758,18 +774,20 @@ mod tests {
     use super::*;
 
     fn tag(v: &Value) -> u8 {
-        // SAFETY: `repr(C, u8)` puts the tag in the first byte.
+        // SAFETY: `repr(u8)` puts the tag in the first byte.
         unsafe { *(v as *const Value as *const u8) }
     }
 
-    fn payload<T: Copy>(v: &Value) -> T {
-        // SAFETY: the variants' payload is at offset `PAYLOAD`.
-        unsafe { *((v as *const Value as *const u8).add(layout::PAYLOAD as usize) as *const T) }
+    fn payload<T: Copy>(v: &Value, off: i32) -> T {
+        // SAFETY: the variant's payload is at offset `off`.
+        unsafe { *((v as *const Value as *const u8).add(off as usize) as *const T) }
     }
 
     #[test]
     fn native_layout() {
         assert_eq!(std::mem::size_of::<Value>(), layout::SIZE as usize);
+        // The JIT reads a global's `Option<Value>` as a `Value`.
+        assert_eq!(std::mem::size_of::<Option<Value>>(), layout::SIZE as usize);
         assert_eq!(tag(&Value::Nil), layout::TAG_NIL);
         assert_eq!(tag(&Value::Bool(true)), layout::TAG_BOOL);
         assert_eq!(tag(&Value::Int(5)), layout::TAG_INT);
@@ -778,9 +796,10 @@ mod tests {
         assert_eq!(tag(&Value::str("x")), layout::TAG_STR);
         assert_eq!(tag(&Value::Uninit), layout::TAG_UNINIT);
         assert!(tag(&Value::Uninit) >= layout::FIRST_HEAP_TAG);
-        assert_eq!(payload::<i64>(&Value::Int(-42)), -42);
-        assert_eq!(payload::<f64>(&Value::Float(2.5)), 2.5);
-        assert!(payload::<bool>(&Value::Bool(true)));
+        assert_eq!(payload::<i64>(&Value::Int(-42), layout::PAYLOAD), -42);
+        assert_eq!(payload::<f64>(&Value::Float(2.5), layout::PAYLOAD), 2.5);
+        assert!(payload::<bool>(&Value::Bool(true), layout::BOOL_PAYLOAD));
+        assert!(!payload::<bool>(&Value::Bool(false), layout::BOOL_PAYLOAD));
         // Zero bytes make `nil` (used to reset registers).
         let zero: Value = unsafe { std::mem::zeroed() };
         assert!(matches!(zero, Value::Nil));

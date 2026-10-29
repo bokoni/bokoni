@@ -1155,7 +1155,7 @@ impl Runtime {
                         }
                     }
                 }
-                reg!(*d) = Value::Str(Rc::from(out.as_str()));
+                reg!(*d) = Value::Str(out.as_str().into());
                 self.concat_buf = out;
             }
             Instr::SetIndex(a, i, v) => {
@@ -1784,7 +1784,7 @@ impl Runtime {
     fn variant(&self, e: &Value, name: Symbol, span: Span) -> R {
         match e {
             Value::Enum(info) => match info.variants.iter().position(|(n, _)| *n == name) {
-                Some(i) => Ok(Value::Variant(info.clone(), i as u32)),
+                Some(i) => Ok(Value::Variant(i as u32, info.clone())),
                 None => rt_err(
                     format!("`{}` has no variant `{}`", info.name, self.name(name)),
                     span,
@@ -2020,7 +2020,7 @@ impl Runtime {
                     Some(Value::Type(info)) => {
                         matches!(v, Value::Object(o) if o.borrow().info.is_a(info))
                     }
-                    Some(Value::Enum(e)) => matches!(v, Value::Variant(x, _) if Rc::ptr_eq(x, e)),
+                    Some(Value::Enum(e)) => matches!(v, Value::Variant(_, x) if Rc::ptr_eq(x, e)),
                     _ => return Err(format!("unknown type `{}`", self.name(*name))),
                 }
             }
@@ -2459,7 +2459,7 @@ pub(crate) fn iter_advance(it: &RefCell<IterState>) -> Option<Value> {
 }
 
 /// Grows the empty vector `regs` to `n` `nil` registers. `Value::Nil` is all zero bytes
-/// (`repr(C, u8)`, tag 0): zeroing is enough, no copy loop.
+/// (`repr(u8)`, tag 0): zeroing is enough, no copy loop.
 #[inline]
 fn fill_nil(regs: &mut Vec<Value>, n: usize) {
     debug_assert!(regs.is_empty());

@@ -453,12 +453,17 @@ namespaces, `trait` for shared behavior.
 - [x] `case` by type: `when int`, `when Animal`, `when int | str` (an `is_a?` of the
       subject, which is refined in that arm and, in the next ones and `else`, to the
       types left); not `nil` without `else` when every type is covered
+- [x] `Value` at 16 bytes (24 before): `Str` and `Tuple` are one pointer wide (thin
+      reference-counted slices, the length in the allocation), `Variant(index, enum)`
+      beside the tag (`repr(u8)`: a `bool`'s payload at byte 1). A list of 2 M
+      integers: 149 MB → 102 MB of memory; a concatenation is a single allocation;
+      speed otherwise unchanged. NaN-boxing (8 bytes) left aside: an `i64` does not fit
 
 ## Decisions that commit the JIT
 
 | Topic                    | v0.1 choice                                         |
 |--------------------------|-----------------------------------------------------|
-| Value representation     | `enum Value` (24 bytes), basic types without allocation; NaN-boxing (8 bytes) to be studied for the JIT |
+| Value representation     | `enum Value` (16 bytes since v0.20, 24 before), basic types without allocation; NaN-boxing (8 bytes) left aside: `int` is a full `i64` |
 | Memory                   | reference counting (`Rc`), no garbage collector     |
 | Rust functions           | single convention `Fn(&[Value]) -> Result<Value, String>` |
 | Names                    | interning: `Symbol(u32)`, O(1) comparisons          |

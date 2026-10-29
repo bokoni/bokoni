@@ -687,7 +687,7 @@ fn emit_inline(
                     cty,
                     MemFlagsData::trusted(),
                     fp,
-                    off + crate::value::layout::PAYLOAD,
+                    off + crate::value::layout::payload_of(want),
                 );
                 (*d, v)
             }
@@ -1511,7 +1511,7 @@ extern "C" fn bk_concat(dst: *mut Value, words: *const u64, kinds: *const u8, n:
                 }
             }
         }
-        *dst = Value::Str(Rc::from(out.as_str()));
+        *dst = Value::Str(out.as_str().into());
         0
     }
 }
@@ -2059,6 +2059,26 @@ fn nil_test(ta: JTy, tb: JTy) -> Option<bool> {
         JTy::Int | JTy::Float | JTy::Bool => Some(false),
         _ => None,
     }
+}
+
+/// Offset of a scalar's payload in a `Value`, by its native type (`i8`: a `bool`).
+fn scalar_payload(ty: Type) -> i32 {
+    if ty == types::I8 {
+        crate::value::layout::BOOL_PAYLOAD
+    } else {
+        crate::value::layout::PAYLOAD
+    }
+}
+
+/// Writes the payload word `w` of a scalar of tag `tag` into the `Value` at `addr + off`.
+fn store_payload(bx: &mut FunctionBuilder, tag: u8, w: CValue, addr: CValue, off: i32) {
+    let w = if tag == crate::value::layout::TAG_BOOL {
+        bx.ins().ireduce(types::I8, w)
+    } else {
+        w
+    };
+    let at = off + crate::value::layout::payload_of(tag);
+    bx.ins().store(MemFlagsData::new(), w, addr, at);
 }
 
 fn spec_operands(ta: JTy, tb: JTy) -> (JTy, JTy) {
@@ -4325,7 +4345,7 @@ impl Jit {
         // object; otherwise the tag is checked (bail if it differs), `int` to `float`.
         macro_rules! elem {
             ($bx:expr, $addr:expr, $a:expr, $span:expr) => {{
-                use crate::value::layout::{PAYLOAD, TAG_BOOL, TAG_FLOAT, TAG_INT};
+                use crate::value::layout::{BOOL_PAYLOAD, PAYLOAD, TAG_BOOL, TAG_FLOAT, TAG_INT};
                 let t = elem_jty(&plan.anns, $a);
                 if let JTy::Obj(_) = t {
                     $addr
@@ -4352,7 +4372,8 @@ impl Jit {
                         JTy::Bool => {
                             let bad = $bx.ins().icmp_imm_s(IntCC::NotEqual, tag, TAG_BOOL as i64);
                             bail!($bx, bad);
-                            $bx.ins().ireduce(types::I8, raw)
+                            $bx.ins()
+                                .load(types::I8, MemFlagsData::trusted(), $addr, BOOL_PAYLOAD)
                         }
                         _ => {
                             let isf = $bx.ins().icmp_imm_s(IntCC::Equal, tag, TAG_FLOAT as i64);
@@ -4456,7 +4477,7 @@ impl Jit {
                         if scalar {
                             // Its payload (the value has the register's type: otherwise
                             // dropped and resumed in the interpreter).
-                            use crate::value::layout::{TAG_BOOL, TAG_FLOAT, TAG_INT};
+                            use crate::value::layout::{TAG_BOOL, TAG_FLOAT, TAG_INT, payload_of};
                             let s = slots[0];
                             let (tag, ty) = match dty {
                                 Some(JTy::Int) => (TAG_INT, types::I64),
@@ -4475,7 +4496,9 @@ impl Jit {
                             bail!(bx, yes);
                             bx.ins().jump(ok, &[]);
                             bx.switch_to_block(ok);
-                            let v = bx.ins().load(ty, MemFlagsData::trusted(), s, PAYLOAD);
+                            let v = bx
+                                .ins()
+                                .load(ty, MemFlagsData::trusted(), s, payload_of(tag));
                             bx.def_var(dvar!(writes[0]), v);
                         } else {
                             for (d, s) in writes.iter().zip(slots) {
@@ -4519,7 +4542,7 @@ impl Jit {
                         if let Some(s) = scratch {
                             let a = bx.ins().stack_addr(types::I64, s, 0);
                             let z = bx.ins().iconst(types::I64, 0);
-                            for k in 0..3 {
+                            for k in 0..crate::value::layout::SIZE / 8 {
                                 bx.ins().store(MemFlagsData::trusted(), z, a, k * 8);
                             }
                             args.push(a);
@@ -4692,7 +4715,9 @@ impl Jit {
                     // A value of any type to a simple type: its tag checked (otherwise
                     // resumed in the interpreter, which gives the error).
                     Guard(d, a, _) if plan.boxed.contains(&key) => {
-                        use crate::value::layout::{PAYLOAD, TAG_BOOL, TAG_FLOAT, TAG_INT};
+                        use crate::value::layout::{
+                            BOOL_PAYLOAD, PAYLOAD, TAG_BOOL, TAG_FLOAT, TAG_INT,
+                        };
                         let v = bx.use_var(uvar!(*a));
                         let tag = bx.ins().load(types::I8, MemFlagsData::trusted(), v, 0);
                         let raw = bx
@@ -4708,7 +4733,8 @@ impl Jit {
                                 let bad =
                                     bx.ins().icmp_imm_s(IntCC::NotEqual, tag, TAG_BOOL as i64);
                                 bail!(bx, bad);
-                                bx.ins().ireduce(types::I8, raw)
+                                bx.ins()
+                                    .load(types::I8, MemFlagsData::trusted(), v, BOOL_PAYLOAD)
                             }
                             _ => {
                                 let isf = bx.ins().icmp_imm_s(IntCC::Equal, tag, TAG_FLOAT as i64);
@@ -4737,7 +4763,7 @@ impl Jit {
                         if plan.boxed.contains(&key)
                             && matches!(dty, Some(JTy::Int | JTy::Float | JTy::Bool)) =>
                     {
-                        use crate::value::layout::{TAG_BOOL, TAG_FLOAT, TAG_INT};
+                        use crate::value::layout::{TAG_BOOL, TAG_FLOAT, TAG_INT, payload_of};
                         let (tag, ty) = match dty {
                             Some(JTy::Int) => (TAG_INT, types::I64),
                             Some(JTy::Float) => (TAG_FLOAT, types::F64),
@@ -4750,7 +4776,7 @@ impl Jit {
                             let t = bx.ins().load(types::I8, MemFlagsData::new(), at, 0);
                             let bad = bx.ins().icmp_imm_s(IntCC::NotEqual, t, tag as i64);
                             bail!(bx, bad);
-                            bx.ins().load(ty, MemFlagsData::new(), at, PAYLOAD)
+                            bx.ins().load(ty, MemFlagsData::new(), at, payload_of(tag))
                         } else {
                             let s = bx.ins().iconst(types::I32, *slot as i64);
                             let t = bx.ins().iconst(types::I32, tag as i64);
@@ -4766,7 +4792,7 @@ impl Jit {
                     // time): its payload if it still has that type, otherwise resumed in the
                     // interpreter.
                     GetUp(d, u) if matches!(dty, Some(JTy::Int | JTy::Float | JTy::Bool)) => {
-                        use crate::value::layout::{TAG_BOOL, TAG_FLOAT, TAG_INT};
+                        use crate::value::layout::{TAG_BOOL, TAG_FLOAT, TAG_INT, payload_of};
                         let (tag, ty) = match dty {
                             Some(JTy::Int) => (TAG_INT, types::I64),
                             Some(JTy::Float) => (TAG_FLOAT, types::F64),
@@ -4783,7 +4809,8 @@ impl Jit {
                                 let t = bx.ins().load(types::I8, MemFlagsData::new(), cell, off);
                                 let bad = bx.ins().icmp_imm_s(IntCC::NotEqual, t, tag as i64);
                                 bail!(bx, bad);
-                                bx.ins().load(ty, MemFlagsData::new(), cell, off + PAYLOAD)
+                                bx.ins()
+                                    .load(ty, MemFlagsData::new(), cell, off + payload_of(tag))
                             }
                             None => {
                                 let uu = bx.ins().iconst(types::I32, *u as i64);
@@ -4883,7 +4910,7 @@ impl Jit {
                             bx.switch_to_block(fast);
                             let t = bx.ins().iconst(types::I8, tag as i64);
                             bx.ins().store(MemFlagsData::new(), t, cell, off);
-                            bx.ins().store(MemFlagsData::new(), w, cell, off + PAYLOAD);
+                            store_payload(&mut bx, tag, w, cell, off);
                             bx.ins().jump(done, &[]);
                             bx.switch_to_block(slow);
                         }
@@ -4924,7 +4951,7 @@ impl Jit {
                             bx.switch_to_block(fast);
                             let t = bx.ins().iconst(types::I8, tag as i64);
                             bx.ins().store(MemFlagsData::new(), t, at, 0);
-                            bx.ins().store(MemFlagsData::new(), w, at, PAYLOAD);
+                            store_payload(&mut bx, tag, w, at, 0);
                             bx.ins().jump(done, &[]);
                             bx.switch_to_block(slow);
                         }
@@ -5117,7 +5144,7 @@ impl Jit {
                             cty,
                             MemFlagsData::trusted(),
                             fp,
-                            off + crate::value::layout::PAYLOAD,
+                            off + crate::value::layout::payload_of(want),
                         );
                         bx.def_var(dvar!(*d), v);
                     }
@@ -5157,7 +5184,7 @@ impl Jit {
                             MemFlagsData::trusted(),
                             v,
                             fp,
-                            off + crate::value::layout::PAYLOAD,
+                            off + crate::value::layout::payload_of(tag),
                         );
                     }
                     // Inlined method: its class checked with a cache (resumed in the
@@ -5324,7 +5351,7 @@ impl Jit {
                             cty,
                             MemFlagsData::trusted(),
                             fp,
-                            off + crate::value::layout::PAYLOAD,
+                            off + crate::value::layout::payload_of(want),
                         );
                         bx.def_var(dvar!(*d), v);
                     }
@@ -5728,7 +5755,7 @@ impl Jit {
                 Term::Return { reg, .. }
                     if ret != RegTy::Value && tyof!(*reg) == Some(JTy::Boxed) =>
                 {
-                    use crate::value::layout::{TAG_BOOL, TAG_FLOAT, TAG_INT};
+                    use crate::value::layout::{BOOL_PAYLOAD, TAG_BOOL, TAG_FLOAT, TAG_INT};
                     let v = bx.use_var(uvar!(*reg));
                     let tag = bx.ins().load(types::I8, MemFlagsData::trusted(), v, 0);
                     let raw = bx
@@ -5743,7 +5770,8 @@ impl Jit {
                         RegTy::Bool => {
                             let bad = bx.ins().icmp_imm_s(IntCC::NotEqual, tag, TAG_BOOL as i64);
                             bail!(bx, bad);
-                            bx.ins().ireduce(types::I8, raw)
+                            bx.ins()
+                                .load(types::I8, MemFlagsData::trusted(), v, BOOL_PAYLOAD)
                         }
                         _ => {
                             let isf = bx.ins().icmp_imm_s(IntCC::Equal, tag, TAG_FLOAT as i64);
@@ -6553,12 +6581,13 @@ impl Dyn<'_> {
             .load(types::I8, MemFlagsData::trusted(), self.regs, Self::off(r))
     }
 
+    /// Payload of a register holding a scalar of type `ty` (`i8`: a `bool`).
     fn payload(&self, bx: &mut FunctionBuilder, r: Reg, ty: Type) -> CValue {
         bx.ins().load(
             ty,
             MemFlagsData::trusted(),
             self.regs,
-            Self::off(r) + PAYLOAD,
+            Self::off(r) + scalar_payload(ty),
         )
     }
 
@@ -6584,11 +6613,12 @@ impl Dyn<'_> {
         bx.ins()
             .store(MemFlagsData::trusted(), tag, self.regs, Self::off(d));
         if let Some(p) = payload {
+            let ty = bx.func.dfg.value_type(p);
             bx.ins().store(
                 MemFlagsData::trusted(),
                 p,
                 self.regs,
-                Self::off(d) + PAYLOAD,
+                Self::off(d) + scalar_payload(ty),
             );
         }
     }
@@ -6967,8 +6997,19 @@ fn dyn_instr(
             let next = bx.create_block();
             bx.ins().brif(scalar, fast, &[], slow, &[]);
             bx.switch_to_block(fast);
-            let v = d.payload(bx, *a, types::I64);
-            d.write(bx, *dst, t, Some(v));
+            // Both words: the payload of a `bool` is in the first one, beside the tag.
+            let src = Dyn::off(*a);
+            let w0 = bx
+                .ins()
+                .load(types::I64, MemFlagsData::trusted(), d.regs, src);
+            let w1 = bx
+                .ins()
+                .load(types::I64, MemFlagsData::trusted(), d.regs, src + 8);
+            d.write(bx, *dst, t, None);
+            bx.ins()
+                .store(MemFlagsData::trusted(), w0, d.regs, Dyn::off(*dst));
+            bx.ins()
+                .store(MemFlagsData::trusted(), w1, d.regs, Dyn::off(*dst) + 8);
             bx.ins().jump(next, &[]);
             bx.switch_to_block(slow);
             d.step(bx, ins, span);

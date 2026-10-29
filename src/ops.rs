@@ -7,9 +7,8 @@ use crate::diagnostic::Error;
 use crate::intern::Symbol;
 use crate::ir::Access;
 use crate::span::Span;
-use crate::value::{Function, HashKey, Value};
+use crate::value::{Function, HashKey, Str, Value};
 use crate::vm::{CallArgs, Runtime};
-use std::rc::Rc;
 
 pub(crate) type R<T = Value> = Result<T, Error>;
 
@@ -162,12 +161,7 @@ impl Runtime {
                 })
             }
 
-            (Add, Value::Str(a), Value::Str(b)) => {
-                let mut s = String::with_capacity(a.len() + b.len());
-                s.push_str(a);
-                s.push_str(b);
-                Value::Str(s.into())
-            }
+            (Add, Value::Str(a), Value::Str(b)) => Value::Str(Str::concat(&[a, b])),
             (Add, Value::Str(_), _) | (Add, _, Value::Str(_)) => {
                 return type_err(
                     format!(
@@ -550,7 +544,7 @@ impl Runtime {
             }
             (M::Join, Value::List(l)) => {
                 let sep = match args.as_slice() {
-                    [] => Rc::from(""),
+                    [] => Str::from(""),
                     [s] => expect_str(s, mname, span)?,
                     _ => return rt_err("`join(separator?)` expects 0 or 1 argument", span),
                 };
@@ -837,7 +831,7 @@ fn arity(name: &str, args: &[Value], n: usize, span: Span) -> R<()> {
     )
 }
 
-fn expect_str(v: &Value, method: &str, span: Span) -> R<Rc<str>> {
+fn expect_str(v: &Value, method: &str, span: Span) -> R<Str> {
     match v {
         Value::Str(s) => Ok(s.clone()),
         _ => type_err(

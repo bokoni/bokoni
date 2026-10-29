@@ -24,7 +24,7 @@ use crate::ast::Program;
 use crate::diagnostic::{Error, Errors};
 use crate::intern::Interner;
 use crate::ir::{Proto, Script};
-use crate::value::{Function, NativeFn, NativeImpl, Value};
+use crate::value::{Function, NativeFn, NativeImpl, Str, Value};
 use crate::vm::{CallArgs, Runtime};
 use crate::{parser, printer};
 use std::fmt::Display;
@@ -579,6 +579,15 @@ impl FromValue for String {
 impl FromValue for Rc<str> {
     fn from_value(v: &Value) -> Result<Self, String> {
         match v {
+            Value::Str(s) => Ok(s.into()),
+            _ => Err(mismatch("str", v)),
+        }
+    }
+}
+
+impl FromValue for Str {
+    fn from_value(v: &Value) -> Result<Self, String> {
+        match v {
             Value::Str(s) => Ok(s.clone()),
             _ => Err(mismatch("str", v)),
         }
@@ -598,6 +607,12 @@ impl IntoValue for &str {
 }
 
 impl IntoValue for Rc<str> {
+    fn into_value(self) -> Value {
+        Value::Str(self.into())
+    }
+}
+
+impl IntoValue for Str {
     fn into_value(self) -> Value {
         Value::Str(self)
     }

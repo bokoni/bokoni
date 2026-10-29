@@ -22,7 +22,7 @@
 //! enough containers were created since the last one.
 
 use crate::objects::Object;
-use crate::value::{Function, HashMap, Record, Value};
+use crate::value::{Function, HashMap, Record, ThinRc, ThinWeak, Value};
 use crate::vm::Cell;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
@@ -35,7 +35,7 @@ enum Node {
     Object(Weak<RefCell<Object>>),
     Cell(Weak<RefCell<Value>>),
     Closure(Weak<Function>),
-    Tuple(Weak<[Value]>),
+    Tuple(ThinWeak<Value>),
 }
 
 /// A registered container, alive during a collection.
@@ -46,7 +46,7 @@ enum Live {
     Object(Rc<RefCell<Object>>),
     Cell(Rc<RefCell<Value>>),
     Closure(Rc<Function>),
-    Tuple(Rc<[Value]>),
+    Tuple(ThinRc<Value>),
 }
 
 struct Registry {
@@ -92,7 +92,7 @@ pub fn track(v: &Value) {
             register(Node::Closure(Rc::downgrade(f)))
         }
         Value::Tuple(t) if t.iter().any(|v| addr_of_value(v).is_some()) => {
-            register(Node::Tuple(Rc::downgrade(t)))
+            register(Node::Tuple(ThinRc::downgrade(t)))
         }
         _ => {}
     }
@@ -110,7 +110,7 @@ pub fn track_new(v: &Value) {
             Value::Hash(h) => Rc::strong_count(h) <= 2,
             Value::Record(r) => Rc::strong_count(r) <= 2,
             Value::Object(o) => Rc::strong_count(o) <= 2,
-            Value::Tuple(t) => Rc::strong_count(t) <= 2,
+            Value::Tuple(t) => ThinRc::strong_count(t) <= 2,
             _ => false,
         };
         if !unique {
@@ -177,7 +177,7 @@ pub(crate) fn addr_of_value(v: &Value) -> Option<usize> {
         Value::Record(r) => Rc::as_ptr(r) as *const () as usize,
         Value::Object(o) => Rc::as_ptr(o) as *const () as usize,
         Value::Function(f) => Rc::as_ptr(f) as *const () as usize,
-        Value::Tuple(t) => Rc::as_ptr(t) as *const () as usize,
+        Value::Tuple(t) => ThinRc::as_ptr(t) as *const () as usize,
         _ => return None,
     })
 }
@@ -191,7 +191,7 @@ impl Live {
             Live::Object(x) => Rc::as_ptr(x) as *const () as usize,
             Live::Cell(x) => Rc::as_ptr(x) as *const () as usize,
             Live::Closure(x) => Rc::as_ptr(x) as *const () as usize,
-            Live::Tuple(x) => Rc::as_ptr(x) as *const () as usize,
+            Live::Tuple(x) => ThinRc::as_ptr(x) as *const () as usize,
         }
     }
 
@@ -208,7 +208,7 @@ impl Live {
             }
             match v {
                 // A tuple owned by this container only: part of it.
-                Value::Tuple(t) if Rc::strong_count(t) == 1 => {
+                Value::Tuple(t) if ThinRc::strong_count(t) == 1 => {
                     for x in t.iter() {
                         value(x, registered, f);
                     }

@@ -582,7 +582,7 @@ impl Runtime {
     pub(crate) fn user_method(&self, v: &Value, name: Symbol) -> Option<Rc<Proto>> {
         match v {
             Value::Object(o) => o.borrow().info.methods.get(&name).cloned(),
-            Value::Variant(e, _) => e.methods.get(&name).cloned(),
+            Value::Variant(_, e) => e.methods.get(&name).cloned(),
             _ => None,
         }
     }
@@ -628,7 +628,7 @@ impl Runtime {
                     span,
                 )
             }
-            Value::Variant(e, i) => {
+            Value::Variant(i, e) => {
                 let (vname, value) = &e.variants[*i as usize];
                 if name == self.syms.value {
                     return Ok(value.clone());
@@ -744,13 +744,13 @@ impl Runtime {
     ) -> R {
         if name == self.syms.values && args.is_empty() {
             let all = (0..e.variants.len() as u32)
-                .map(|i| Value::Variant(e.clone(), i))
+                .map(|i| Value::Variant(i, e.clone()))
                 .collect();
             return Ok(Value::list(all));
         }
         if name == self.syms.from && args.len() == 1 {
             let found = e.variants.iter().position(|(_, v)| v.equals(&args[0]));
-            return Ok(found.map_or(Value::Nil, |i| Value::Variant(e.clone(), i as u32)));
+            return Ok(found.map_or(Value::Nil, |i| Value::Variant(i as u32, e.clone())));
         }
         rt_err(
             format!(

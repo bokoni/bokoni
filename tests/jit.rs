@@ -1298,3 +1298,22 @@ fn refined_values_are_native() {
     assert!(e.eval("def f(x: int?): int = 1\nf(\"s\")").is_err());
     assert!(e.eval("def h(x: any): int?\n  x\nend\nh(\"s\")").is_err());
 }
+
+#[test]
+fn bools_in_values_are_read_and_written() {
+    // A `bool`'s payload is beside the tag (byte 1): fields, globals, captured
+    // variables, list elements and untyped copies, read and written in native code.
+    let src = "class F\n  def init(@on: bool)\n  end\n  def flip(): bool\n    @on = not @on\n    @on\n  end\nend\n\
+               let g = false\n\
+               def tick(n: int): int\n  let t = 0\n  for i in 0...n\n    g = not g\n    t += 1 if g\n  end\n  t\nend\n\
+               def count(xs: [bool]): int\n  let t = 0\n  for x in xs\n    t += 1 if x\n  end\n  t\nend\n\
+               def caught(n: int): bool\n  let b = true\n  let f = || b = not b\n  for i in 0...n\n    f()\n  end\n  b\nend\n\
+               def copy(x) = x\n\
+               def maybe(x: bool?): bool = if x != nil then x else false end\n\
+               let f = F(false)\n\
+               [f.flip(), f.flip(), tick(5), g, count([true, false, true]), caught(3), copy(true), copy(false), maybe(true), maybe(nil)]";
+    assert_eq!(
+        same(src),
+        "[true, false, 3, true, 2, false, true, false, true, false]"
+    );
+}
