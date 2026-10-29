@@ -1,0 +1,20 @@
+[package]
+name = "bokoni-playground"
+version = "0.1.0"
+edition = "2024"
+description = "Bokoni compiled to WebAssembly for the browser playground (interpreter only)"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+bokoni = { path = "../..", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

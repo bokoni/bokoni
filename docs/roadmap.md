@@ -462,6 +462,11 @@ namespaces, `trait` for shared behavior.
       format (sequences, maps with field names, a variant's value or name; hash keys of
       their own type, left to the format); an error for a function, a range, a
       structure that contains itself; deep nesting grows the stack
+- [x] `engine.check(src, name)`: syntax and static checks without running
+- [x] Browser playground (`playground/`): the interpreter in WebAssembly (no JIT
+      inside wasm), a Monaco editor with Bokoni highlighting, static errors as one
+      types, runs in a worker (stop, 10 s limit), examples, links with the code;
+      400 nested calls at most (the browser's stack, about 1 MB in a Chrome worker)
 
 ## Decisions that commit the JIT
 

@@ -118,6 +118,15 @@ Lists and tuples become sequences; hashes, records and objects (their fields) ma
 enum variant its value (`enum E: str`) or its name. A function, a range or a structure
 that contains itself is an error.
 
+`engine.check(src, "name.bk")` gives the errors `eval` would report before running
+(syntax, static checks) without running anything: for an editor, a linter.
+
+## Playground
+
+[`playground/`](playground/README.md): Bokoni in the browser (the interpreter compiled to
+WebAssembly, a Monaco editor, errors as one types). `cd playground/web && bun install &&
+bun run dev`.
+
 ## Command line
 
 ```sh

@@ -1,0 +1,19 @@
+{
+  "name": "bokoni-playground",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "wasm": "bun scripts/build-wasm.ts",
+    "monaco": "bun scripts/monaco-features.ts",
+    "dev": "bun run wasm && bun --bun vite",
+    "build": "bun run wasm && bun --bun tsc --noEmit && bun --bun vite build",
+    "preview": "bun --bun vite preview",
+    "test": "bun run wasm && bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "monaco-editor": "^0.57.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  }
+}

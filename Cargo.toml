@@ -3,6 +3,8 @@ name = "bokoni"
 version = "0.1.0"
 edition = "2024"
 description = "Scripting language embedded in Rust, Ruby-like syntax, gradual typing"
+# The browser playground is a separate crate and web project.
+exclude = ["playground"]
 
 [lib]
 path = "src/lib.rs"

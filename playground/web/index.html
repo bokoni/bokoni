@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bokoni Playground</title>
+    <meta name="description" content="Write and run Bokoni in the browser: Ruby-like syntax, gradual typing." />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='5' y='5' width='22' height='22' rx='5' transform='rotate(45 16 16)' fill='%237c4dff'/></svg>" />
+  </head>
+  <body>
+    <header class="bar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true"></span>
+        <span class="name">Bokoni</span>
+        <span class="tag">playground</span>
+      </div>
+      <label class="examples">
+        <span class="sr-only">Example</span>
+        <select id="examples"></select>
+      </label>
+      <div class="spacer"></div>
+      <a class="link" href="https://github.com/bokoni/bokoni/blob/main/docs/syntax.md" target="_blank" rel="noopener">Syntax</a>
+      <button id="share" class="ghost" title="Copy a link to this program">Share</button>
+      <button id="theme" class="ghost icon" title="Theme"></button>
+      <button id="run" class="primary" title="Run (Ctrl+Enter)">
+        <span class="play" aria-hidden="true"></span><span class="label">Run</span>
+      </button>
+    </header>
+    <main id="main" class="split">
+      <section class="pane editor-pane">
+        <div id="editor"></div>
+        <footer class="status">
+          <span id="problems"></span>
+          <span id="cursor"></span>
+        </footer>
+      </section>
+      <div id="divider" class="divider" role="separator" aria-orientation="vertical"></div>
+      <section class="pane output-pane">
+        <div class="pane-head">
+          <span class="title">Output</span>
+          <span id="run-status"></span>
+          <button id="clear" class="ghost small">Clear</button>
+        </div>
+        <div id="output" aria-live="polite"></div>
+      </section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,4 @@
+# The stack Rust keeps in WebAssembly memory (its own data, not the browser's call stack,
+# see `MAX_CALL_DEPTH`): 4 MB instead of 1 MB, room for the interpreter's nested calls.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=-zstack-size=4194304"]
