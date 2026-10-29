@@ -1317,3 +1317,30 @@ fn bools_in_values_are_read_and_written() {
         "[true, false, 3, true, 2, false, true, false, true, false]"
     );
 }
+
+#[test]
+fn ill_typed_code_matches_without_static_checks() {
+    // Found by the fuzzer: code the checker rejects, run anyway.
+    let run = |src: &str, jit: bool| {
+        let mut e = Engine::new();
+        e.set_output(|_| {});
+        e.set_static_checks(false);
+        e.set_jit(jit);
+        e.set_jit_eager(true);
+        match e.eval(src) {
+            Ok(v) => e.inspect(&v),
+            Err(err) => err.render(src, "test"),
+        }
+    };
+    // A typed list given a value it cannot hold: the result's annotation is checked.
+    let list = "def sq(n: int): [int]\n  let out: [int] = []\n  for i in 0...n\n    out << i * i\n  end\n  out[0] = out\n  out\nend\nsq(3)";
+    // A private method called from outside, on an object of known class.
+    let private = "class P\n  def init(@x: int)\n  end\n  private def v(): int = @x\nend\n\
+                   def sum(ps: [P]): int\n  let t = 0\n  for p in ps\n    t += p.v()\n  end\n  t\nend\n\
+                   sum([P(1), P(2)])";
+    for src in [list, private] {
+        let (a, b) = (run(src, false), run(src, true));
+        assert!(a.contains("error"), "{a}");
+        assert_eq!(a, b, "JIT differs from the interpreter for:\n{src}");
+    }
+}

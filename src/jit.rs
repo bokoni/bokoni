@@ -2137,6 +2137,23 @@ impl Target {
 }
 
 /// Elements a native list can hold: simple values, objects of a declared type.
+/// Can a value of native type `v` be an element of a list annotated `[e]` (`xs << v`,
+/// `xs[i] = v`)? Otherwise the function stays in the interpreter: the list no longer has
+/// its type, which its uses (a result, an argument) must check.
+fn may_hold(anns: &[RtType], e: &RtType, v: JTy) -> bool {
+    match e {
+        RtType::Any => true,
+        RtType::Optional(x) => may_hold(anns, x, v),
+        RtType::Union(xs) => xs.iter().any(|x| may_hold(anns, x, v)),
+        RtType::Int => v == JTy::Int,
+        RtType::Float => matches!(v, JTy::Int | JTy::Float),
+        RtType::Bool => v == JTy::Bool,
+        RtType::List(x) => matches!(v, JTy::List(a) if same_ann_exact(x, &anns[a as usize])),
+        RtType::Named(..) => matches!(v, JTy::Obj(_)),
+        _ => false,
+    }
+}
+
 fn elem_ok(e: &RtType) -> bool {
     prim(e).is_some() || matches!(e, RtType::Named(..) | RtType::Str)
 }
@@ -2287,6 +2304,11 @@ impl Analysis<'_> {
             Closure(..) => JTy::Boxed,
             // `x is T` (the type of a `rescue` clause…): by a helper.
             IsType(_, a, _) if word(g(*a)?) => JTy::Bool,
+            // A typed list given a value it may not hold (see `may_hold`): its type no
+            // longer known, the function stays in the interpreter.
+            SetIndex(a, ..) | Bin(BinOp::Push, _, a, _) if matches!(g(*a), Some(JTy::List(_))) => {
+                return None;
+            }
             // Anything else the interpreter's code can do on values (`Runtime::step`): an
             // operation on a hash, a record, a tuple…; its result any value.
             _ if !matches!(
@@ -2428,20 +2450,18 @@ impl Analysis<'_> {
                 }
                 _ => return None,
             },
-            // `xs << v`, `xs[i] = v`: any native value (the elements are checked when read).
+            // `xs << v`, `xs[i] = v`: a native value the list may hold (an object's class
+            // is checked when the element is read).
             Bin(BinOp::Push, _, a, b) => match (g(*a)?, g(*b)?) {
-                (
-                    JTy::List(e),
-                    JTy::Int | JTy::Float | JTy::Bool | JTy::Obj(_) | JTy::List(_),
-                ) => JTy::List(e),
+                (JTy::List(e), v) if may_hold(&self.anns, &self.anns[e as usize], v) => {
+                    JTy::List(e)
+                }
                 _ => return None,
             },
             SetIndex(a, i, v) => match (g(*a)?, g(*i)?, g(*v)?) {
-                (
-                    JTy::List(_),
-                    JTy::Int,
-                    JTy::Int | JTy::Float | JTy::Bool | JTy::Obj(_) | JTy::List(_),
-                ) => return Some(None),
+                (JTy::List(e), JTy::Int, v) if may_hold(&self.anns, &self.anns[e as usize], v) => {
+                    return Some(None);
+                }
                 _ => return None,
             },
             // `let out: [int] = []`, an annotation already satisfied.
@@ -2477,7 +2497,11 @@ impl Analysis<'_> {
             // Declared method of an object of known type (`self`, or a parameter): called
             // directly, if not redefined by the object's class (checked when calling).
             CallMethod {
-                recv, name, site, ..
+                recv,
+                name,
+                site,
+                access,
+                ..
             } if !matches!(g(*recv)?, JTy::List(_) | JTy::Str) => {
                 let site = &p.calls[*site as usize];
                 let info = match g(*recv)? {
@@ -2504,6 +2528,11 @@ impl Analysis<'_> {
                     _ => None,
                 };
                 let declared = info.methods.get(name)?.clone();
+                // A `private` / `protected` method not called on `self`: the interpreter
+                // checks the access (and gives the error).
+                if declared.vis != crate::ast::Visibility::Public && *access != crate::ir::Access::THIS {
+                    return None;
+                }
                 // Method of a generic class called on `self` in a typed copy: the copy for
                 // the same type arguments.
                 let owner = crate::objects::method_owner(&info, *name, &declared);
