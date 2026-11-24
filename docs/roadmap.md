@@ -467,6 +467,12 @@ namespaces, `trait` for shared behavior.
       inside wasm), a Monaco editor with Bokoni highlighting, static errors as one
       types, runs in a worker (stop, 10 s limit), examples, links with the code;
       400 nested calls at most (the browser's stack, about 1 MB in a Chrome worker)
+- [x] WebAssembly backend (`wasm-jit` feature, `src/wasm_jit.rs`): inside WebAssembly,
+      typed functions (`int` / `float` / `bool`) written as WebAssembly modules with
+      `wasm-encoder`, instantiated by the host against the program's memory and function
+      table, called through function pointers; used by the playground (`fib(25)`: 26.6 ms
+      → 0.5 ms in Chrome). Same answers as the interpreter: edge cases, examples, random
+      programs (`playground/web/test/jit.test.ts`)
 
 ## Decisions that commit the JIT
 

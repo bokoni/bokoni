@@ -21,6 +21,7 @@ cranelift-module = { version = "=0.136.2", optional = true }
 cranelift-native = { version = "=0.136.2", optional = true }
 serde = { version = "1", optional = true }
 stacker = "0.1"
+wasm-encoder = { version = "0.262", optional = true }
 
 [profile.release]
 debug = 1
@@ -39,5 +40,8 @@ jit = [
     "dep:cranelift-module",
     "dep:cranelift-native",
 ]
+# Compilation of typed functions to WebAssembly, for Bokoni running in WebAssembly
+# (`wasm_jit`; the host compiles the generated modules).
+wasm-jit = ["dep:wasm-encoder"]
 # Serialization of script values (`Engine::serializable`), into any `serde` format.
 serde = ["dep:serde"]

@@ -174,10 +174,10 @@ impl Engine {
     }
 
     /// Enables or disables native (JIT) compilation of typed functions (enabled by
-    /// default when the `jit` feature is compiled in). The result is the same; only
-    /// the speed changes.
+    /// default when the `jit` or `wasm-jit` feature is compiled in). The result is the
+    /// same; only the speed changes.
     pub fn set_jit(&mut self, enabled: bool) {
-        self.rt.jit_enabled = enabled && cfg!(feature = "jit");
+        self.rt.jit_enabled = enabled && cfg!(any(feature = "jit", feature = "wasm-jit"));
     }
 
     /// Compiles each function on its first call (instead of the second): used by the

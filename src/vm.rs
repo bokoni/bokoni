@@ -15,6 +15,12 @@ use crate::ops::{Builtin, METHODS, Method, R, list_index, rt_err, short, type_er
 use crate::span::Span;
 use crate::value::{Function, HashMap, Range, Record, Value};
 use std::cell::RefCell;
+
+/// The native code backend compiled in: Cranelift, or WebAssembly modules.
+#[cfg(feature = "jit")]
+use crate::jit as native;
+#[cfg(all(feature = "wasm-jit", not(feature = "jit")))]
+use crate::wasm_jit as native;
 use std::rc::Rc;
 
 /// Cell of a variable captured by a closure.
@@ -146,8 +152,8 @@ pub struct Runtime {
     pub(crate) caught: Vec<Option<Error>>,
     /// Calls left before checking whether a collection of cycles is due.
     gc_calls: u32,
-    #[cfg(feature = "jit")]
-    pub(crate) jit: Option<crate::jit::Jit>,
+    #[cfg(any(feature = "jit", feature = "wasm-jit"))]
+    pub(crate) jit: Option<native::Jit>,
     /// Error raised while running baseline native code, waiting to be propagated.
     #[cfg(feature = "jit")]
     pending: Option<Error>,
@@ -192,12 +198,12 @@ impl Runtime {
             syms,
             frames: Vec::new(),
             no_ctx: Rc::from([]),
-            jit_enabled: cfg!(feature = "jit"),
+            jit_enabled: cfg!(any(feature = "jit", feature = "wasm-jit")),
             jit_eager: false,
             concat_buf: String::new(),
             caught: Vec::new(),
             gc_calls: GC_CALLS,
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "wasm-jit"))]
             jit: None,
             #[cfg(feature = "jit")]
             pending: None,
@@ -286,7 +292,7 @@ impl Runtime {
     /// Fast call: positional arguments, as many as parameters, read directly from the
     /// caller's registers.
     pub(crate) fn invoke_regs(&mut self, c: &Closure, args: &[Value], span: Span) -> R {
-        #[cfg(feature = "jit")]
+        #[cfg(any(feature = "jit", feature = "wasm-jit"))]
         if let Some(r) = self.native_fast(&c.proto, None, args, span, &c.upvals) {
             return r;
         }
@@ -336,7 +342,7 @@ impl Runtime {
         let check_stack = self.depth.is_multiple_of(STACK_CHECK);
         let body = || {
             bind(self, &mut regs)?;
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "wasm-jit"))]
             if let Some(r) = self.try_jit(proto, &regs, upvals) {
                 return r;
             }
@@ -1461,7 +1467,7 @@ impl Runtime {
     /// arguments are of exactly its native types (`int`, `float`, `bool`; `this` first for
     /// a method): no frame, no conversion. `None`: general path (which also produces the
     /// errors of wrong arguments).
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "wasm-jit"))]
     #[inline]
     fn native_fast(
         &mut self,
@@ -1507,11 +1513,11 @@ impl Runtime {
         };
         // (Simple types only, passed by value.)
         let by_ref = 0;
-        let jit: *mut crate::jit::Jit = self.jit.as_mut()?;
+        let jit: *mut native::Jit = self.jit.as_mut()?;
         let (depth, max) = (self.depth + 1, self.max_depth);
         // SAFETY: `jit` belongs to this runtime; neither is borrowed during the call.
         let r = unsafe {
-            crate::jit::Jit::call(
+            native::Jit::call(
                 jit,
                 self,
                 entry,
@@ -1528,7 +1534,7 @@ impl Runtime {
     }
 
     /// Runs `proto` natively if it is (or becomes) compiled; `None` otherwise.
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "wasm-jit"))]
     fn try_jit(&mut self, proto: &Rc<Proto>, regs: &[Value], upvals: &[Cell]) -> Option<R> {
         if !self.jit_enabled {
             return None;
@@ -1578,7 +1584,7 @@ impl Runtime {
                 _ => None,
             };
             if self.jit.is_none() {
-                self.jit = crate::jit::Jit::new();
+                self.jit = native::Jit::new();
                 if self.jit.is_none() {
                     // Machine not supported by Cranelift.
                     self.jit_enabled = false;
@@ -1593,7 +1599,7 @@ impl Runtime {
             JitState::Native(code) => (
                 code.entry,
                 code.params.len(),
-                crate::jit::by_ref(&code.params)?,
+                native::by_ref(&code.params)?,
                 code.ret,
             ),
             _ => return None,
@@ -1603,11 +1609,11 @@ impl Runtime {
             .into_iter()
             .chain(proto.params.iter().map(|p| regs[p.reg as usize].clone()))
             .collect();
-        let jit: *mut crate::jit::Jit = self.jit.as_mut()?;
+        let jit: *mut native::Jit = self.jit.as_mut()?;
         let (depth, max) = (self.depth, self.max_depth);
         // SAFETY: `jit` belongs to this runtime; neither is borrowed during the call.
         Some(unsafe {
-            crate::jit::Jit::call(jit, self, entry, n, by_ref, ret, &args, upvals, depth, max)
+            native::Jit::call(jit, self, entry, n, by_ref, ret, &args, upvals, depth, max)
         })
     }
 
@@ -2285,7 +2291,7 @@ impl TypeInfo {
 /// simple value (`int`, `float`, `bool`) or a list of them, every argument then of
 /// exactly the type of its parameter (the generic function's arguments are not checked:
 /// its annotations are `any`). `None`: no typed copy for these arguments.
-#[cfg(feature = "jit")]
+#[cfg(any(feature = "jit", feature = "wasm-jit"))]
 fn specialization(proto: &Rc<Proto>, regs: &[Value]) -> Option<Rc<Proto>> {
     let arg = |k: usize| {
         let v = &regs[proto.params.get(k)?.reg as usize];
@@ -2304,7 +2310,7 @@ fn specialization(proto: &Rc<Proto>, regs: &[Value]) -> Option<Rc<Proto>> {
 
 /// Copy of `proto` (parameters not annotated) typed by its arguments (`arg(k)`): simple
 /// values, strings, lists of simple values. `None` if one is of another type.
-#[cfg(feature = "jit")]
+#[cfg(any(feature = "jit", feature = "wasm-jit"))]
 fn untyped_spec<'a>(
     proto: &Rc<Proto>,
     arg: impl Fn(usize) -> Option<&'a Value>,
@@ -2350,7 +2356,7 @@ fn untyped_spec<'a>(
 
 /// The arguments in `regs` are exactly of the types of the parameters of typed copy
 /// `spec` (`int` for an `int`, a list of `int` for an `[int]`…).
-#[cfg(feature = "jit")]
+#[cfg(any(feature = "jit", feature = "wasm-jit"))]
 fn fits_params(spec: &Proto, regs: &[Value]) -> bool {
     fn fits(v: &Value, t: &RtType) -> bool {
         match (t, v) {
@@ -2371,7 +2377,7 @@ fn fits_params(spec: &Proto, regs: &[Value]) -> bool {
 /// Typed copy of method `m` of a generic class for `this` and its arguments: each type
 /// parameter found from the first field written `T` (the class's fields come first), or
 /// from a parameter. `None` if one is not a simple type.
-#[cfg(feature = "jit")]
+#[cfg(any(feature = "jit", feature = "wasm-jit"))]
 fn method_spec(m: &Rc<Proto>, this: &Value, args: &[Value]) -> Option<Rc<Proto>> {
     let Value::Object(o) = this else {
         return None;
@@ -2407,7 +2413,7 @@ fn method_spec(m: &Rc<Proto>, this: &Value, args: &[Value]) -> Option<Rc<Proto>>
 }
 
 /// `int` / `float` / `bool` of a value.
-#[cfg(feature = "jit")]
+#[cfg(any(feature = "jit", feature = "wasm-jit"))]
 fn simple_ty(v: &Value) -> Option<RtType> {
     match v {
         Value::Int(_) => Some(RtType::Int),

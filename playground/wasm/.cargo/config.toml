@@ -1,4 +1,10 @@
 # The stack Rust keeps in WebAssembly memory (its own data, not the browser's call stack,
 # see `MAX_CALL_DEPTH`): 4 MB instead of 1 MB, room for the interpreter's nested calls.
 [target.wasm32-unknown-unknown]
-rustflags = ["-C", "link-arg=-zstack-size=4194304"]
+# The function table exported and growable: the page appends the functions compiled from
+# scripts to it (`bk_compile`).
+rustflags = [
+  "-C", "link-arg=-zstack-size=4194304",
+  "-C", "link-arg=--export-table",
+  "-C", "link-arg=--growable-table",
+]

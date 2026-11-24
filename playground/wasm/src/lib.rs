@@ -6,6 +6,10 @@
 //! a JSON object, is read at `result_ptr()` for `result_len()` bytes. What the script
 //! prints goes to the imported `env.bk_output` as it happens.
 //!
+//! Typed functions are compiled to WebAssembly (`bokoni::wasm_jit`): the imported
+//! `env.bk_compile` instantiates each module and appends its functions to this module's
+//! table.
+//!
 //! ```json
 //! {"value": "[1, 2]" | null,
 //!  "diagnostics": [{"severity": "error", "kind": "type", "message": "…",
@@ -14,17 +18,23 @@
 //! Columns count UTF-16 units (as JavaScript strings do), from 1.
 
 use bokoni::{Engine, Error, ErrorKind};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt::Write;
 
 #[link(wasm_import_module = "env")]
 unsafe extern "C" {
     /// Text printed by the script (UTF-8).
     fn bk_output(ptr: *const u8, len: usize);
+    /// Instantiates the module (`len` bytes at `ptr`) against this module's memory and
+    /// table, appends its exports `f0`, `f1`… to the table; the index of `f0`, or -1.
+    fn bk_compile(ptr: *const u8, len: usize) -> i32;
 }
 
 thread_local! {
     static RESULT: RefCell<String> = const { RefCell::new(String::new()) };
+    static JIT: Cell<bool> = const { Cell::new(true) };
+    /// The engine of `run_again`, kept from one call to the next.
+    static KEPT: RefCell<Option<Engine>> = const { RefCell::new(None) };
 }
 
 /// Name of the script in messages.
@@ -76,6 +86,29 @@ pub unsafe extern "C" fn run(ptr: *const u8, len: usize) {
     let mut e = engine();
     // SAFETY: the imported function only reads the `len` bytes during the call.
     e.set_output(|s| unsafe { bk_output(s.as_ptr(), s.len()) });
+    eval(&mut e, src);
+}
+
+/// Runs the script in the engine of the previous call (its definitions kept), or a new
+/// one: for tests of what a later script changes (a function redefined).
+///
+/// # Safety
+/// `ptr` points to `len` bytes written by JavaScript.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn run_again(ptr: *const u8, len: usize) {
+    // SAFETY: see above.
+    let src = unsafe { source(ptr, len) };
+    let mut e = KEPT.with(|k| k.borrow_mut().take()).unwrap_or_else(|| {
+        let mut e = engine();
+        // SAFETY: the imported function only reads the `len` bytes during the call.
+        e.set_output(|s| unsafe { bk_output(s.as_ptr(), s.len()) });
+        e
+    });
+    eval(&mut e, src);
+    KEPT.with(|k| *k.borrow_mut() = Some(e));
+}
+
+fn eval(e: &mut Engine, src: &str) {
     let r = e.eval_named(src, FILE);
     let (value, mut errors) = match r {
         Ok(v) => (Some(e.inspect(&v)), Vec::new()),
@@ -112,9 +145,31 @@ unsafe fn source<'a>(ptr: *const u8, len: usize) -> &'a str {
 }
 
 fn engine() -> Engine {
+    bokoni::wasm_jit::set_compiler(Some(compile));
     let mut e = Engine::new();
     e.set_max_call_depth(MAX_CALL_DEPTH);
+    e.set_jit(JIT.with(Cell::get));
     e
+}
+
+fn compile(bytes: &[u8]) -> Option<u32> {
+    // SAFETY: the imported function only reads the bytes during the call.
+    let base = unsafe { bk_compile(bytes.as_ptr(), bytes.len()) };
+    u32::try_from(base).ok()
+}
+
+/// Typed functions compiled to WebAssembly (1, the default) or interpreted (0), from the
+/// next engine (`run_again` starts a new one).
+#[unsafe(no_mangle)]
+pub extern "C" fn set_jit(on: u32) {
+    JIT.with(|j| j.set(on != 0));
+    KEPT.with(|k| k.borrow_mut().take());
+}
+
+/// Number of functions compiled so far.
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_compiled() -> u32 {
+    bokoni::wasm_jit::compiled_functions()
 }
 
 /// Writes the JSON answer into `RESULT`.

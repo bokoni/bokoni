@@ -34,6 +34,8 @@ pub mod span;
 pub mod thin;
 pub mod value;
 pub mod vm;
+#[cfg(feature = "wasm-jit")]
+pub mod wasm_jit;
 
 pub use ast::Visibility;
 pub use diagnostic::{Error, ErrorKind, Errors};

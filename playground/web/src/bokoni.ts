@@ -1,5 +1,9 @@
 // The Bokoni interpreter compiled to WebAssembly (see `playground/wasm`): a thin wrapper
 // around its exports. Used by the worker, and by the tests under Bun.
+//
+// Its typed functions are compiled to WebAssembly modules as it runs (`bk_compile`): each
+// is instantiated against the interpreter's memory and function table, and its functions
+// appended to that table, where the interpreter calls them.
 
 export type Severity = "error" | "warning";
 
@@ -27,12 +31,16 @@ export interface Answer {
 
 interface Exports {
   memory: WebAssembly.Memory;
+  __indirect_function_table: WebAssembly.Table;
   alloc(len: number): number;
   dealloc(ptr: number, len: number): void;
   run(ptr: number, len: number): void;
+  run_again(ptr: number, len: number): void;
   check(ptr: number, len: number): void;
   result_ptr(): number;
   result_len(): number;
+  set_jit(on: number): void;
+  jit_compiled(): number;
 }
 
 const encoder = new TextEncoder();
@@ -56,6 +64,24 @@ export class Bokoni {
           const bytes = new Uint8Array(exports!.memory.buffer, ptr, len);
           onOutput(decoder.decode(bytes));
         },
+        bk_compile(ptr: number, len: number): number {
+          const x = exports!;
+          const bytes = new Uint8Array(x.memory.buffer, ptr, len).slice();
+          try {
+            const table = x.__indirect_function_table;
+            const m = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
+              env: { memory: x.memory, table },
+            });
+            const fs = Object.keys(m.exports).length;
+            const base = table.grow(fs);
+            for (let i = 0; i < fs; i++) table.set(base + i, m.exports[`f${i}`] as Function);
+            return base;
+          } catch (e) {
+            // (The function stays interpreted.)
+            console.warn("bokoni: compiling a function failed", e);
+            return -1;
+          }
+        },
       },
     });
     exports = instance.exports as unknown as Exports;
@@ -67,12 +93,30 @@ export class Bokoni {
     return this.call("run", src);
   }
 
+  /**
+   * Runs the script in the engine of the previous `runAgain` (its definitions kept), or
+   * a new one (tests).
+   */
+  runAgain(src: string): Answer {
+    return this.call("run_again", src);
+  }
+
+  /** Typed functions compiled to WebAssembly (the default), or all interpreted. */
+  setJit(on: boolean) {
+    this.x.set_jit(on ? 1 : 0);
+  }
+
+  /** Number of functions compiled to WebAssembly so far. */
+  get compiled(): number {
+    return this.x.jit_compiled();
+  }
+
   /** Static checks only: the script is compiled, not run. */
   check(src: string): Answer {
     return this.call("check", src);
   }
 
-  private call(f: "run" | "check", src: string): Answer {
+  private call(f: "run" | "run_again" | "check", src: string): Answer {
     const bytes = encoder.encode(src);
     const len = Math.max(bytes.length, 1);
     const ptr = this.x.alloc(len);

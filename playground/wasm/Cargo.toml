@@ -2,7 +2,7 @@
 name = "bokoni-playground"
 version = "0.1.0"
 edition = "2024"
-description = "Bokoni compiled to WebAssembly for the browser playground (interpreter only)"
+description = "Bokoni compiled to WebAssembly for the browser playground"
 publish = false
 
 [lib]
@@ -10,7 +10,8 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-bokoni = { path = "../..", default-features = false }
+# Typed functions compiled to WebAssembly modules, instantiated by the page (`bk_compile`).
+bokoni = { path = "../..", default-features = false, features = ["wasm-jit"] }
 
 [profile.release]
 opt-level = 3
