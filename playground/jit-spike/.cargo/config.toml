@@ -1,0 +1,4 @@
+# The function table exported and growable: the host adds the generated functions to it,
+# and Rust calls them through ordinary function pointers (indices in that table).
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--export-table", "-C", "link-arg=--growable-table"]

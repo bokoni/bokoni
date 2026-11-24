@@ -1,0 +1,11 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WebAssembly backend spike</title>
+<pre id="out"></pre>
+<script type="module">
+  import { spike } from "./host.js";
+  const out = document.getElementById("out");
+  const bytes = await (await fetch("target/wasm32-unknown-unknown/release/bokoni_jit_spike.wasm")).arrayBuffer();
+  const ok = await spike(bytes, (s) => (out.textContent += s + "\n"));
+  out.textContent += ok ? "ALL OK\n" : "FAILED\n";
+</script>

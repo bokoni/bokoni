@@ -1,7 +1,7 @@
 # How a script runs
 
 Three ways to turn a `.bk` file into work done by the processor. The first two exist
-today; the third is a possible backend, not started.
+today; the third is a possible backend, its mechanism checked (phase 0 below).
 
 | | Path | Who produces the machine code |
 |---|---|---|
@@ -38,7 +38,7 @@ wasmtime): a module's code is fixed when it is instantiated; it cannot make memo
 executable nor jump into bytes it has just written. Built without the JIT
 (`--no-default-features`), Bokoni runs there with the interpreter only.
 
-## 3. WebAssembly backend (possible, not started)
+## 3. WebAssembly backend (possible; phase 0 done)
 
 The way to get compiled code inside WebAssembly: Bokoni writes a small `.wasm` module for
 the script's functions (with [`wasm-encoder`](https://crates.io/crates/wasm-encoder),
@@ -61,3 +61,32 @@ The same two tiers as the JIT would apply:
 
 Worth it only for scripts that compute: a configuration evaluated in about a millisecond
 gains nothing over the interpreter.
+
+### Phase 0: done ([`playground/jit-spike/`](../playground/jit-spike/src/lib.rs))
+
+The mechanism the backend rests on works, under Bun (JavaScriptCore) and in Chrome (V8).
+Rust (built with `--export-table --growable-table`) writes a module with `wasm-encoder`.
+The host instantiates it against Rust's memory and function table and appends its
+functions to that table. Rust then calls them through ordinary `extern "C" fn` pointers,
+which on wasm32 are indices in that table. The generated code:
+
+- reads Rust's memory (a `Vec<i64>` summed);
+- calls back into Rust with `call_indirect` on a function pointer it is given;
+- returns a `#[repr(C)]` structure through the pointer the C ABI passes first, which is
+  how the JIT's `(status, result)` would come back.
+
+Speed of a recursive `fib`, without overflow checks:
+
+| | generated | rustc |
+|---|---:|---:|
+| Chrome, `fib(25)` | 0.20 ms | 0.20 ms |
+| Chrome, `fib(30)` | 1.2 ms | 1.0 ms |
+| Bun, `fib(25)` | 0.41 ms | 0.17 ms |
+| Bun, `fib(30)` | 2.0 ms | 1.5 ms |
+
+For comparison, the playground's interpreter takes about 40 ms for `fib(25)`.
+
+`cd playground/jit-spike && cargo build --release --target wasm32-unknown-unknown && bun
+host.js`; or serve the directory and open `index.html`. The module is compiled
+synchronously (`new WebAssembly.Module`), which a browser allows for small modules on the
+main thread and for any size in a worker, where the playground runs.

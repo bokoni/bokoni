@@ -1,0 +1,19 @@
+[package]
+name = "bokoni-jit-spike"
+version = "0.1.0"
+edition = "2024"
+description = "Phase 0 of a WebAssembly backend: code written with wasm-encoder, called from Rust"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+wasm-encoder = "0.262"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
