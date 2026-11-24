@@ -93,8 +93,11 @@ export function program(seed: number): string {
       body.push(`  end`);
     }
     body.push(`  ${expr(ret, 3)}`);
-    const sig = params.map((t, i) => `p${i}: ${t}`).join(", ");
-    out.push(`def ${name}(${sig}): ${ret}\n${body.join("\n")}\nend`);
+    // Annotations left out at times: the result inferred, a copy typed for the arguments.
+    const bare = r.next() < 0.2;
+    const sig = params.map((t, i) => (bare && i > 0 ? `p${i}` : `p${i}: ${t}`)).join(", ");
+    const result = r.next() < 0.35 ? "" : `: ${ret}`;
+    out.push(`def ${name}(${sig})${result}\n${body.join("\n")}\nend`);
     fns.push(self);
   }
   const last = fns[fns.length - 1]!;

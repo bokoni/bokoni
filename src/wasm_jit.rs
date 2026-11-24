@@ -7,10 +7,10 @@
 //! `f1`… to that table and returns the index of the first one. A function pointer being
 //! an index in that table, Rust then calls the code like the Cranelift JIT's.
 //!
-//! Phase 1: functions whose parameters and result are annotated `int`, `float` or `bool`
-//! (or a copy typed for its arguments) and whose body only computes with such values,
-//! compares, branches and calls such functions (recursion included). Any other function
-//! stays interpreted. Same rules as the interpreter: overflow, Euclidean division,
+//! Phase 1: functions whose parameters are `int`, `float` or `bool` (annotated, or a copy
+//! typed for its arguments), whose result is too (annotated, or inferred: `Infer`), and
+//! whose body only computes with such values, compares, branches and calls such functions
+//! (recursion included). Any other function stays interpreted. Same rules as the interpreter: overflow, Euclidean division,
 //! division by zero, call depth, with the same messages and the same call stack.
 //!
 //! - Each function has an internal function, `(ctx, params…) -> (status, result)`
@@ -202,8 +202,19 @@ fn val_of(t: T) -> ValType {
     }
 }
 
-/// Parameters and result of a function the generated code can run.
-fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
+/// Parameters and result of a function the generated code can run; its result inferred
+/// when not annotated (`Infer`).
+fn native_sig(p: &Proto, globals: &Globals, inf: &mut Infer) -> Option<(Vec<RegTy>, RegTy)> {
+    let params = native_sig_params(p)?;
+    let ret = match &p.ret {
+        Some(t) => prim(&t.ty)?,
+        None => inf.ret(p, globals)?,
+    };
+    Some((params, ret))
+}
+
+/// Parameters of a function the generated code can run.
+fn native_sig_params(p: &Proto) -> Option<Vec<RegTy>> {
     if p.kind != ProtoKind::Function
         || p.ncells != 0
         || !p.captures.is_empty()
@@ -212,8 +223,7 @@ fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
     {
         return None;
     }
-    let params = p
-        .params
+    p.params
         .iter()
         .map(|prm| {
             if prm.has_default {
@@ -221,9 +231,64 @@ fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
             }
             prim(&prm.ty.as_ref()?.ty)
         })
-        .collect::<Option<Vec<_>>>()?;
-    let ret = prim(&p.ret.as_ref()?.ty)?;
-    Some((params, ret))
+        .collect()
+}
+
+/// Results of functions without a result annotation, inferred: the type `R` (`int`, then
+/// `float`, then `bool`) such that, its calls (recursive ones included) assumed to return
+/// `R`, every `return` of the function returns exactly `R`. Then by induction on the
+/// depth of the calls, it does return `R` (or never returns).
+#[derive(Default)]
+struct Infer {
+    /// Results established (`None`: no native type).
+    known: FxHashMap<usize, Option<RegTy>>,
+    /// Assumptions being checked (function, type), innermost last.
+    assumed: Vec<(usize, RegTy)>,
+    /// Assumptions read (functions), for the inferences that depend on them.
+    read: Vec<usize>,
+}
+
+impl Infer {
+    fn ret(&mut self, p: &Proto, globals: &Globals) -> Option<RegTy> {
+        let key = p as *const Proto as usize;
+        if let Some(&(_, r)) = self.assumed.iter().find(|(k, _)| *k == key) {
+            self.read.push(key);
+            return Some(r);
+        }
+        if let Some(r) = self.known.get(&key) {
+            return *r;
+        }
+        let mut found = None;
+        let mark = self.read.len();
+        for r in [RegTy::Int, RegTy::Float, RegTy::Bool] {
+            self.assumed.push((key, r));
+            let ok = analyze(p, globals, self).is_some();
+            self.assumed.pop();
+            if ok {
+                found = Some(r);
+                break;
+            }
+        }
+        // Depends on an assumption still being checked (mutual recursion): not kept, the
+        // one that assumed it depends on it in turn.
+        let deps: Vec<usize> = self.read.drain(mark..).filter(|k| *k != key).collect();
+        if deps.is_empty() {
+            self.known.insert(key, found);
+        } else {
+            self.read.extend(deps);
+        }
+        found
+    }
+
+    /// The type assumed for `p`'s result, while checking it.
+    fn assumed(&self, p: &Proto) -> Option<RegTy> {
+        let key = p as *const Proto as usize;
+        self.assumed
+            .iter()
+            .rev()
+            .find(|(k, _)| *k == key)
+            .map(|(_, r)| *r)
+    }
 }
 
 /// The function in global slot `slot`, if it is one written in Bokoni.
@@ -265,9 +330,17 @@ struct Plan {
     /// Type written by each instruction of each block, if any.
     defs: Vec<Vec<Option<T>>>,
     /// Function called by each `Call` (key: block, instruction).
-    targets: FxHashMap<(usize, usize), Rc<Proto>>,
+    targets: FxHashMap<(usize, usize), Target>,
     /// Global slots read (the functions called).
     slots: Vec<u32>,
+}
+
+/// A function called, with its native signature.
+#[derive(Clone)]
+struct Target {
+    proto: Rc<Proto>,
+    params: Vec<RegTy>,
+    ret: RegTy,
 }
 
 /// Type written by `ins` (`Some(None)`: nothing), operands read from `cur`; `None`: not
@@ -275,9 +348,10 @@ struct Plan {
 fn transfer(
     p: &Proto,
     globals: &Globals,
+    inf: &mut Infer,
     ins: &Instr,
     cur: &[Lat],
-    target: &mut Option<Rc<Proto>>,
+    target: &mut Option<Target>,
     slots: &mut Vec<u32>,
 ) -> Option<Option<T>> {
     use Instr::*;
@@ -371,21 +445,31 @@ fn transfer(
                     .collect::<Option<Vec<_>>>()?;
                 callee = callee.specialize_params(&tys);
             }
-            let (params, ret) = native_sig(&callee)?;
+            let (params, ret) = native_sig(&callee, globals, inf)?;
             if params.len() != args.len()
                 || !params.iter().zip(&args).all(|(p, a)| fits(of(*p), *a))
             {
                 return None;
             }
-            *target = Some(callee);
+            *target = Some(Target {
+                proto: callee,
+                params,
+                ret,
+            });
             of(ret)
         }
         _ => return None,
     }))
 }
 
-fn analyze(p: &Proto, globals: &Globals) -> Option<Plan> {
-    let (params, ret) = native_sig(p)?;
+fn analyze(p: &Proto, globals: &Globals, inf: &mut Infer) -> Option<Plan> {
+    // While checking an assumed result: that one.
+    let (params, ret) = match inf.assumed(p) {
+        Some(r) => (native_sig_params(p)?, r),
+        None => native_sig(p, globals, inf)?,
+    };
+    // An inferred result is returned as is (an annotated `float` converts an `int`).
+    let exact = p.ret.is_none();
     // Typed IR registers: their type does not change.
     let fixed: Vec<Option<T>> = p
         .regs
@@ -414,7 +498,7 @@ fn analyze(p: &Proto, globals: &Globals) -> Option<Plan> {
             };
             for (k, ins) in b.instrs.iter().enumerate() {
                 let mut target = None;
-                let t = transfer(p, globals, ins, &cur, &mut target, &mut slots)?;
+                let t = transfer(p, globals, inf, ins, &cur, &mut target, &mut slots)?;
                 if let Some(q) = target {
                     targets.insert((bi, k), q);
                 }
@@ -443,7 +527,7 @@ fn analyze(p: &Proto, globals: &Globals) -> Option<Plan> {
                 Term::IfInt { a, b: y, .. } => g(*a) == Some(T::Int) && g(*y) == Some(T::Int),
                 Term::IfIntK { a, .. } => g(*a) == Some(T::Int),
                 Term::Return { reg, .. } => match (ret, g(*reg)) {
-                    (RegTy::Float, Some(T::Int)) => true,
+                    (RegTy::Float, Some(T::Int)) => !exact,
                     (_, t) => t == Some(of(ret)),
                 },
                 _ => false,
@@ -563,6 +647,7 @@ impl Jit {
         let mut order: Vec<Rc<Proto>> = Vec::new();
         let mut plans: FxHashMap<usize, Option<Plan>> = FxHashMap::default();
         let mut todo = vec![root.clone()];
+        let mut inf = Infer::default();
         while let Some(p) = todo.pop() {
             let key = Rc::as_ptr(&p) as usize;
             if plans.contains_key(&key) {
@@ -577,10 +662,10 @@ impl Jit {
             }
             let plan = match *p.jit.borrow() {
                 JitState::Rejected => None,
-                _ => analyze(&p, globals),
+                _ => analyze(&p, globals, &mut inf),
             };
             if let Some(plan) = &plan {
-                todo.extend(plan.targets.values().cloned());
+                todo.extend(plan.targets.values().map(|t| t.proto.clone()));
             }
             plans.insert(key, plan);
             order.push(p);
@@ -593,7 +678,7 @@ impl Jit {
                 let key = Rc::as_ptr(p) as usize;
                 let bad = plans[&key].as_ref().is_some_and(|plan| {
                     plan.targets.values().any(|q| {
-                        let k = Rc::as_ptr(q) as usize;
+                        let k = Rc::as_ptr(&q.proto) as usize;
                         !self.compiled.contains_key(&k) && !matches!(plans.get(&k), Some(Some(_)))
                     })
                 });
@@ -836,7 +921,7 @@ impl Jit {
                 match ins {
                     Instr::Call { dst, site, .. } => {
                         let q = &plan.targets[&(bi, k)];
-                        let (cparams, cret) = native_sig(q).unwrap();
+                        let (cparams, cret) = (&q.params, q.ret);
                         let depth_err = self.error_id(ErrKind::Depth, span, &p.script);
                         // Depth: as the interpreter, an error at the call beyond the limit.
                         x.local_get(0).i64_load(mem(DEPTH)).local_tee(s[0]);
@@ -853,12 +938,12 @@ impl Jit {
                             ctx.get(&mut x, r);
                             convert(&mut x, cur[r as usize].get().unwrap(), of(*pt));
                         }
-                        match callees[&(Rc::as_ptr(q) as usize)] {
+                        match callees[&(Rc::as_ptr(&q.proto) as usize)] {
                             Callee::Local(i) => {
                                 x.call(i);
                             }
                             Callee::Table(i) => {
-                                let ty = types.internal(&cparams, cret);
+                                let ty = types.internal(cparams, cret);
                                 x.i32_const(i as i32).call_indirect(0, ty);
                             }
                         }
@@ -870,7 +955,7 @@ impl Jit {
                         x.local_set(tmp).local_set(st);
                         x.local_get(0).local_get(s[0]).i64_store(mem(DEPTH));
                         self.traces.push(TraceInfo {
-                            name: q.name.clone(),
+                            name: q.proto.name.clone(),
                             span,
                         });
                         let tid = (self.traces.len() - 1) as i32;

@@ -67,9 +67,12 @@ gains nothing over the interpreter.
 ### Phase 1: typed functions ([`src/wasm_jit.rs`](../src/wasm_jit.rs))
 
 What the Cranelift JIT compiled in its first version (v0.4), the same way: a function
-whose parameters and result are annotated `int`, `float` or `bool` (or a copy typed for
-its arguments, for parameters without annotations), whose body only computes with such
-values, compares, branches, loops and calls such functions (recursion included). Any
+whose parameters and result are `int`, `float` or `bool`, whose body only computes with
+such values, compares, branches, loops and calls such functions (recursion included).
+Annotations may be left out: parameters without one get a copy typed for the arguments,
+and a result without one is inferred. For that, `int`, then `float`, then `bool` is
+assumed, recursive calls included, and kept if every `return` gives exactly that type
+(`def fib(n) = …` is compiled). Any
 other function stays interpreted, and so does a function calling one, since the generated
 code does not call the interpreter yet.
 
@@ -110,9 +113,9 @@ call stack): edge cases of arithmetic, every example of the playground, and rand
 programs of typed functions ([`generate.ts`](../playground/web/test/generate.ts); 400 in
 CI, `BK_GEN=3000 bun test` for more).
 
-Next: a result without annotation (inferred), calls into the interpreter from the
-generated code (for what it does not compile), then lists, strings and objects through
-the interpreter's helpers, and a structured control flow.
+Next: calls into the interpreter from the generated code (for what it does not
+compile), then lists, strings and objects through the interpreter's helpers, and a
+structured control flow.
 
 ### Phase 0: done ([`playground/jit-spike/`](../playground/jit-spike/src/lib.rs))
 

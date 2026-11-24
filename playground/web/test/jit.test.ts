@@ -94,8 +94,24 @@ def norm(a: float, b: float): float = sq(a) + sq(b)
     expect(same("def add(a, b): int = a + b\ndef f(n: int): int = add(n, 1) * 2\nf(20)")).toBe(2);
   });
 
-  test("a result without annotation: interpreted (phase 1)", () => {
-    expect(same("def add(a, b) = a + b\ndef f(n: int): int = add(n, 1) * 2\nf(20)")).toBe(0);
+  test("no annotation at all: inferred", () => {
+    expect(same("def add(a, b) = a + b\ndef f(n: int): int = add(n, 1) * 2\nf(20)")).toBe(2);
+    expect(same("def fib(n) = if n < 2 then n else fib(n - 1) + fib(n - 2) end\nfib(20)")).toBe(1);
+    // (One copy of each for `int` arguments.)
+    expect(same("def half(x) = x / 2.0\ndef f(n) = half(n) + half(n + 1)\n[f(3), f(4)]")).toBe(2);
+  });
+
+  test("mutual recursion without annotations", () => {
+    const src = "def even(n) = if n == 0 then true else odd(n - 1) end\n" +
+      "def odd(n) = if n == 0 then false else even(n - 1) end\n[even(10), odd(7)]";
+    expect(same(src)).toBeGreaterThanOrEqual(2);
+  });
+
+  test("results of different types: interpreted", () => {
+    // (An `int` and a `float`: no one native type, unlike `: float`, which converts.)
+    expect(same("def f(n) = if n > 0 then 1 else 2.5 end\n[f(1), f(-1)]")).toBe(0);
+    expect(same("def f(n): float = n * 2\n[f(1), f(-1)]")).toBe(1);
+    expect(same("def f(n) = if n > 0 then f(n - 1) else 0.5 end\nf(3)")).toBe(1);
   });
 
   test("more than sixteen arguments", () => {

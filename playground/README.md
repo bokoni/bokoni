@@ -41,8 +41,8 @@ Needs the `wasm32-unknown-unknown` Rust target (`rustup target add wasm32-unknow
 
 ## Limits
 
-- Only typed functions are compiled (`int`, `float`, `bool` parameters and result, and
-  what they call): `fib(25)` in 0.5 ms in Chrome, as fast as the desktop JIT. The rest
+- Only functions computing with `int`, `float` and `bool` are compiled (annotated or
+  not): `fib(25)` in 0.5 ms in Chrome, as fast as the desktop JIT. The rest
   (lists, strings, objects, closures) is interpreted: 5 to 60 times slower than the
   desktop JIT on hot loops.
 - 400 nested calls at most (`MAX_CALL_DEPTH` in `wasm/src/lib.rs`): each one takes room
