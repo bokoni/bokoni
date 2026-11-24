@@ -49,7 +49,9 @@ Fully typed functions are compiled to native code (Cranelift JIT) on their first
 (`def max(a: T, b: T): T forall T`) is compiled once per type it is called with, and
 methods, lists and strings are compiled too; where an assumption of the native code does
 not hold, the interpreter takes over at that point.
-Everything else is interpreted, with exactly the same result.
+Untyped functions get lighter native code that calls the interpreter for anything beyond
+simple arithmetic (about twice as fast), with exactly the same result. Inside WebAssembly
+there is no JIT, only the interpreter ([docs/execution.md](docs/execution.md)).
 
 Macros, as in Crystal, generate code at parse time:
 
@@ -143,6 +145,8 @@ cargo run -- --no-jit script.bk   # without native compilation
 ## Documentation
 
 - [docs/syntax.md](docs/syntax.md) — the syntax (specification)
+- [docs/execution.md](docs/execution.md) — how a script runs: interpreter, Cranelift JIT,
+  a possible WebAssembly backend
 - [docs/roadmap.md](docs/roadmap.md) — roadmap to the JIT, progress, performance
 
 ## Development
