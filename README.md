@@ -149,7 +149,9 @@ cargo run -- --no-jit script.bk   # without native compilation
 
 - [docs/syntax.md](docs/syntax.md) — the syntax (specification)
 - [docs/execution.md](docs/execution.md) — how a script runs: interpreter, Cranelift JIT,
-  a possible WebAssembly backend
+  WebAssembly backend
+- [hosts/wasmtime](hosts/wasmtime/README.md) — Bokoni compiled to WebAssembly in a native
+  host's sandbox (fuel, memory limit)
 - [docs/roadmap.md](docs/roadmap.md) — roadmap to the JIT, progress, performance
 
 ## Development

@@ -2,3 +2,4 @@ piss/
 /target
 /playground/wasm/target
 /playground/jit-spike/target
+/hosts/wasmtime/target

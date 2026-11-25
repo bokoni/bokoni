@@ -1,0 +1,10 @@
+[package]
+name = "bokoni-wasmtime"
+version = "0.1.0"
+edition = "2024"
+description = "Bokoni compiled to WebAssembly, run by wasmtime: a sandbox with fuel and a memory limit, whose functions compile to WebAssembly too"
+publish = false
+
+[dependencies]
+# The version of the platform's kernel.
+wasmtime = "48.0.1"

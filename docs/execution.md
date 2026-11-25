@@ -56,9 +56,12 @@ the code through a function pointer, which in WebAssembly is an index in that ta
   [`playground/web/src/bokoni.ts`](../playground/web/src/bokoni.ts); the crate is built
   with `-C link-arg=--export-table -C link-arg=--growable-table`. Without a compiler (or
   outside WebAssembly), everything is interpreted.
-- In a wasmtime host, the compiler would be an import of the same kind; the host
-  instantiates the module under the same fuel and memory limits. Components do not share
-  memory, so the host links the generated module at the level of core modules.
+- In a wasmtime host ([`hosts/wasmtime`](../hosts/wasmtime/README.md)), the same import:
+  the host instantiates each module in the same store, under the same fuel and memory
+  limits; components do not share memory, so it links core modules. Each module is
+  compiled by wasmtime's Cranelift (about 0.6 ms for a small one): `fib(25)` goes from
+  39 ms to 1.7 ms, but a configuration evaluated in 0.1 ms takes 2 ms compiled, so such
+  scripts run interpreted there.
 - The VM sees it as it sees the Cranelift JIT (`Jit::compile`, `Jit::call`,
   `Jit::compile_dynamic`, `JitState::Native`), so the same paths call it.
 
