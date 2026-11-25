@@ -7,7 +7,7 @@ itself running in WebAssembly (the browser playground), where the second cannot.
 |---|---|---|
 | **1. Interpreter** | `.bk` → IR → run instruction by instruction by the interpreter | nobody, for the script: only the interpreter (Rust) is compiled |
 | **2. Cranelift JIT** | `.bk` → IR → Cranelift → machine code | Bokoni itself, in its own process |
-| **3. WebAssembly backend** | `.bk` → IR → `.wasm` bytes (`wasm-encoder`) → instantiated by the host | the host: the browser's engine (V8, SpiderMonkey) or wasmtime |
+| **3. WebAssembly backend** | `.bk` → IR → Cranelift's IR → `.wasm` bytes (`wasm-encoder`) → instantiated by the host | the host: the browser's engine (V8, SpiderMonkey) or wasmtime |
 
 ## 1. Interpreter
 
@@ -24,7 +24,11 @@ Bokoni writes machine code into memory and jumps to it. Two tiers:
 - **Typed code**: a function whose parameters and return are annotated (`int`, `float`,
   `bool`, a `type`, a list of them…) is compiled on its first call into straight native
   code: values in machine registers, fields read at their offset. 14 to 54 times faster
-  than the interpreter (`fib(25)`: 0.5 ms).
+  than the interpreter (`fib(25)`: 0.5 ms). Parameters without annotation get a copy
+  typed for the arguments; a result without one is guessed (`guess_ret`: the type every
+  `return` gives, the calls assumed to return their own guess), `def fib(n) = …`
+  included. A wrong guess costs a resumption, as a typed copy returning another type
+  does (status 2).
 - **Baseline code**: any other function, compiled on its second call (or its first if it
   loops). Registers stay `Value`s in memory; native code does the simple cases
   (constants, copies, arithmetic, comparisons, branches) and calls the interpreter's own
@@ -42,12 +46,15 @@ WebAssembly backend if its host compiles modules for it (section 3).
 
 ## 3. WebAssembly backend (`wasm-jit` feature)
 
-The way to get compiled code inside WebAssembly ([`src/wasm_jit.rs`](../src/wasm_jit.rs)):
-Bokoni writes a small `.wasm` module for a function (with
-[`wasm-encoder`](https://crates.io/crates/wasm-encoder), which only writes the binary
-format) and hands its bytes to the host, which compiles it to machine code like any
-other module and links it to the program's memory and function table. Rust then calls
-the code through a function pointer, which in WebAssembly is an index in that table.
+The Cranelift JIT itself, inside WebAssembly ([`src/wasm_jit.rs`](../src/wasm_jit.rs)).
+The JIT builds its functions in Cranelift's IR (CLIF), as natively, both tiers with
+everything they do (typed code on lists, strings and objects, its resumptions in the
+interpreter, baseline code); only the last step differs. In place of Cranelift's machine
+code backend (`cranelift_jit::JITModule`), `WasmModule` translates each function from
+CLIF into WebAssembly (`wasm-encoder`, which only writes the binary format) and hands the
+module to the host, which compiles it to machine code and links it to the program's
+memory and function table. Rust calls the code through a function pointer, which in
+WebAssembly is an index in that table.
 
 - The embedder gives a compiler (`bokoni::wasm_jit::set_compiler`): a function that
   instantiates a module's bytes against the program's memory (`env.memory`) and function
@@ -58,79 +65,69 @@ the code through a function pointer, which in WebAssembly is an index in that ta
   outside WebAssembly), everything is interpreted.
 - In a wasmtime host ([`hosts/wasmtime`](../hosts/wasmtime/README.md)), the same import:
   the host instantiates each module in the same store, under the same fuel and memory
-  limits; components do not share memory, so it links core modules. Each module is
-  compiled by wasmtime's Cranelift (about 0.6 ms for a small one): `fib(25)` goes from
-  39 ms to 1.7 ms, but a configuration evaluated in 0.1 ms takes 2 ms compiled, so such
-  scripts run interpreted there.
-- The VM sees it as it sees the Cranelift JIT (`Jit::compile`, `Jit::call`,
-  `Jit::compile_dynamic`, `JitState::Native`), so the same paths call it.
+  limits; components do not share memory, so it links core modules. Compiling a function
+  costs a few million units of fuel and about a millisecond: `fib(25)` goes from 42 ms to
+  2.9 ms, but a configuration evaluated in 0.1 ms takes 4 ms compiled, so such scripts
+  run interpreted there.
 
-The same two tiers as the Cranelift JIT:
+The translation:
 
-- **Typed code.** A function whose parameters and result are `int`, `float` or `bool`,
-  whose body only computes with such values, compares, branches, loops and calls such
-  functions (recursion included), as the Cranelift JIT compiled in its first version
-  (v0.4). Annotations may be left out: parameters without one get a copy typed for the
-  arguments, and a result without one is inferred. For that, `int`, then `float`, then
-  `bool` is assumed, recursive calls included, and kept if every `return` gives exactly
-  that type (`def fib(n) = …` is compiled). The values live in WebAssembly locals. The
-  functions compiled together call each other directly, one compiled earlier through the
-  table; each has an internal function `(ctx, params…) -> (status, result)` and an entry
-  point for Rust with the Cranelift JIT's C signature. The interpreter's rules: overflow
-  of `+`, `-`, `*` and negation, Euclidean `/` and `%`, division by zero,
-  `i64::MIN / -1`, the call depth, the same messages and call stack. Redefining a global
-  function invalidates the code calling it, directly or through other compiled
-  functions.
-- **Baseline code.** Any other function without `rescue` / `ensure`, as the Cranelift
-  JIT's, with the same helpers ([`src/baseline.rs`](../src/baseline.rs)): its registers
-  stay `Value`s in the call's window, the code does the simple cases itself (constants,
-  copies of scalar values, arithmetic and comparisons of two integers or two floats,
-  branches) and calls the interpreter's code for everything else, lists, strings,
-  objects, closures and calls included; the semantics are the same by construction.
-
-**Control flow**, for both: structured, as a compiler from a structured language would
-write it, from the IR's blocks (N. Ramsey, "Beyond Relooper", 2022): a `loop` for each
-loop header, a `block` before each block reached by several forward edges, the others
-written inline where they are branched to; along the dominator tree, in reverse
-postorder. A graph that is not reducible (none from Bokoni's code: checked on every
-program of the tests) gets a loop over a `br_table` on the block number instead.
+- CLIF values become WebAssembly locals (an `i8` in an `i32`, its low byte); a block's
+  parameters are locals assigned on the edges into it. The JIT handles addresses as `i64`
+  (as on a 64-bit machine), 32 bits in WebAssembly's memory: converted at each memory
+  access, and at each call of a Rust helper, whose WebAssembly parameters come from its
+  Rust type (`sig_of`). The JIT reads and writes addresses in memory at their real width
+  (`Addresses`).
+- Stack slots live in an area of the program's memory used as a stack, a function's
+  frame taken there on its first use (a typed function's slots mostly serve its
+  resumptions, rarely taken). Values nothing uses are not computed, stores into slots
+  nothing reads not made.
+- Control flow is structured, as a compiler from a structured language would write it
+  (N. Ramsey, "Beyond Relooper", 2022): a `loop` for each loop header, a `block` before
+  each block reached by several forward edges, the others written inline where they are
+  branched to, along the dominator tree, in reverse postorder. A graph that is not
+  reducible (none from Bokoni's code) gets a loop over a `br_table` instead.
+- Each function has an adapter for Rust (its addresses as `i32`).
+- An instruction the translation does not know leaves the function interpreted (none in
+  the tests).
 
 Measured in Chrome (V8), the interpreter against the compiled code of the playground
-(the best of three runs):
+(the best of three runs, compilation included):
 
 | Program | Interpreter | Compiled |
 |---|---:|---:|
-| recursive `fib(25)` | 26.5 ms | 0.3 ms |
-| recursive `fib(30)` | 295 ms | 2.8 ms |
-| the same, without annotations | 315 ms | 2.8 ms |
-| `float`: harmonic series, 1 M iterations | 25.3 ms | 0.8 ms |
-| sum of a list of 200,000 `int`, twice (baseline) | 14.5 ms | 6.4 ms |
-| `map` / `filter` over 100,000 elements | 14.1 ms | 10.8 ms |
-| `type` objects created and read, 100,000 | 14.3 ms | 9.1 ms |
-| string interpolation, 100,000 | 5.6 ms | 4.1 ms |
-| a closure called 300,000 times | 26.0 ms | 15.8 ms |
+| recursive `fib(25)` | 27.1 ms | 1.3 ms |
+| recursive `fib(30)` | 301 ms | 4.4 ms |
+| the same, without annotations | 314 ms | 4.7 ms |
+| `float`: harmonic series, 1 M iterations | 27.8 ms | 0.9 ms |
+| sum of a list of 200,000 `int`, twice | 13.7 ms | 2.6 ms |
+| `type` objects created and read, 100,000 | 14.8 ms | 4.9 ms |
+| dot product of two `type` objects, 1 M | 230 ms | 28 ms |
+| `map` / `filter` over 100,000 elements | 14.3 ms | 11.4 ms |
+| string interpolation, 100,000 | 5.7 ms | 5.0 ms |
+| a closure called 300,000 times | 29.3 ms | 30.2 ms |
 
-The natively compiled Cranelift JIT takes 0.5 ms for `fib(25)`.
+The closure gains nothing natively either (21 ms → 19 ms): a call of a closure value goes
+through the interpreter.
 
 Tested under Bun ([`playground/web/test/`](../playground/web/test)), each program run
-interpreted, compiled as usual, and with every function compiled from its first call
-(baseline code for the untyped ones), the answers compared (value, errors, positions,
-call stack, what it printed):
+interpreted, compiled as usual, and with every function compiled from its first call,
+the answers compared (value, errors, positions, call stack, what it printed):
 
 - `jit.test.ts`: edge cases of arithmetic, redefinitions, every example of the
   playground, and random programs of typed functions, annotations left out at times
-  ([`generate.ts`](../playground/web/test/generate.ts); 400 in CI, `BK_GEN=3000 bun
+  ([`generate.ts`](../playground/web/test/generate.ts); 400 in CI, `BK_GEN=10000 bun
   test` for more);
 - `corpus.test.ts`: every Bokoni program of the Rust tests (the string literals of
   `tests/*.rs`) and of [`syntax.md`](syntax.md), nearly 900, also with the dispatch loop
-  instead of structured control flow.
+  instead of structured control flow; none left untranslated.
 
-Not done: the typed tier stops at `int`, `float` and `bool`. The Cranelift JIT's typed
-code also reads lists, strings and objects natively and resumes in the interpreter when
-an assumption fails (`DeoptSite`); here such functions run as baseline code (1.3 to 2.3
-times faster than the interpreter rather than 5 to 50).
+Running the JIT in WebAssembly found two bugs of the native one, fixed for both: a call
+the analysis left to the interpreter (an argument of any type) was still inlined, which
+made Cranelift panic; redefining a function did not reach the callers of its callers
+(their code kept calling the old one).
 
-### Phase 0: done ([`playground/jit-spike/`](../playground/jit-spike/src/lib.rs))
+### Phase 0 ([`playground/jit-spike/`](../playground/jit-spike/src/lib.rs))
 
 The mechanism the backend rests on works, under Bun (JavaScriptCore) and in Chrome (V8).
 Rust (built with `--export-table --growable-table`) writes a module with `wasm-encoder`.

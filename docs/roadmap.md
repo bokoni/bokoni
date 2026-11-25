@@ -468,14 +468,16 @@ namespaces, `trait` for shared behavior.
       types, runs in a worker (stop, 10 s limit), examples, links with the code;
       400 nested calls at most (the browser's stack, about 1 MB in a Chrome worker)
 - [x] WebAssembly backend (`wasm-jit` feature, `src/wasm_jit.rs`): inside WebAssembly,
-      typed functions (`int` / `float` / `bool`) written as WebAssembly modules with
-      `wasm-encoder`, instantiated by the host against the program's memory and function
-      table, called through function pointers; used by the playground (`fib(25)`: 26.6 ms
-      → 0.3 ms in Chrome); results without annotation inferred; baseline code for the
-      other functions (`src/baseline.rs`, the helpers shared with Cranelift's); structured
-      control flow ("Beyond Relooper"). Same answers as the interpreter: edge cases,
-      examples, random programs, the programs of the Rust tests
-      (`playground/web/test/`)
+      the Cranelift JIT itself, both tiers, its functions translated from Cranelift's IR
+      into WebAssembly modules (`wasm-encoder`) the host instantiates against the
+      program's memory and function table, called through function pointers; structured
+      control flow ("Beyond Relooper"); used by the playground (`fib(25)`: 27 ms → 1.3 ms
+      in Chrome, a dot product of objects 230 ms → 28 ms) and by a wasmtime host
+      (`hosts/wasmtime`). Same answers as the interpreter: edge cases, examples, random
+      programs, the ~900 programs of the Rust tests (`playground/web/test/`)
+- [x] Typed JIT: a result without annotation guessed (`def fib(n)`: 4.9 ms → 1.1 ms
+      natively for `fib(27)`); fixed: a call left to the interpreter was still inlined
+      (a panic), a redefinition did not reach the callers of callers
 
 ## Decisions that commit the JIT
 

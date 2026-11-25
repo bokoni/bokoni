@@ -728,6 +728,7 @@ impl Compiler<'_> {
             nslots: f.nslots,
             jit: Default::default(),
             jit_dyn: Default::default(),
+            ret_guess: Default::default(),
             calls_seen: Default::default(),
             has_loop,
             plain_params,

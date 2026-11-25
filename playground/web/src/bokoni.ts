@@ -43,6 +43,7 @@ interface Exports {
   jit_compiled(): number;
   jit_baseline(): number;
   jit_dispatched(): number;
+  jit_untranslated(): number;
 }
 
 const encoder = new TextEncoder();
@@ -119,6 +120,11 @@ export class Bokoni {
   /** Number of other functions compiled to WebAssembly (baseline code) so far. */
   get baseline(): number {
     return this.x.jit_baseline();
+  }
+
+  /** Number of functions that could not be translated to WebAssembly. */
+  get untranslated(): number {
+    return this.x.jit_untranslated();
   }
 
   /** Number of compiled functions whose control flow could not be structured. */

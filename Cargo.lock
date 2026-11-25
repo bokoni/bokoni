@@ -54,6 +54,7 @@ dependencies = [
  "serde",
  "serde_json",
  "stacker",
+ "target-lexicon",
  "wasm-encoder",
 ]
 

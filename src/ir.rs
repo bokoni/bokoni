@@ -79,6 +79,9 @@ pub struct Proto {
     /// Baseline native compilation (untyped code): 0 = not yet, 1 = impossible,
     /// otherwise the address of the entry point `extern "C" fn(*mut Runtime, *mut NativeFrame) -> i32`.
     pub jit_dyn: std::cell::Cell<usize>,
+    /// Result without annotation: the native type guessed for it (`jit::guess_ret`;
+    /// `Some(Value)`: none, or being guessed).
+    pub ret_guess: std::cell::Cell<Option<RegTy>>,
     /// Number of calls (baseline compilation waits for the second, unless there is a loop).
     pub calls_seen: std::cell::Cell<u32>,
     /// The function contains a loop (a jump to an earlier block).
@@ -764,6 +767,7 @@ impl Proto {
             vis: self.vis,
             jit: Default::default(),
             jit_dyn: Default::default(),
+            ret_guess: Default::default(),
             calls_seen: Default::default(),
             has_loop: self.has_loop,
             plain_params: self.plain_params,

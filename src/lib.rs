@@ -20,7 +20,7 @@ pub mod gc;
 pub mod globals;
 pub mod intern;
 pub mod ir;
-#[cfg(feature = "jit")]
+#[cfg(any(feature = "jit", feature = "wasm-jit"))]
 pub mod jit;
 pub mod lexer;
 pub mod macros;

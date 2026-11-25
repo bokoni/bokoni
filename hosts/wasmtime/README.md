@@ -34,11 +34,12 @@ Measured on hulk (x86_64), a new store per run, the module itself compiled once 
 
 | Script | Interpreted | Compiled |
 |---|---:|---:|
-| recursive `fib(25)`, typed | 39 ms, 553 M fuel | 1.7 ms, 17 M fuel |
-| 100,000 `type` objects created and read | 20 ms, 366 M fuel | 13.5 ms, 224 M fuel |
-| a configuration: records, helpers, a list | 0.10 ms, 0.57 M fuel | 2.0 ms, 0.69 M fuel |
+| recursive `fib(25)`, typed | 42 ms, 575 M fuel | 2.9 ms, 32 M fuel |
+| 100,000 `type` objects created and read | 20.5 ms, 374 M fuel | 8.9 ms, 139 M fuel |
+| a configuration: records, helpers, a list | 0.11 ms, 0.57 M fuel | 4.3 ms, 11 M fuel |
 
-Each function compiled is a module wasmtime compiles with Cranelift (about 0.6 ms for a
-small one): for a script evaluated in a fraction of a millisecond, such as a pipeline's
-configuration, that is twenty times its run. Such scripts run interpreted (`jit: 0`);
-compiling pays for scripts that compute.
+Compiling a function costs a few million units of fuel (the JIT builds its code and
+translates it to WebAssembly inside the module) and a module wasmtime compiles with
+Cranelift (about a millisecond): for a script evaluated in a fraction of a millisecond,
+such as a pipeline's configuration, that is forty times its run. Such scripts run
+interpreted (`jit: 0`); compiling pays for scripts that compute.

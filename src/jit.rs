@@ -76,11 +76,22 @@ use cranelift_codegen::ir::{
     AbiParam, InstBuilder, MemFlagsData, Signature, Type, UserFuncName, types,
 };
 use cranelift_codegen::ir::{Block as CBlock, FuncRef, Value as CValue};
+#[cfg(feature = "jit")]
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
+#[cfg(feature = "jit")]
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
+use cranelift_module::{FuncId, Linkage};
+#[cfg(feature = "jit")]
+use cranelift_module::{Module, default_libcall_names};
 use std::rc::Rc;
+
+/// Where the functions built go: Cranelift's machine code, or, for Bokoni running in
+/// WebAssembly, WebAssembly modules (`crate::wasm_jit`).
+#[cfg(feature = "jit")]
+type ClifModule = JITModule;
+#[cfg(not(feature = "jit"))]
+type ClifModule = crate::wasm_jit::WasmModule;
 
 /// Context shared with native code. The first four fields are read and written by the
 /// generated code (fixed offsets); the others are used by Rust code only.
@@ -117,9 +128,44 @@ const PENDING: i64 = -2;
 const DEPTH_OFFSET: i32 = 0;
 const MAX_DEPTH_OFFSET: i32 = 8;
 const ERR_OFFSET: i32 = 16;
-const ENV_OFFSET: i32 = 24;
-const CELLS_OFFSET: i32 = 32;
-const CAUGHT_OFFSET: i32 = 40;
+const ENV_OFFSET: i32 = std::mem::offset_of!(JitCtx, env) as i32;
+const CELLS_OFFSET: i32 = std::mem::offset_of!(JitCtx, cells) as i32;
+const CAUGHT_OFFSET: i32 = std::mem::offset_of!(JitCtx, caught) as i32;
+
+/// Bytes of an address in memory: 8, or 4 in WebAssembly, where native code still
+/// handles addresses as `i64` (`crate::wasm_jit`).
+const PTR_BYTES: i32 = std::mem::size_of::<usize>() as i32;
+
+/// Addresses in memory, as the `i64` native code handles.
+trait Addresses {
+    /// An address read from memory.
+    fn load_addr(&mut self, at: CValue, off: i32) -> CValue;
+    /// An address written into memory.
+    fn store_addr(&mut self, v: CValue, at: CValue, off: i32);
+}
+
+impl Addresses for FunctionBuilder<'_> {
+    fn load_addr(&mut self, at: CValue, off: i32) -> CValue {
+        if PTR_BYTES == 8 {
+            self.ins()
+                .load(types::I64, MemFlagsData::trusted(), at, off)
+        } else {
+            let v = self
+                .ins()
+                .load(types::I32, MemFlagsData::trusted(), at, off);
+            self.ins().uextend(types::I64, v)
+        }
+    }
+
+    fn store_addr(&mut self, v: CValue, at: CValue, off: i32) {
+        let v = if PTR_BYTES == 8 {
+            v
+        } else {
+            self.ins().ireduce(types::I32, v)
+        };
+        self.ins().store(MemFlagsData::trusted(), v, at, off);
+    }
+}
 
 #[derive(Clone, Copy)]
 enum ErrKind {
@@ -1648,10 +1694,14 @@ struct Compiled {
     id: FuncId,
     params: Vec<RegTy>,
     ret: RegTy,
+    /// Global slots its code depends on (functions called directly, types constructed).
+    slots: Vec<u32>,
+    /// Functions it calls (keys of `Jit::compiled`): their code, and what it depends on.
+    calls: Vec<usize>,
 }
 
 pub struct Jit {
-    module: JITModule,
+    module: ClifModule,
     /// `Option<Value>` has the layout of a `Value` (`None` has a tag of a value that owns
     /// something): native code reads and writes globals of simple types in place.
     inline_globals: bool,
@@ -1783,7 +1833,63 @@ fn native_ty(rt: &RtType) -> Option<RegTy> {
 fn ret_jty(anns: &mut Vec<RtType>, q: &Proto) -> JTy {
     match &q.ret {
         Some(t) => value_jty(anns, &t.ty),
-        None => JTy::Boxed,
+        None => guessed(q).map_or(JTy::Boxed, jty),
+    }
+}
+
+/// The type guessed for the result of `p` (not annotated), if any.
+fn guessed(p: &Proto) -> Option<RegTy> {
+    p.ret_guess.get().filter(|t| *t != RegTy::Value)
+}
+
+/// Guesses the result of `p`, if not annotated: the type every `return` of its typed code
+/// gives (`int`, `float` or `bool`), its calls assumed to return their guess (`p` itself,
+/// while being guessed, any value). Its typed code then returns that type, as a typed copy
+/// does (`def fib(n) = …`: no value boxed at each call). A wrong guess costs nothing more
+/// than a resumption: the function returns its value with status 2 (`bk_resume`).
+fn guess_ret(p: &Proto, globals: &Globals, len: crate::intern::Symbol) {
+    if p.ret.is_some()
+        || p.ret_guess.get().is_some()
+        || !matches!(p.kind, ProtoKind::Function | ProtoKind::Lambda)
+    {
+        return;
+    }
+    p.ret_guess.set(Some(RegTy::Value));
+    let Some(plan) = analyze(p, None, globals, len, Vec::new()) else {
+        return;
+    };
+    let mut guess = None;
+    for (bi, b) in p.blocks.iter().enumerate() {
+        let Term::Return { reg, .. } = &b.term else {
+            continue;
+        };
+        // The register's type at the `return`.
+        let mut cur = plan.entry[bi].clone();
+        for (k, ins) in b.instrs.iter().enumerate() {
+            if let (Some((_, Some(d))), Some(t)) = (reads_writes(p, ins), plan.defs[bi][k]) {
+                cur[d as usize] = Lat::T(t);
+                for w in extra_writes(ins) {
+                    cur[w as usize] = Lat::T(t);
+                }
+            }
+        }
+        let t = match cur[*reg as usize] {
+            // (A block never reached.)
+            Lat::Undef => continue,
+            Lat::T(t @ (JTy::Int | JTy::Float | JTy::Bool)) => t,
+            _ => return,
+        };
+        if guess.is_some_and(|g| g != t) {
+            return;
+        }
+        guess = Some(t);
+    }
+    if let Some(t) = guess {
+        p.ret_guess.set(Some(match t {
+            JTy::Int => RegTy::Int,
+            JTy::Float => RegTy::Float,
+            _ => RegTy::Bool,
+        }));
     }
 }
 
@@ -1815,10 +1921,10 @@ fn native_sig(p: &Proto) -> Option<(Vec<RegTy>, RegTy)> {
             native_ty(t)?
         });
     }
-    // Not annotated: any value (in the caller's slot).
+    // Not annotated: the type guessed (`guess_ret`), or any value (in the caller's slot).
     let ret = match &p.ret {
         Some(t) => native_ty(&t.ty)?,
-        None => RegTy::Value,
+        None => guessed(p).unwrap_or(RegTy::Value),
     };
     Some((params, ret))
 }
@@ -2746,6 +2852,8 @@ impl Analysis<'_> {
                             let tys = callee.type_args(&arg)?;
                             callee = callee.specialize(&tys);
                         }
+                        // (Its result guessed before its signature is read.)
+                        guess_ret(&callee, self.globals, self.len);
                         let (cparams, _) = native_sig(&callee)?;
                         if site.block
                             || !site.named.is_empty()
@@ -2972,7 +3080,8 @@ fn analyze(
                 Term::Return { reg, .. } => match ret {
                     // Any value (read from a cell…) for a simple result: its tag checked.
                     RegTy::Int | RegTy::Float | RegTy::Bool if g(*reg) == Some(JTy::Boxed) => true,
-                    RegTy::Float => num(*reg),
+                    // (An annotated `float` converts an `int`; a guessed one is exact.)
+                    RegTy::Float if p.ret.is_some() => num(*reg),
                     // Not annotated: any value (boxed when returned).
                     _ if ret_jty == JTy::Boxed => matches!(
                         g(*reg),
@@ -3162,69 +3271,114 @@ fn float_cc(op: BinOp) -> FloatCC {
     }
 }
 
-impl Jit {
-    /// `None` if the machine is not supported by Cranelift.
-    pub fn new() -> Option<Self> {
-        let mut flags = settings::builder();
-        flags.set("use_colocated_libcalls", "false").ok()?;
-        flags.set("is_pic", "false").ok()?;
-        flags.set("opt_level", "speed").ok()?;
-        let isa = cranelift_native::builder()
-            .ok()?
-            .finish(settings::Flags::new(flags))
-            .ok()?;
-        let mut builder = JITBuilder::with_isa(isa, default_libcall_names());
-        builder.symbol("bk_trace", bk_trace as *const u8);
-        builder.symbol("bk_frem", bk_frem as *const u8);
-        builder.symbol("bk_field_native", bk_field_native as *const u8);
-        builder.symbol("bk_obj_fields", bk_obj_fields as *const u8);
-        builder.symbol("bk_this_fields", bk_this_fields as *const u8);
-        builder.symbol("bk_method_is", bk_method_is as *const u8);
-        builder.symbol("bk_resume", bk_resume as *const u8);
-        builder.symbol("bk_list_push", bk_list_push as *const u8);
-        builder.symbol("bk_fields_cached", bk_fields_cached as *const u8);
-        builder.symbol("bk_str_add", bk_str_add as *const u8);
-        builder.symbol("bk_call_boxed", bk_call_boxed as *const u8);
-        builder.symbol("bk_binary", bk_binary as *const u8);
-        builder.symbol("bk_truthy", bk_truthy as *const u8);
-        builder.symbol("bk_global", bk_global as *const u8);
-        builder.symbol("bk_global_word", bk_global_word as *const u8);
-        builder.symbol("bk_obj_is", bk_obj_is as *const u8);
-        builder.symbol("bk_up_get", bk_up_get as *const u8);
-        builder.symbol("bk_up_word", bk_up_word as *const u8);
-        builder.symbol("bk_assign_up", bk_assign_up as *const u8);
-        builder.symbol("bk_global_env", bk_global_env as *const u8);
-        builder.symbol("bk_cells_init", bk_cells_init as *const u8);
-        builder.symbol("bk_cells_drop", bk_cells_drop as *const u8);
-        builder.symbol("bk_cell_new", bk_cell_new as *const u8);
-        builder.symbol("bk_closure", bk_closure as *const u8);
-        builder.symbol("bk_step_boxed", bk_step_boxed as *const u8);
-        builder.symbol("bk_iter_step", bk_iter_step as *const u8);
-        builder.symbol("bk_catch", bk_catch as *const u8);
-        builder.symbol("bk_is_type", bk_is_type as *const u8);
-        builder.symbol("bk_reraise", bk_reraise as *const u8);
-        builder.symbol("bk_caught_drop", bk_caught_drop as *const u8);
-        builder.symbol("bk_assign_global", bk_assign_global as *const u8);
-        builder.symbol("bk_box_into", bk_box_into as *const u8);
-        builder.symbol("bk_new_object", bk_new_object as *const u8);
-        builder.symbol("bk_init_done", bk_init_done as *const u8);
-        builder.symbol("bk_str_cmp", bk_str_cmp as *const u8);
-        builder.symbol("bk_str_len", bk_str_len as *const u8);
-        builder.symbol("bk_concat", bk_concat as *const u8);
-        builder.symbol("bk_list_set", bk_list_set as *const u8);
-        builder.symbol("bk_list_snapshot", bk_list_snapshot as *const u8);
-        builder.symbol("bk_list_view", bk_list_view as *const u8);
-        builder.symbol("bk_build", bk_build as *const u8);
-        builder.symbol("bk_clone_into", bk_clone_into as *const u8);
-        builder.symbol("bk_move_out", bk_move_out as *const u8);
-        builder.symbol("bk_drop_slots", bk_drop_slots as *const u8);
-        builder.symbol("bk_step", bk_step as *const u8);
-        builder.symbol("bk_iter_next", bk_iter_next as *const u8);
-        builder.symbol("bk_drop", bk_drop as *const u8);
-        for (name, f) in FAST {
-            builder.symbol(*name, *f as *const u8);
+/// The Rust functions native code calls (`Linkage::Import`), by name: their addresses
+/// (and, in WebAssembly, their signatures, `crate::wasm_jit::sig_of`: hence their
+/// parameters, `_` each).
+macro_rules! helpers {
+    ($($f:ident($($p:tt),*)),* $(,)?) => {
+        #[cfg(feature = "jit")]
+        fn helpers() -> Vec<(&'static str, usize)> {
+            let mut v = vec![$((stringify!($f), $f as *const u8 as usize)),*];
+            v.extend(FAST.iter().map(|(n, f)| (*n, *f as *const u8 as usize)));
+            v
         }
-        let mut module = JITModule::new(builder);
+
+        #[cfg(not(feature = "jit"))]
+        fn helpers() -> Vec<(&'static str, usize, crate::wasm_jit::Sig)> {
+            let mut v = vec![$((
+                stringify!($f),
+                $f as *const u8 as usize,
+                crate::wasm_jit::sig_of($f as extern "C" fn($($p),*) -> _),
+            )),*];
+            v.extend(
+                FAST.iter()
+                    .map(|(n, f)| (*n, *f as *const u8 as usize, crate::wasm_jit::sig_of(*f))),
+            );
+            v
+        }
+    };
+}
+
+helpers!(
+    bk_trace(_, _),
+    bk_frem(_, _),
+    bk_field_native(_, _, _),
+    bk_obj_fields(_, _),
+    bk_this_fields(_, _),
+    bk_method_is(_, _, _),
+    bk_resume(_, _, _, _),
+    bk_list_push(_, _, _),
+    bk_fields_cached(_, _),
+    bk_str_add(_, _, _, _),
+    bk_call_boxed(_, _, _, _),
+    bk_binary(_, _, _, _, _, _, _, _),
+    bk_truthy(_),
+    bk_global(_, _, _),
+    bk_global_word(_, _, _, _),
+    bk_obj_is(_, _),
+    bk_up_get(_, _, _),
+    bk_up_word(_, _, _, _),
+    bk_assign_up(_, _, _, _, _),
+    bk_global_env(_, _, _),
+    bk_cells_init(_, _),
+    bk_cells_drop(_, _),
+    bk_cell_new(_, _),
+    bk_closure(_, _, _, _, _),
+    bk_step_boxed(_, _, _, _, _, _),
+    bk_iter_step(_, _),
+    bk_catch(_, _, _, _, _),
+    bk_is_type(_, _, _, _, _),
+    bk_reraise(_, _, _),
+    bk_caught_drop(_, _),
+    bk_assign_global(_, _, _, _, _),
+    bk_box_into(_, _, _),
+    bk_new_object(_, _),
+    bk_init_done(_, _, _),
+    bk_str_cmp(_, _, _, _),
+    bk_str_len(_),
+    bk_concat(_, _, _, _),
+    bk_list_set(_, _, _, _),
+    bk_list_snapshot(_, _),
+    bk_list_view(_, _),
+    bk_build(_, _, _),
+    bk_clone_into(_, _),
+    bk_move_out(_, _, _),
+    bk_drop_slots(_, _),
+    bk_step(_, _, _, _, _),
+    bk_iter_next(_, _, _),
+    bk_drop(_),
+);
+
+/// Cranelift's JIT for this machine; `None` if Cranelift does not support it.
+#[cfg(feature = "jit")]
+fn module() -> Option<ClifModule> {
+    let mut flags = settings::builder();
+    flags.set("use_colocated_libcalls", "false").ok()?;
+    flags.set("is_pic", "false").ok()?;
+    flags.set("opt_level", "speed").ok()?;
+    let isa = cranelift_native::builder()
+        .ok()?
+        .finish(settings::Flags::new(flags))
+        .ok()?;
+    let mut builder = JITBuilder::with_isa(isa, default_libcall_names());
+    for (name, addr) in helpers() {
+        builder.symbol(name, addr as *const u8);
+    }
+    Some(JITModule::new(builder))
+}
+
+/// The translation into WebAssembly; `None` without a compiler for its modules.
+#[cfg(not(feature = "jit"))]
+fn module() -> Option<ClifModule> {
+    crate::wasm_jit::compiler()?;
+    Some(ClifModule::new(helpers()))
+}
+
+impl Jit {
+    /// `None` if the machine is not supported by Cranelift (or, in WebAssembly, without a
+    /// compiler for the modules).
+    pub fn new() -> Option<Self> {
+        let mut module = module()?;
         let ptr = module.target_config().pointer_type();
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr));
@@ -3517,6 +3671,7 @@ impl Jit {
             } else {
                 Vec::new()
             };
+            guess_ret(&p, globals, self.len_sym);
             let plan = analyze(&p, this, globals, self.len_sym, env);
             if let Some(plan) = &plan {
                 todo.extend(plan.targets.values().cloned());
@@ -3542,7 +3697,16 @@ impl Jit {
                     Ok(id) => id,
                     Err(_) => return,
                 };
-                self.compiled.insert(key, Compiled { id, params, ret });
+                self.compiled.insert(
+                    key,
+                    Compiled {
+                        id,
+                        params,
+                        ret,
+                        slots: Vec::new(),
+                        calls: Vec::new(),
+                    },
+                );
                 new.push(p.clone());
             }
         }
@@ -3557,22 +3721,55 @@ impl Jit {
                 continue;
             }
             match self.define_entry(key) {
-                Ok(e) => entries.push((p.clone(), e, [plan.callees, plan.ctors].concat())),
+                Ok(e) => {
+                    let c = self.compiled.get_mut(&key).unwrap();
+                    c.slots = [plan.callees, plan.ctors].concat();
+                    c.calls = plan.targets.values().map(Target::key).collect();
+                    entries.push((p.clone(), e));
+                }
                 Err(_) => *p.jit.borrow_mut() = JitState::Rejected,
             }
         }
         if self.module.finalize_definitions().is_err() {
+            // (In WebAssembly: an instruction its translation does not know.) Interpreted.
+            for (p, _) in &entries {
+                self.compiled.remove(&(Rc::as_ptr(p) as usize));
+                *p.jit.borrow_mut() = JitState::Rejected;
+            }
             return;
         }
-        for (p, entry, callees) in entries {
-            let c = &self.compiled[&(Rc::as_ptr(&p) as usize)];
+        #[cfg(feature = "wasm-jit")]
+        crate::wasm_jit::count_typed(entries.len());
+        for (p, entry) in entries {
+            let key = Rc::as_ptr(&p) as usize;
+            let c = &self.compiled[&key];
             let code = self.module.get_finalized_function(entry);
             *p.jit.borrow_mut() = JitState::Native(NativeCode {
                 entry: code as usize,
                 params: c.params.clone(),
                 ret: c.ret,
             });
-            for slot in callees {
+            // What its code depends on, and that of the functions it calls (directly or
+            // not): their code is called directly, a redefinition anywhere below must
+            // reach it.
+            let mut slots: Vec<u32> = Vec::new();
+            let mut seen = vec![key];
+            let mut todo = vec![key];
+            while let Some(k) = todo.pop() {
+                let Some(c) = self.compiled.get(&k) else {
+                    continue;
+                };
+                slots.extend(&c.slots);
+                for &q in &c.calls {
+                    if !seen.contains(&q) {
+                        seen.push(q);
+                        todo.push(q);
+                    }
+                }
+            }
+            slots.sort_unstable();
+            slots.dedup();
+            for slot in slots {
                 globals.watch(slot, &p);
             }
             // Type of a parameter redeclared: field layout to recompile.
@@ -3777,7 +3974,9 @@ impl Jit {
         // registers).
         let mut inlines: FxHashMap<usize, (Rc<Proto>, Plan)> = FxHashMap::default();
         for (k, t) in &plan.targets {
-            if inlinable(&t.proto, p)
+            // (Not a call the analysis left to the interpreter: an argument of any type.)
+            if !plan.boxed.contains(k)
+                && inlinable(&t.proto, p)
                 && let Some(qp) =
                     analyze(&t.proto, t.this.clone(), globals, self.len_sym, Vec::new())
             {
@@ -3942,8 +4141,7 @@ impl Jit {
         // Captured variables (cells of the closure called), set by the caller.
         let has_env = !p.captures.is_empty();
         let envv = if has_env {
-            bx.ins()
-                .load(types::I64, MemFlagsData::trusted(), ctxv, ENV_OFFSET)
+            bx.load_addr(ctxv, ENV_OFFSET)
         } else {
             bx.ins().iconst(types::I64, 0)
         };
@@ -3979,8 +4177,7 @@ impl Jit {
         let keptv = bx.ins().stack_addr(types::I64, kept_slot, 0);
         for k in 0..nkept {
             let z = bx.ins().iconst(types::I64, 0);
-            bx.ins()
-                .store(MemFlagsData::trusted(), z, keptv, (k * 8) as i32);
+            bx.store_addr(z, keptv, k as i32 * PTR_BYTES);
         }
         let live = liveness(p);
         // Checks on entry (until the first block): see `DeoptSite::entry`.
@@ -4077,16 +4274,13 @@ impl Jit {
                 };
                 // The interpreter resumes with this function's captured variables.
                 if has_env {
-                    $bx.ins()
-                        .store(MemFlagsData::trusted(), envv, ctxv, ENV_OFFSET);
+                    $bx.store_addr(envv, ctxv, ENV_OFFSET);
                 }
                 if ncells > 0 {
-                    $bx.ins()
-                        .store(MemFlagsData::trusted(), cellsv, ctxv, CELLS_OFFSET);
+                    $bx.store_addr(cellsv, ctxv, CELLS_OFFSET);
                 }
                 if nkept > 0 {
-                    $bx.ins()
-                        .store(MemFlagsData::trusted(), keptv, ctxv, CAUGHT_OFFSET);
+                    $bx.store_addr(keptv, ctxv, CAUGHT_OFFSET);
                 }
                 let call = $bx.ins().call(resume_ref, &[ctxv, sp, buf, outp]);
                 let status = $bx.inst_results(call)[0];
@@ -4474,8 +4668,7 @@ impl Jit {
                             } else {
                                 own!(bx, *d)
                             };
-                            bx.ins()
-                                .store(MemFlagsData::trusted(), s, outs, (j * 8) as i32);
+                            bx.store_addr(s, outs, j as i32 * PTR_BYTES);
                             slots.push(s);
                         }
                         self.boxed_steps.push(Box::new(BoxedStep {
@@ -4829,12 +5022,7 @@ impl Jit {
                         };
                         let v = match self.cell_off {
                             Some(off) => {
-                                let cell = bx.ins().load(
-                                    types::I64,
-                                    MemFlagsData::trusted(),
-                                    envv,
-                                    (*u * 8) as i32,
-                                );
+                                let cell = bx.load_addr(envv, *u as i32 * PTR_BYTES);
                                 let t = bx.ins().load(types::I8, MemFlagsData::new(), cell, off);
                                 let bad = bx.ins().icmp_imm_s(IntCC::NotEqual, t, tag as i64);
                                 bail!(bx, bad);
@@ -4921,12 +5109,7 @@ impl Jit {
                         };
                         let done = bx.create_block();
                         if let (Some(off), Some(tag)) = (self.cell_off, tag) {
-                            let cell = bx.ins().load(
-                                types::I64,
-                                MemFlagsData::trusted(),
-                                envv,
-                                (*u * 8) as i32,
-                            );
+                            let cell = bx.load_addr(envv, *u as i32 * PTR_BYTES);
                             let old = bx.ins().load(types::I8, MemFlagsData::new(), cell, off);
                             let simple = bx.ins().icmp_imm_u(
                                 IntCC::UnsignedLessThan,
@@ -5802,6 +5985,12 @@ impl Jit {
                             bx.ins()
                                 .load(types::I8, MemFlagsData::trusted(), v, BOOL_PAYLOAD)
                         }
+                        // A guessed `float`: exactly (the function returns what it computes).
+                        _ if p.ret.is_none() => {
+                            let bad = bx.ins().icmp_imm_s(IntCC::NotEqual, tag, TAG_FLOAT as i64);
+                            bail!(bx, bad);
+                            bx.ins().bitcast(types::F64, MemFlagsData::new(), raw)
+                        }
                         _ => {
                             let isf = bx.ins().icmp_imm_s(IntCC::Equal, tag, TAG_FLOAT as i64);
                             let isi = bx.ins().icmp_imm_s(IntCC::Equal, tag, TAG_INT as i64);
@@ -5819,7 +6008,7 @@ impl Jit {
                 }
                 // Result not annotated, of a simple type (or `nil`): a value in the slot.
                 Term::Return { reg, .. }
-                    if p.ret.is_none()
+                    if ret == RegTy::Value
                         && matches!(
                             tyof!(*reg),
                             Some(JTy::Int | JTy::Float | JTy::Bool | JTy::Nil)
@@ -6487,12 +6676,7 @@ impl Jit {
             let ps = bx.block_params(entry);
             (ps[0], ps[1])
         };
-        let regs = bx.ins().load(
-            ptr,
-            MemFlagsData::trusted(),
-            frame,
-            std::mem::offset_of!(NativeFrame, regs) as i32,
-        );
+        let regs = bx.load_addr(frame, std::mem::offset_of!(NativeFrame, regs) as i32);
         bx.ins().jump(blocks[0], &[]);
         let d = Dyn {
             regs_ty: &p.regs,
@@ -6592,6 +6776,8 @@ impl Jit {
         self.module.define_function(id, &mut ctx).ok()?;
         self.module.clear_context(&mut ctx);
         self.module.finalize_definitions().ok()?;
+        #[cfg(feature = "wasm-jit")]
+        crate::wasm_jit::count_baseline();
         Some(self.module.get_finalized_function(id) as usize)
     }
 

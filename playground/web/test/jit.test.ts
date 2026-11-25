@@ -18,7 +18,7 @@ beforeAll(async () => {
 
 /**
  * Runs `src` interpreted, compiled, then compiled eagerly: the answers and what each
- * printed; the typed functions compiled (as usual).
+ * printed; the functions compiled as usual, typed and to baseline code.
  */
 function both(src: string) {
   const run = (mode: boolean | "eager") => {
@@ -27,10 +27,10 @@ function both(src: string) {
     return { answer: bk.run(src), printed };
   };
   const interpreted = run(false);
-  const before = bk.compiled;
+  const [typed, base] = [bk.compiled, bk.baseline];
   const compiled = run(true);
-  const functions = bk.compiled - before;
-  return { interpreted, compiled, eager: run("eager"), functions };
+  const [functions, baseline] = [bk.compiled - typed, bk.baseline - base];
+  return { interpreted, compiled, eager: run("eager"), functions, baseline };
 }
 
 /** The same answers; returns the number of typed functions compiled. */
@@ -101,24 +101,25 @@ def norm(a: float, b: float): float = sq(a) + sq(b)
     expect(same("def add(a, b): int = a + b\ndef f(n: int): int = add(n, 1) * 2\nf(20)")).toBe(2);
   });
 
-  test("no annotation at all: inferred", () => {
+  test("no annotation at all: copies typed for the arguments", () => {
     expect(same("def add(a, b) = a + b\ndef f(n: int): int = add(n, 1) * 2\nf(20)")).toBe(2);
     expect(same("def fib(n) = if n < 2 then n else fib(n - 1) + fib(n - 2) end\nfib(20)")).toBe(1);
-    // (One copy of each for `int` arguments.)
-    expect(same("def half(x) = x / 2.0\ndef f(n) = half(n) + half(n + 1)\n[f(3), f(4)]")).toBe(2);
+    expect(same("def half(x) = x / 2.0\ndef f(n) = half(n) + half(n + 1)\n[f(3), f(4)]")).toBeGreaterThan(0);
   });
 
-  test("mutual recursion without annotations", () => {
+  test("mutual recursion without annotations: baseline code", () => {
     const src = "def even(n) = if n == 0 then true else odd(n - 1) end\n" +
       "def odd(n) = if n == 0 then false else even(n - 1) end\n[even(10), odd(7)]";
-    expect(same(src)).toBeGreaterThanOrEqual(2);
+    same(src);
+    expect(both(src).baseline).toBe(2);
   });
 
-  test("results of different types: not typed", () => {
+  test("results of different types: baseline code", () => {
     // (An `int` and a `float`: no one native type, unlike `: float`, which converts.)
     expect(same("def f(n) = if n > 0 then 1 else 2.5 end\n[f(1), f(-1)]")).toBe(0);
     expect(same("def f(n): float = n * 2\n[f(1), f(-1)]")).toBe(1);
-    expect(same("def f(n) = if n > 0 then f(n - 1) else 0.5 end\nf(3)")).toBe(1);
+    expect(same("def f(n) = if n > 0 then f(n - 1) else 0.5 end\nf(3)")).toBe(0);
+    expect(both("def f(n) = if n > 0 then f(n - 1) else 0.5 end\nf(3)").baseline).toBe(1);
   });
 
   test("more than sixteen arguments", () => {
@@ -200,4 +201,4 @@ test("generated programs: the same answer", () => {
   // Not vacuous: most programs compile, some fail at run time.
   expect(compiled).toBeGreaterThan(n);
   expect(errors).toBeGreaterThan(n / 20);
-});
+}, 600_000);

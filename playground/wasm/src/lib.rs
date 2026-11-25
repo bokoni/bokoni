@@ -182,6 +182,12 @@ pub extern "C" fn jit_baseline() -> u32 {
     bokoni::wasm_jit::baseline_functions()
 }
 
+/// Number of functions that could not be translated to WebAssembly so far.
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_untranslated() -> u32 {
+    bokoni::wasm_jit::untranslated_functions()
+}
+
 /// Number of functions compiled without structured control flow so far.
 #[unsafe(no_mangle)]
 pub extern "C" fn jit_dispatched() -> u32 {

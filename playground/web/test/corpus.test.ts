@@ -105,6 +105,8 @@ test("the programs of the Rust tests and of syntax.md: the same answers", async 
   const progs = await corpus();
   let compiled = 0;
   let dispatched = 0;
+  // Programs with a function the translation into WebAssembly does not know.
+  const untranslated: string[] = [];
   for (const src of progs) {
     // The browser's own stack overflowing (very deep data, recursion through
     // built-ins): a crash, after which the instance is replaced (as the playground does).
@@ -121,9 +123,11 @@ test("the programs of the Rust tests and of syntax.md: the same answers", async 
     const interpreted = await run(false);
     const before = bk.baseline + bk.compiled;
     const unstructured = bk.dispatched;
+    const failures = bk.untranslated;
     const eager = await run("eager");
     compiled += Math.max(0, bk.baseline + bk.compiled - before);
     dispatched += Math.max(0, bk.dispatched - unstructured);
+    if (bk.untranslated > failures) untranslated.push(src);
     for (const got of [eager, await run("dispatch")]) {
       if (JSON.stringify(got) !== JSON.stringify(interpreted)) {
         expect({ src, ...got }).toEqual({ src, ...interpreted });
@@ -135,4 +139,6 @@ test("the programs of the Rust tests and of syntax.md: the same answers", async 
   expect(compiled).toBeGreaterThan(progs.length / 2);
   // Bokoni's control flow graphs are reducible: all structured.
   expect(dispatched).toBe(0);
+  // Every function the JIT builds is translated.
+  expect(untranslated.slice(0, 3)).toEqual([]);
 }, 120_000);

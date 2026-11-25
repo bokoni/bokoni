@@ -16,11 +16,9 @@ use crate::span::Span;
 use crate::value::{Function, HashMap, Range, Record, Value};
 use std::cell::RefCell;
 
-/// The native code backend compiled in: Cranelift, or WebAssembly modules.
-#[cfg(feature = "jit")]
+/// The JIT (its functions compiled to machine code, or to WebAssembly modules).
+#[cfg(any(feature = "jit", feature = "wasm-jit"))]
 use crate::jit as native;
-#[cfg(all(feature = "wasm-jit", not(feature = "jit")))]
-use crate::wasm_jit as native;
 use std::rc::Rc;
 
 /// Cell of a variable captured by a closure.
@@ -830,7 +828,7 @@ impl Runtime {
             } => {
                 let site = &proto.calls[*site as usize];
                 // Declared method already compiled: called directly.
-                #[cfg(feature = "jit")]
+                #[cfg(any(feature = "jit", feature = "wasm-jit"))]
                 if self.jit_enabled
                     && site.named.is_empty()
                     && !site.block
@@ -1620,7 +1618,7 @@ impl Runtime {
     /// Resumption in the interpreter of native code (see `jit::DeoptSite`): `proto` runs
     /// from instruction `instr` of block `block`, with the registers rebuilt, at call
     /// depth `depth`.
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "wasm-jit"))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn resume(
         &mut self,

@@ -74,7 +74,8 @@ fn same_answers_interpreted_and_compiled() {
 
 #[test]
 fn compiled_code_is_faster_in_fuel() {
-    let src = "def fib(n: int): int = if n < 2 then n else fib(n - 1) + fib(n - 2) end\nfib(22)";
+    // (Building and translating the code takes fuel too: a few million units.)
+    let src = "def fib(n: int): int = if n < 2 then n else fib(n - 1) + fib(n - 2) end\nfib(25)";
     let interpreted = run(src, mode(0)).unwrap();
     let compiled = run(src, mode(1)).unwrap();
     assert_eq!(compiled.json, interpreted.json);

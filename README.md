@@ -46,14 +46,15 @@ end
 
 Fully typed functions are compiled to native code (Cranelift JIT) on their first call:
 `fib(25)` goes from 28 ms (interpreted) to 0.5 ms. A generic function
-(`def max(a: T, b: T): T forall T`) is compiled once per type it is called with, and
-methods, lists and strings are compiled too; where an assumption of the native code does
-not hold, the interpreter takes over at that point.
+(`def max(a: T, b: T): T forall T`) is compiled once per type it is called with, a
+result without annotation is guessed (`def fib(n) = …` too), and methods, lists and
+strings are compiled too; where an assumption of the native code does not hold, the
+interpreter takes over at that point.
 Untyped functions get lighter native code that calls the interpreter for anything beyond
 simple arithmetic (about twice as fast), with exactly the same result. Inside WebAssembly,
-where Cranelift cannot run, functions are compiled to WebAssembly modules instead, in
-the same two tiers (`wasm-jit` feature, used by the playground;
-[docs/execution.md](docs/execution.md)).
+where Cranelift cannot produce machine code, the same JIT builds its code and translates
+it into WebAssembly modules the host compiles (`wasm-jit` feature, used by the
+playground; [docs/execution.md](docs/execution.md)).
 
 Macros, as in Crystal, generate code at parse time:
 

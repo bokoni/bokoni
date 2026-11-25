@@ -461,6 +461,7 @@ fn outlined(p: &Proto, r: &Region, name: Symbol) -> Proto {
         vis: p.vis,
         jit: Default::default(),
         jit_dyn: Default::default(),
+        ret_guess: Default::default(),
         calls_seen: Default::default(),
         has_loop: true,
         plain_params: true,

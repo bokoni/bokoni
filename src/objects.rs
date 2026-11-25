@@ -126,7 +126,7 @@ pub(crate) struct Syms {
     pub values: Symbol,
     pub from: Symbol,
     /// `len` (read by the JIT).
-    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "jit", feature = "wasm-jit")), allow(dead_code))]
     pub len: Symbol,
     pub message: Symbol,
     pub error: Symbol,

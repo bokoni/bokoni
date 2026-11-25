@@ -135,6 +135,34 @@ fn redefinition_invalidates_native_code() {
 }
 
 #[test]
+fn a_call_left_to_the_interpreter_is_not_inlined() {
+    // `f0` is small enough to inline, but its argument (`g`'s result, not annotated) is a
+    // value of any type: the call goes through the interpreter (it panicked, the inlined
+    // body taking that value for an `int`).
+    let src = "def f0(p0: int): float = p0 * 0.5\ndef g(x) = x\n\
+               def f3(p0: int): float = f0(g(p0))\n[f3(2), f3(3)]";
+    assert_eq!(same(src), "[1.0, 1.5]");
+}
+
+#[test]
+fn redefinition_reaches_callers_of_callers() {
+    // `h` calls `g`'s native code directly, which calls `f`'s: redefining `f` must reach
+    // `h` too, not only `g`.
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    e.eval(
+        "def f(n: int): int = n + 1\ndef g(n: int): int = f(n) * 10\ndef h(n: int): int = g(n) + 1",
+    )
+    .unwrap();
+    assert_eq!(e.eval_as::<i64>("h(1)").unwrap(), 21);
+    assert_eq!(e.eval_as::<i64>("h(1)").unwrap(), 21);
+    assert!(e.is_native("h"));
+    e.eval("def f(n: int): int = n + 2").unwrap();
+    assert_eq!(e.eval_as::<i64>("h(1)").unwrap(), 31);
+    assert!(e.is_native("h"));
+}
+
+#[test]
 fn deep_recursion_beyond_the_native_stack() {
     // The native stack is not enough for 200,000 calls: the interpreter takes over (its
     // stack grows on the heap), with the same result.

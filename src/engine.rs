@@ -411,7 +411,7 @@ impl Engine {
         )
         .map_err(with_src)?;
         // Loops of the main program as functions, for the typed JIT.
-        if cfg!(feature = "jit")
+        if cfg!(any(feature = "jit", feature = "wasm-jit"))
             && self.rt.jit_enabled
             && let Some(p) = Rc::get_mut(&mut main)
         {
