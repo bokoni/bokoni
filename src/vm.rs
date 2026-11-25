@@ -1660,7 +1660,14 @@ impl Runtime {
                 }
             }
             let jit = self.jit.as_mut()?;
-            jit.len_sym = self.syms.len;
+            jit.list_syms = native::ListSyms {
+                len: self.syms.len,
+                map: self.syms.map,
+                filter: self.syms.filter,
+                each: self.syms.each,
+                any: self.syms.any,
+                all: self.syms.all,
+            };
             jit.compile(proto, this, &mut self.globals, upvals, regs);
         }
         let (entry, n, by_ref, ret) = match &*proto.jit.borrow() {

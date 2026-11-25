@@ -100,6 +100,32 @@ type ClifModule = JITModule;
 #[cfg(not(feature = "jit"))]
 type ClifModule = crate::wasm_jit::WasmModule;
 
+/// Symbols of the list methods the typed JIT does natively (`len`; `map`, `filter`,
+/// `each`, `any`, `all` calling a known closure: `bk_each`).
+#[derive(Clone, Copy)]
+pub struct ListSyms {
+    pub len: crate::intern::Symbol,
+    pub map: crate::intern::Symbol,
+    pub filter: crate::intern::Symbol,
+    pub each: crate::intern::Symbol,
+    pub any: crate::intern::Symbol,
+    pub all: crate::intern::Symbol,
+}
+
+impl Default for ListSyms {
+    fn default() -> Self {
+        let none = crate::intern::Symbol(u32::MAX);
+        ListSyms {
+            len: none,
+            map: none,
+            filter: none,
+            each: none,
+            any: none,
+            all: none,
+        }
+    }
+}
+
 /// Context shared with native code. The first four fields are read and written by the
 /// generated code (fixed offsets); the others are used by Rust code only.
 #[repr(C)]
@@ -1391,6 +1417,209 @@ extern "C" fn bk_closure_env(
     }
 }
 
+/// `xs.map(f)` (`filter`, `each`, `any`, `all`) in typed code, `f` a closure of a known
+/// function (`EachCall::declared`, checked) whose typed copy is compiled: its code called
+/// directly on each element, over a copy of the list (`f` may change it), as the
+/// interpreter's built-in does. If that code is no longer in place (redefined, left to
+/// the interpreter) the rest goes through the interpreter, nothing redone.
+struct EachCall {
+    op: EachOp,
+    /// The typed copy called.
+    proto: Rc<Proto>,
+    declared: Rc<Proto>,
+    /// Its parameter's native type.
+    param: RegTy,
+    /// It cannot change a list (`changes_no_list`): no copy of the list is needed.
+    pure: bool,
+    span: Span,
+}
+
+/// Does `q` change no list, nor call anything that could? Simple values, operations
+/// (the interpreter's on any value run no script code), its captured variables (a list
+/// assigned elsewhere stays alive in its caller's register).
+fn changes_no_list(q: &Proto) -> bool {
+    use Instr::*;
+    q.blocks.iter().flat_map(|b| &b.instrs).all(|i| {
+        matches!(
+            i,
+            Int(..)
+                | Float(..)
+                | Bool(..)
+                | Nil(..)
+                | Const(..)
+                | Move(..)
+                | Guard(..)
+                | IBin(..)
+                | IBinK(..)
+                | FBin(..)
+                | INeg(..)
+                | FNeg(..)
+                | IToF(..)
+                | Not(..)
+                | GetUp(..)
+                | SetUp(..)
+        ) || matches!(i, Bin(op, ..) if *op != BinOp::Push)
+    })
+}
+
+/// See `EachCall`. The result: a list (`map`, `filter`, `each`) into the slot `out`, a
+/// `bool` (`any`, `all`) as a word. Returns 0; 3 if nothing was done (another closure, an
+/// element not of the parameter's type, little native stack left: the interpreter does
+/// it all); 2 if a `map` holds a value of another type than the native result
+/// (`JitCtx::returned`); 1, an error in the closure's native code (its own call not in
+/// the call stack yet); 4, an error raised through the interpreter (traced).
+extern "C" fn bk_each(
+    ctx: *mut JitCtx,
+    call: *const EachCall,
+    list: *const Value,
+    f: *const Value,
+    out: *mut u64,
+) -> i32 {
+    // SAFETY: `call` is kept alive by the `Jit`; `list`, `f` and `out` are slots of the
+    // native frame; the entry points are those `define_entry` generates.
+    unsafe {
+        let call = &*call;
+        let Value::Function(func) = &*f else {
+            return 3;
+        };
+        let Function::Script(c) = &**func else {
+            return 3;
+        };
+        let Value::List(l) = &*list else {
+            return 3;
+        };
+        if !Rc::ptr_eq(&c.proto, &call.declared)
+            || stacker::remaining_stack().is_some_and(|r| r < 128 * 1024)
+        {
+            return 3;
+        }
+        let fits = |v: &Value| {
+            matches!(
+                (call.param, v),
+                (RegTy::Int, Value::Int(_))
+                    | (RegTy::Float, Value::Int(_) | Value::Float(_))
+                    | (RegTy::Bool, Value::Bool(_))
+            )
+        };
+        if !l.borrow().iter().all(fits) {
+            return 3;
+        }
+        // A copy of the list if the closure may change it; otherwise its elements read
+        // as they come (simple values: no borrow held during the calls).
+        let copy: Vec<Value> = if call.pure {
+            Vec::new()
+        } else {
+            l.borrow().clone()
+        };
+        let n = if call.pure {
+            l.borrow().len()
+        } else {
+            copy.len()
+        };
+        let depth = (*ctx).depth;
+        let mut kept = Vec::with_capacity(if call.op == EachOp::Map { n } else { 0 });
+        // A `map` element not of the native result's type.
+        let mut other = false;
+        for k in 0..n {
+            let item;
+            let v = match copy.get(k) {
+                Some(v) => v,
+                None => {
+                    item = l.borrow()[k].clone();
+                    &item
+                }
+            };
+            let code = match &*call.proto.jit.borrow() {
+                JitState::Native(code) if code.params.len() == 1 => Some((code.entry, code.ret)),
+                _ => None,
+            };
+            let r = match code {
+                Some((entry, ret)) => {
+                    let arg = match (call.param, v) {
+                        (RegTy::Float, Value::Int(i)) => (*i as f64).to_bits(),
+                        (_, Value::Int(i)) => *i as u64,
+                        (_, Value::Float(x)) => x.to_bits(),
+                        (_, Value::Bool(b)) => *b as u64,
+                        _ => return 3,
+                    };
+                    let mut word = 0u64;
+                    let mut result = Value::Nil;
+                    let outp = match ret {
+                        RegTy::Value => &mut result as *mut Value as *mut u64,
+                        _ => &mut word as *mut u64,
+                    };
+                    (*ctx).env = c.upvals.as_ptr();
+                    (*ctx).depth = depth + 1;
+                    let code: extern "C" fn(*mut JitCtx, *const u64, *mut u64) -> i32 =
+                        std::mem::transmute(entry);
+                    let status = code(ctx, &arg, outp);
+                    (*ctx).depth = depth;
+                    match status {
+                        0 => match ret {
+                            RegTy::Int => Value::Int(word as i64),
+                            RegTy::Float => Value::Float(f64::from_bits(word)),
+                            RegTy::Bool => Value::Bool(word & 1 == 1),
+                            RegTy::Value => result,
+                        },
+                        2 => {
+                            other |= ret != RegTy::Value;
+                            (*ctx).returned.take().unwrap_or(Value::Nil)
+                        }
+                        _ => return 1,
+                    }
+                }
+                None => {
+                    other = true;
+                    match with_interpreter(ctx, |rt| rt.call1(&*f, v.clone(), call.span)) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            (*ctx).pending = Some(e);
+                            (*ctx).err = PENDING;
+                            return 4;
+                        }
+                    }
+                }
+            };
+            match call.op {
+                EachOp::Map => kept.push(r),
+                EachOp::Filter => {
+                    if r.truthy() {
+                        kept.push(v.clone());
+                    }
+                }
+                EachOp::Each => {}
+                EachOp::Any if r.truthy() => {
+                    *out = 1;
+                    return 0;
+                }
+                EachOp::All if !r.truthy() => {
+                    *out = 0;
+                    return 0;
+                }
+                EachOp::Any | EachOp::All => {}
+            }
+        }
+        let v = match call.op {
+            EachOp::Any => {
+                *out = 0;
+                return 0;
+            }
+            EachOp::All => {
+                *out = 1;
+                return 0;
+            }
+            EachOp::Each => (*list).clone(),
+            _ => Value::list(kept),
+        };
+        if call.op == EachOp::Map && other {
+            (*ctx).returned = Some(v);
+            return 2;
+        }
+        *(out as *mut Value) = v;
+        0
+    }
+}
+
 /// 1 if `v` is an object of class `info` (exactly), otherwise 0.
 extern "C" fn bk_obj_is(v: *const Value, info: *const crate::objects::TypeInfo) -> i32 {
     // SAFETY: `v` is a slot of the native frame; `info` is kept alive by the JIT.
@@ -1749,10 +1978,13 @@ pub struct Jit {
     str_fns: [FuncId; 4],
     /// `bk_call_boxed`, `bk_binary`, `bk_truthy`, `bk_global`, `bk_box_into`,
     /// `bk_new_object`, `bk_init_done`.
-    boxed_fns: [FuncId; 24],
+    boxed_fns: [FuncId; 25],
     /// Calls through the interpreter (addresses held by native code).
     #[allow(clippy::vec_box)]
     boxed_calls: Vec<Box<BoxedCall>>,
+    /// See `EachCall` (addresses held by native code).
+    #[allow(clippy::vec_box)]
+    each_calls: Vec<Box<EachCall>>,
     /// Instructions done by the interpreter (addresses held by native code).
     #[allow(clippy::vec_box)]
     boxed_steps: Vec<Box<BoxedStep>>,
@@ -1764,8 +1996,8 @@ pub struct Jit {
     /// Types whose layout native code knows (kept alive: their address serves as their
     /// identity).
     known_types: Vec<Rc<crate::objects::TypeInfo>>,
-    /// Symbol of the `len` method (lists).
-    pub len_sym: crate::intern::Symbol,
+    /// Symbols of the list methods done natively.
+    pub list_syms: ListSyms,
     /// Helpers of the baseline code (`bk_step`, `bk_iter_next`, `bk_drop`).
     dyn_fns: Option<(FuncId, FuncId, FuncId)>,
     /// Fast helpers (`FAST`), in the order of `Fast`.
@@ -1866,7 +2098,7 @@ fn guessed(p: &Proto) -> Option<RegTy> {
 /// does (`def fib(n) = …`: no value boxed at each call). A wrong guess costs nothing more
 /// than a resumption: the function returns its value with status 2 (`bk_resume`).
 /// `env`: its captured variables, as for its analysis.
-fn guess_ret(p: &Proto, globals: &Globals, len: crate::intern::Symbol, env: &[Value]) {
+fn guess_ret(p: &Proto, globals: &Globals, syms: ListSyms, env: &[Value]) {
     if p.ret.is_some()
         || p.ret_guess.get().is_some()
         || !matches!(p.kind, ProtoKind::Function | ProtoKind::Lambda)
@@ -1874,7 +2106,7 @@ fn guess_ret(p: &Proto, globals: &Globals, len: crate::intern::Symbol, env: &[Va
         return;
     }
     p.ret_guess.set(Some(RegTy::Value));
-    let Some(plan) = analyze(p, None, globals, len, env.to_vec(), &[]) else {
+    let Some(plan) = analyze(p, None, globals, syms, env.to_vec(), &[]) else {
         return;
     };
     let mut guess = None;
@@ -2242,7 +2474,7 @@ fn elem_jty(anns: &[RtType], a: u32) -> JTy {
 struct Analysis<'a> {
     p: &'a Proto,
     globals: &'a Globals,
-    len: crate::intern::Symbol,
+    syms: ListSyms,
     anns: Vec<RtType>,
     callees: Vec<u32>,
     ctors: Vec<u32>,
@@ -2261,6 +2493,8 @@ struct Analysis<'a> {
     /// compiles the function (`args`). With the values its captured variables are typed
     /// from (`lambda_env`, the closure's).
     lambdas: FxHashMap<Reg, (Rc<Proto>, Vec<Value>)>,
+    /// See `local_closures`.
+    local: FxHashMap<usize, u32>,
 }
 
 /// Function compiled and called directly; for a method, the type of `self` it is
@@ -2735,11 +2969,66 @@ impl Analysis<'_> {
                 );
                 ret
             }
+            // `xs.map(f)`, `filter`, `each`, `any`, `all`, `f` a closure of a known
+            // function: its typed code called on each element (`bk_each`).
+            CallMethod {
+                recv, name, site, ..
+            } if matches!(g(*recv)?, JTy::List(_)) && each_op(self.syms, *name).is_some() => {
+                let op = each_op(self.syms, *name)?;
+                let site = &p.calls[*site as usize];
+                let JTy::List(a) = g(*recv)? else {
+                    return None;
+                };
+                let et = match &self.anns[a as usize] {
+                    t @ (RtType::Int | RtType::Float | RtType::Bool) => t.clone(),
+                    _ => return None,
+                };
+                if site.npos != 1 || !site.named.is_empty() || g(site.start)? != JTy::Boxed {
+                    return None;
+                }
+                let (declared, env) = self.closure_for(ins, site.start)?;
+                if declared.params.len() != 1 || declared.is_generic() {
+                    return None;
+                }
+                let callee = if declared.untyped() {
+                    declared.specialize_params(std::slice::from_ref(&et))
+                } else {
+                    declared.clone()
+                };
+                guess_ret(&callee, self.globals, self.syms, &env);
+                let (cparams, cret) = native_sig(&callee)?;
+                match (&cparams[..], &et) {
+                    ([RegTy::Float], RtType::Int | RtType::Float)
+                    | ([RegTy::Int], RtType::Int)
+                    | ([RegTy::Bool], RtType::Bool) => {}
+                    _ => return None,
+                }
+                let t = match op {
+                    EachOp::Map => match cret {
+                        RegTy::Int => JTy::List(intern_ann(&mut self.anns, &RtType::Int)),
+                        RegTy::Float => JTy::List(intern_ann(&mut self.anns, &RtType::Float)),
+                        RegTy::Bool => JTy::List(intern_ann(&mut self.anns, &RtType::Bool)),
+                        RegTy::Value => JTy::Boxed,
+                    },
+                    EachOp::Filter | EachOp::Each => JTy::List(a),
+                    EachOp::Any | EachOp::All => JTy::Bool,
+                };
+                self.targets.insert(
+                    ins as *const Instr as usize,
+                    Target {
+                        proto: callee,
+                        this: None,
+                        declared: Some(declared),
+                        env,
+                    },
+                );
+                t
+            }
             CallMethod {
                 recv, name, site, ..
             } => {
                 let site = &p.calls[*site as usize];
-                let ok = *name == self.len
+                let ok = *name == self.syms.len
                     && matches!(g(*recv)?, JTy::List(_) | JTy::Str)
                     && site.npos == 0
                     && site.named.is_empty()
@@ -2859,7 +3148,7 @@ impl Analysis<'_> {
                                 global_env(self.globals, slot),
                             ),
                             _ => {
-                                let (child, env) = self.lambdas.get(f)?.clone();
+                                let (child, env) = self.closure_for(ins, *f)?;
                                 (child, true, env)
                             }
                         };
@@ -2909,7 +3198,7 @@ impl Analysis<'_> {
                             callee = callee.specialize(&tys);
                         }
                         // (Its result guessed before its signature is read.)
-                        guess_ret(&callee, self.globals, self.len, &env);
+                        guess_ret(&callee, self.globals, self.syms, &env);
                         let (cparams, _) = native_sig(&callee)?;
                         if site.block
                             || !site.named.is_empty()
@@ -3045,6 +3334,77 @@ fn lambda_env(p: &Proto, child: &Proto) -> Vec<Value> {
         .collect()
 }
 
+/// The closure in register `r` at `ins` (a call), if its function is known: made just
+/// before in the same block (`local_closures`), a lambda of the function in a register
+/// that holds no other, or given as an argument to the call that compiles it; with the
+/// values its captured variables are typed from.
+impl Analysis<'_> {
+    fn closure_for(&self, ins: &Instr, r: Reg) -> Option<(Rc<Proto>, Vec<Value>)> {
+        if let Some(&c) = self.local.get(&(ins as *const Instr as usize)) {
+            let child = self.p.children[c as usize].clone();
+            let env = lambda_env(self.p, &child);
+            return Some((child, env));
+        }
+        self.lambdas.get(&r).cloned()
+    }
+}
+
+/// A list method `bk_each` does.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum EachOp {
+    Map,
+    Filter,
+    Each,
+    Any,
+    All,
+}
+
+fn each_op(syms: ListSyms, name: crate::intern::Symbol) -> Option<EachOp> {
+    Some(match name {
+        n if n == syms.map => EachOp::Map,
+        n if n == syms.filter => EachOp::Filter,
+        n if n == syms.each => EachOp::Each,
+        n if n == syms.any => EachOp::Any,
+        n if n == syms.all => EachOp::All,
+        _ => return None,
+    })
+}
+
+/// Calls whose closure (the function called, or the last argument of a method) is made
+/// in the same block, just before (`r = closure …`, the register not written again
+/// since): key, the address of the call; value, the lambda (`children`). The registers
+/// of temporary values are reused, unlike those of variables (`lambda_regs`).
+fn local_closures(p: &Proto) -> FxHashMap<usize, u32> {
+    let mut out = FxHashMap::default();
+    if p.children.is_empty() {
+        return out;
+    }
+    for b in &p.blocks {
+        let mut made: FxHashMap<Reg, u32> = FxHashMap::default();
+        for ins in &b.instrs {
+            let f = match ins {
+                Instr::Call { f, .. } => Some(*f),
+                Instr::CallMethod { site, .. } => {
+                    let s = &p.calls[*site as usize];
+                    (s.npos > 0).then(|| s.start + s.npos - 1)
+                }
+                _ => None,
+            };
+            if let Some(c) = f.and_then(|f| made.get(&f)) {
+                out.insert(ins as *const Instr as usize, *c);
+            }
+            if let Instr::Closure(d, c) = ins {
+                made.insert(*d, *c);
+            } else {
+                for w in crate::outline::regs_of(p, ins).1 {
+                    made.remove(&w);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Registers that only hold closures of one of the function's lambdas (`let inc = || …`):
 /// written by `Closure(r, child)` only, always the same child. A call of one is direct,
 /// the closure checked when calling (`bk_closure_env`).
@@ -3089,7 +3449,7 @@ fn analyze(
     p: &Proto,
     this: Option<Rc<crate::objects::TypeInfo>>,
     globals: &Globals,
-    len: crate::intern::Symbol,
+    syms: ListSyms,
     env: Vec<Value>,
     args: &[Value],
 ) -> Option<Plan> {
@@ -3108,7 +3468,7 @@ fn analyze(
     let mut an = Analysis {
         p,
         globals,
-        len,
+        syms,
         anns: Vec::new(),
         callees: Vec::new(),
         ctors: Vec::new(),
@@ -3118,6 +3478,7 @@ fn analyze(
         global_objs: FxHashMap::default(),
         env,
         steps: Default::default(),
+        local: local_closures(p),
         lambdas: lambda_regs(p)
             .into_iter()
             .map(|(r, c)| {
@@ -3477,6 +3838,7 @@ helpers!(
     bk_up_word(_, _, _, _),
     bk_assign_up(_, _, _, _, _),
     bk_closure_env(_, _, _, _),
+    bk_each(_, _, _, _, _),
     bk_cells_init(_, _),
     bk_cells_drop(_, _),
     bk_cell_new(_, _),
@@ -3681,6 +4043,7 @@ impl Jit {
                 &[ptr, types::I32, ptr, ptr][..],
                 types::I32,
             ),
+            ("bk_each", &[ptr, ptr, ptr, ptr, ptr][..], types::I32),
             ("bk_cells_init", &[ptr, types::I64][..], types::INVALID),
             ("bk_cells_drop", &[ptr, types::I64][..], types::INVALID),
             ("bk_cell_new", &[ptr, types::I32][..], types::INVALID),
@@ -3718,7 +4081,7 @@ impl Jit {
             }
             boxed_fns.push(module.declare_function(name, Linkage::Import, &sig).ok()?);
         }
-        let boxed_fns: [FuncId; 24] = boxed_fns.try_into().ok()?;
+        let boxed_fns: [FuncId; 25] = boxed_fns.try_into().ok()?;
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr));
         sig.params.push(AbiParam::new(ptr));
@@ -3776,11 +4139,12 @@ impl Jit {
             str_fns,
             boxed_fns,
             boxed_calls: Vec::new(),
+            each_calls: Vec::new(),
             boxed_steps: Vec::new(),
             mem_fns,
             build_plans: Vec::new(),
             known_types: Vec::new(),
-            len_sym: crate::intern::Symbol(u32::MAX),
+            list_syms: ListSyms::default(),
             dyn_fns: None,
             fast_fns: Vec::new(),
             field_caches: Vec::new(),
@@ -3843,9 +4207,9 @@ impl Jit {
             } else {
                 guessed
             };
-            guess_ret(&p, globals, self.len_sym, &env);
+            guess_ret(&p, globals, self.list_syms, &env);
             let args = if Rc::ptr_eq(&p, root) { args } else { &[] };
-            let plan = analyze(&p, this, globals, self.len_sym, env, args);
+            let plan = analyze(&p, this, globals, self.list_syms, env, args);
             if let Some(plan) = &plan {
                 todo.extend(plan.targets.values().cloned());
             }
@@ -4053,6 +4417,7 @@ impl Jit {
             up_word_ref,
             set_up_ref,
             closure_env_ref,
+            each_ref,
             cells_init_ref,
             cells_drop_ref,
             cell_new_ref,
@@ -4148,13 +4513,18 @@ impl Jit {
         let mut inlines: FxHashMap<usize, (Rc<Proto>, Plan)> = FxHashMap::default();
         for (k, t) in &plan.targets {
             // (Not a call the analysis left to the interpreter: an argument of any type.)
+            // (Not a closure called by `bk_each`.)
+            // SAFETY: the key is the address of an instruction of `p`.
+            let each = matches!(unsafe { &*(*k as *const Instr) }, Instr::CallMethod { .. })
+                && t.this.is_none();
             if !plan.boxed.contains(k)
+                && !each
                 && inlinable(&t.proto, p)
                 && let Some(qp) = analyze(
                     &t.proto,
                     t.this.clone(),
                     globals,
-                    self.len_sym,
+                    self.list_syms,
                     Vec::new(),
                     &[],
                 )
@@ -5577,6 +5947,81 @@ impl Jit {
                             fp,
                             off + crate::value::layout::payload_of(tag),
                         );
+                    }
+                    // `xs.map(f)`… with a known closure (see `EachCall`).
+                    CallMethod {
+                        dst, recv, site, ..
+                    } if matches!(tyof!(*recv), Some(JTy::List(_)))
+                        && plan.targets.contains_key(&key) =>
+                    {
+                        let Instr::CallMethod { name, .. } = ins else {
+                            return Err(());
+                        };
+                        let op = each_op(self.list_syms, *name).ok_or(())?;
+                        let target = &plan.targets[&key];
+                        let (cparams, _) = native_sig(&target.proto).ok_or(())?;
+                        self.each_calls.push(Box::new(EachCall {
+                            op,
+                            proto: target.proto.clone(),
+                            declared: target.declared.clone().ok_or(())?,
+                            param: cparams[0],
+                            pure: changes_no_list(&target.proto),
+                            span,
+                        }));
+                        let desc = &**self.each_calls.last().unwrap() as *const EachCall;
+                        let dp = bx.ins().iconst(types::I64, desc as i64);
+                        // Call depth (checked before anything is done).
+                        let depth =
+                            bx.ins()
+                                .load(types::I64, MemFlagsData::trusted(), ctxv, DEPTH_OFFSET);
+                        let max = bx.ins().load(
+                            types::I64,
+                            MemFlagsData::trusted(),
+                            ctxv,
+                            MAX_DEPTH_OFFSET,
+                        );
+                        let too_deep = bx.ins().icmp(IntCC::SignedGreaterThanOrEqual, depth, max);
+                        bail!(bx, too_deep);
+                        let list = bx.use_var(uvar!(*recv));
+                        let fv = bx.use_var(uvar!(p.calls[*site as usize].start));
+                        let flag = matches!(op, EachOp::Any | EachOp::All);
+                        let out = if flag {
+                            bx.ins().stack_addr(types::I64, dout, 0)
+                        } else {
+                            own!(bx, *dst)
+                        };
+                        let call = bx.ins().call(each_ref, &[ctxv, dp, list, fv, out]);
+                        let status = bx.inst_results(call)[0];
+                        // 3: nothing done, the interpreter does it.
+                        let none = bx.ins().icmp_imm_s(IntCC::Equal, status, 3);
+                        bail!(bx, none);
+                        // 2: a `map` with a value of another type: resumed after it.
+                        let other = bx.ins().icmp_imm_s(IntCC::Equal, status, 2);
+                        deopt!(bx, other, cur, site_b, site_k + 1, Some(*dst));
+                        // 1: an error in the closure's code (its call added to the stack);
+                        // 4: one raised through the interpreter.
+                        call_sites.push((target.proto.name.clone(), span));
+                        let tid = trace_base + (call_sites.len() - 1) as i64;
+                        let failed = bx.create_block();
+                        let traced = bx.create_block();
+                        let cont = bx.create_block();
+                        bx.ins().brif(status, failed, &[], cont, &[]);
+                        bx.switch_to_block(failed);
+                        let own_err = bx.ins().icmp_imm_s(IntCC::Equal, status, 1);
+                        let none = bx.ins().iconst(types::I64, -1);
+                        bx.ins().brif(own_err, traced, &[], fail, &[none.into()]);
+                        bx.switch_to_block(traced);
+                        let t = bx.ins().iconst(types::I32, tid);
+                        bx.ins().call(trace_ref, &[ctxv, t]);
+                        let none = bx.ins().iconst(types::I64, -1);
+                        bx.ins().jump(fail, &[none.into()]);
+                        bx.switch_to_block(cont);
+                        if flag {
+                            let b = bx.ins().stack_load(types::I64, types::I8, dout, 0);
+                            bx.def_var(dvar!(*dst), b);
+                        } else {
+                            bx.def_var(dvar!(*dst), out);
+                        }
                     }
                     // Inlined method: its class checked with a cache (resumed in the
                     // interpreter, which makes the call, if it redefines the method).

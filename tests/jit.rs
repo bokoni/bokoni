@@ -1265,6 +1265,39 @@ fn closures_given_as_arguments_and_to_built_ins() {
 }
 
 #[test]
+fn list_methods_with_closures_in_typed_code() {
+    for src in [
+        // `map`, `filter`, `each`, `any`, `all` over a typed list, a known closure.
+        "def f(xs: [int], k: int): int\n  let ys = xs.map(|x| x * k)\n  let zs = xs.filter(|x| x % 3 == 0)\n  let n = 0\n  xs.each(|x| n += x)\n  ys.len() + zs.len() + ys[5] + zs[3] + n + (if xs.any(|x| x > 900) then 1 else 0 end) + (if xs.all(|x| x >= 0) then 10 else 0 end)\nend\nf((0...1000).to_list(), 2)",
+        "def f(xs: [float]): [float] = xs.map(|x| x / 2.0)\nf([1.0, 2.5, -3.0])",
+        "def f(xs: [int]): [float] = xs.map(|x: float| x * 0.5)\nf([1, 2, 3])",
+        "def f(xs: [bool]) = [xs.map(|b| not b), xs.filter(|b| b).len(), xs.any(|b| b), xs.all(|b| b)]\nf([true, false, true])",
+        "def f(xs: [int]) = xs.map(|x| \"#{x}\")\nf([1, 2])",
+        "def f(xs: [int]): [int] = xs.filter(|x| x > 1)\nf([])",
+        // A result of another type on the way: the rest through the interpreter.
+        "def f(xs: [int])\n  let ys = xs.map(|x| if x > 50 then x * 0.5 else x end)\n  [ys.len(), ys[10], ys[60]]\nend\nf((0...100).to_list())",
+        "def f(xs: [int])\n  let k = 1\n  let ys = xs.map(|x| begin k = 2.5 if x == 5\n x * k end)\n  ys\nend\nf((0...10).to_list())",
+        // Elements of another type: all by the interpreter.
+        "def f(xs: [int]) = xs.map(|x| x + 1)\nlet xs = [1, 2]\nxs << 3.5\nf(xs)",
+        // The closure changes the list (a copy is iterated), or another one.
+        "def f(xs: [int])\n  let r = xs.map(|x| begin xs << x\n x * 2 end)\n  [r, xs.len()]\nend\nf([1, 2, 3])",
+        "def f(xs: [int])\n  let seen = []\n  xs.each(|x| seen << x * x)\n  seen\nend\nf([1, 2, 3])",
+        // Errors in the closure: same message and call stack.
+        "def f(xs: [int]): [int] = xs.map(|x| 12 / x)\nf([1, 2, 0, 4])",
+        "def f(xs: [int]): [int] = xs.map(|x| x * 4611686018427387904)\nf([0, 1, 2])",
+        "def g(x: int): int = 10 / x\ndef f(xs: [int]): [int] = xs.map(|x| g(x))\nf([1, 0])",
+        // Deep recursion through `map`.
+        "def down(n: int): int = if n == 0 then 0 else [n].map(|x| down(x - 1))[0] + 1 end\ndown(30000)",
+        "def down(n: int): int = if n == 0 then 0 else [n].map(|x| down(x - 1))[0] + 1 end\ndown(300)",
+        // The closure given as an argument, and a closure in a variable.
+        "def apply(xs: [int], f): [int] = xs.map(f)\n[apply([1, 2], |x| x + 1), apply([1, 2], |x| x * 10)]",
+        "def f(xs: [int]): int\n  let sq = |x| x * x\n  xs.map(sq).len() + xs.filter(sq).len()\nend\nf([1, 2, 3])",
+    ] {
+        same(src);
+    }
+}
+
+#[test]
 fn hashes_records_tuples_in_native_code() {
     // Done by the interpreter's code from native code: same results and errors.
     for src in [

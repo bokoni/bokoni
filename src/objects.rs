@@ -128,6 +128,17 @@ pub(crate) struct Syms {
     /// `len` (read by the JIT).
     #[cfg_attr(not(any(feature = "jit", feature = "wasm-jit")), allow(dead_code))]
     pub len: Symbol,
+    /// `map`, `filter`, `each`, `any`, `all` (read by the JIT).
+    #[cfg_attr(not(any(feature = "jit", feature = "wasm-jit")), allow(dead_code))]
+    pub map: Symbol,
+    #[cfg_attr(not(any(feature = "jit", feature = "wasm-jit")), allow(dead_code))]
+    pub filter: Symbol,
+    #[cfg_attr(not(any(feature = "jit", feature = "wasm-jit")), allow(dead_code))]
+    pub each: Symbol,
+    #[cfg_attr(not(any(feature = "jit", feature = "wasm-jit")), allow(dead_code))]
+    pub any: Symbol,
+    #[cfg_attr(not(any(feature = "jit", feature = "wasm-jit")), allow(dead_code))]
+    pub all: Symbol,
     pub message: Symbol,
     pub error: Symbol,
 }
@@ -142,6 +153,11 @@ impl Syms {
             values: i.intern("values"),
             from: i.intern("from"),
             len: i.intern("len"),
+            map: i.intern("map"),
+            filter: i.intern("filter"),
+            each: i.intern("each"),
+            any: i.intern("any"),
+            all: i.intern("all"),
             message: i.intern("message"),
             error: i.intern("Error"),
         }

@@ -51,6 +51,10 @@ const PROGRAMS: &[(&str, &str)] = &[
         "let xs = (0...100000).to_list()\nxs.map(|x| x * 2).filter(|x| x % 3 == 0).sum()",
     ),
     (
+        "map / filter in a typed function (100 k, 10 passes)",
+        "def run(xs: [int], k: int): int\n  let t = 0\n  for r in 0...10\n    t += xs.map(|x| x * k).filter(|x| x % 3 == 0).len()\n  end\n  t\nend\nrun((0...100000).to_list(), 2)",
+    ),
+    (
         "closures and counter (300 k calls)",
         "def counter()\n  let n = 0\n  || n += 1\nend\nlet c = counter()\nlet last = 0\nfor i in 0...300000\n  last = c()\nend\nlast",
     ),

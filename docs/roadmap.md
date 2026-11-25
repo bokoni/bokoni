@@ -498,11 +498,19 @@ namespaces, `trait` for shared behavior.
       `map` / `filter` / `sum` over 100 k elements: 9.4 ms → 4.8 ms natively, 11.5 ms
       → 5.4 ms in Chrome
 
+- [x] `map`, `filter`, `each`, `any`, `all` in typed code over a list of `int`,
+      `float` or `bool`, the closure known (made just before, in a variable, given as
+      an argument): its typed code called on each element by a helper (`bk_each`),
+      without the interpreter; the list not copied when the closure cannot change one;
+      a result of another type or code no longer in place, the rest through the
+      interpreter (nothing redone). `map` then `filter` over 100 k elements, 10 times
+      in a typed function: 112 ms interpreted, 28 ms natively (about 45 ms through the
+      built-ins); in Chrome, 153 ms → 34 ms
+
 ### Next
 
-- [ ] Built-ins over lists in typed code (`xs.map(|x| …)` in a typed function): a loop
-      in native code calling the closure directly, rather than the interpreter's
-      built-in (which copies the list and calls through Rust on each element)
+- [ ] The same loop in native code (no call through Rust per element, about 12 ns
+      now), the closure inlined when small
 - [ ] WebAssembly backend: typed code 4 to 6 times slower than a module written by hand
       (`fib(25)`: 1.0 ms against 0.2 ms in phase 0): addresses converted at each
       access, values kept in locals the translation could merge
