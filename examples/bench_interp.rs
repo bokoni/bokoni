@@ -59,6 +59,10 @@ const PROGRAMS: &[(&str, &str)] = &[
         "def run(n: int): float\n  let k = 0.5\n  let f = |x: int| x * k\n  let t = 0.0\n  for i in 0...n\n    t += f(i)\n  end\n  t\nend\nrun(300000)",
     ),
     (
+        "a closure given as an argument (300 k calls)",
+        "def apply(f, n: int): int\n  let t = 0\n  for i in 0...n\n    t += f(i)\n  end\n  t\nend\napply(|x| x * 3, 300000)",
+    ),
+    (
         "objects: construction and fields (100 k)",
         "type P\n  x: int = 0\n  y: int = 0\nend\nlet s = 0\nfor i in 0...100000\n  let p = P(x: i, y: 2)\n  s += p.x + p.y\nend\ns",
     ),

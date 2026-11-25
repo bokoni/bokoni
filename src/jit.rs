@@ -56,12 +56,13 @@
 //!   its cell. A function's own cells are in its native frame (created on entry, dropped
 //!   on exit, given to the interpreter on a resumption); its lambdas are built by a
 //!   helper (`bk_closure`).
-//! - A closure called directly: one in a global, or one of the function's lambdas in a
-//!   register that holds no other (`lambda_regs`: `let inc = || c += 1`), checked when
-//!   calling (`bk_closure_env`), inlined if small and capturing nothing. Its captured
-//!   variables are typed as guesses, checked on every read: from the values of the
-//!   closure in the global, or from what the function writes into its cells
-//!   (`lambda_env`).
+//! - A closure called directly: one in a global, one of the function's lambdas in a
+//!   register that holds no other (`lambda_regs`: `let inc = || c += 1`), or the one a
+//!   parameter was given by the call that compiles the function (a parameter of a
+//!   function type is any value); checked when calling (`bk_closure_env`), inlined if
+//!   small and capturing nothing. Its captured variables are typed as guesses, checked
+//!   on every read: from the values of the closure, or from what the function writes
+//!   into its cells (`lambda_env`).
 //!
 //! Internal calling convention: `fn(ctx, params…) -> (status, result)`, status 0 = success,
 //! 1 = error (described in `ctx`). Each function also has an entry point for Rust:
@@ -1873,7 +1874,7 @@ fn guess_ret(p: &Proto, globals: &Globals, len: crate::intern::Symbol, env: &[Va
         return;
     }
     p.ret_guess.set(Some(RegTy::Value));
-    let Some(plan) = analyze(p, None, globals, len, env.to_vec()) else {
+    let Some(plan) = analyze(p, None, globals, len, env.to_vec(), &[]) else {
         return;
     };
     let mut guess = None;
@@ -2014,7 +2015,10 @@ pub(crate) fn by_ref(params: &[RegTy]) -> Option<u64> {
 
 /// Annotation whose values are handled as values of any type in native code.
 fn any_value(t: &RtType) -> bool {
-    matches!(t, RtType::Any | RtType::Optional(_) | RtType::Union(_))
+    matches!(
+        t,
+        RtType::Any | RtType::Optional(_) | RtType::Union(_) | RtType::Fn
+    )
 }
 
 fn value_jty(anns: &mut Vec<RtType>, t: &RtType) -> JTy {
@@ -2252,8 +2256,11 @@ struct Analysis<'a> {
     /// Values of the captured variables when compiled (empty: unknown).
     env: Vec<Value>,
     steps: crate::intern::FxHashSet<usize>,
-    /// See `lambda_regs`.
-    lambdas: FxHashMap<Reg, u32>,
+    /// Registers holding a closure of a known function, called directly (checked when
+    /// calling): see `lambda_regs`; and a parameter given a closure on the call that
+    /// compiles the function (`args`). With the values its captured variables are typed
+    /// from (`lambda_env`, the closure's).
+    lambdas: FxHashMap<Reg, (Rc<Proto>, Vec<Value>)>,
 }
 
 /// Function compiled and called directly; for a method, the type of `self` it is
@@ -2852,8 +2859,7 @@ impl Analysis<'_> {
                                 global_env(self.globals, slot),
                             ),
                             _ => {
-                                let child = p.children[*self.lambdas.get(f)? as usize].clone();
-                                let env = lambda_env(p, &child);
+                                let (child, env) = self.lambdas.get(f)?.clone();
                                 (child, true, env)
                             }
                         };
@@ -3077,12 +3083,15 @@ fn lambda_regs(p: &Proto) -> FxHashMap<Reg, u32> {
         .collect()
 }
 
+/// `args`: the registers of a call of `p` (its parameters) when compiled for that call,
+/// otherwise empty.
 fn analyze(
     p: &Proto,
     this: Option<Rc<crate::objects::TypeInfo>>,
     globals: &Globals,
     len: crate::intern::Symbol,
     env: Vec<Value>,
+    args: &[Value],
 ) -> Option<Plan> {
     let (_, ret) = native_sig(p)?;
     let method = p.kind == ProtoKind::Method;
@@ -3109,7 +3118,31 @@ fn analyze(
         global_objs: FxHashMap::default(),
         env,
         steps: Default::default(),
-        lambdas: lambda_regs(p),
+        lambdas: lambda_regs(p)
+            .into_iter()
+            .map(|(r, c)| {
+                let child = p.children[c as usize].clone();
+                let env = lambda_env(p, &child);
+                (r, (child, env))
+            })
+            .chain(
+                p.params
+                    .iter()
+                    .filter_map(|prm| match args.get(prm.reg as usize)? {
+                        Value::Function(f) => match &**f {
+                            Function::Script(c) => Some((
+                                prm.reg,
+                                (
+                                    c.proto.clone(),
+                                    c.upvals.iter().map(|u| u.borrow().clone()).collect(),
+                                ),
+                            )),
+                            _ => None,
+                        },
+                        _ => None,
+                    }),
+            )
+            .collect(),
         this: this.clone(),
     };
     // Typed IR registers: their type does not change.
@@ -3758,13 +3791,16 @@ impl Jit {
     }
 
     /// Compiles `root` (and the functions it calls) if possible; for a method, `this` is
-    /// the class that declares it. Updates the JIT state of every function encountered.
+    /// the class that declares it; `args`, the registers of the call that compiles it (a
+    /// closure given as an argument is then called directly, checked). Updates the JIT
+    /// state of every function encountered.
     pub fn compile(
         &mut self,
         root: &Rc<Proto>,
         this: Option<Rc<crate::objects::TypeInfo>>,
         globals: &mut Globals,
         env: &[crate::vm::Cell],
+        args: &[Value],
     ) {
         // 1. Functions reachable through direct calls, and their analysis.
         let mut order: Vec<Rc<Proto>> = Vec::new();
@@ -3808,7 +3844,8 @@ impl Jit {
                 guessed
             };
             guess_ret(&p, globals, self.len_sym, &env);
-            let plan = analyze(&p, this, globals, self.len_sym, env);
+            let args = if Rc::ptr_eq(&p, root) { args } else { &[] };
+            let plan = analyze(&p, this, globals, self.len_sym, env, args);
             if let Some(plan) = &plan {
                 todo.extend(plan.targets.values().cloned());
             }
@@ -4113,8 +4150,14 @@ impl Jit {
             // (Not a call the analysis left to the interpreter: an argument of any type.)
             if !plan.boxed.contains(k)
                 && inlinable(&t.proto, p)
-                && let Some(qp) =
-                    analyze(&t.proto, t.this.clone(), globals, self.len_sym, Vec::new())
+                && let Some(qp) = analyze(
+                    &t.proto,
+                    t.this.clone(),
+                    globals,
+                    self.len_sym,
+                    Vec::new(),
+                    &[],
+                )
             {
                 inlines.insert(*k, (t.proto.clone(), qp));
             }
@@ -6422,15 +6465,19 @@ impl Jit {
             (*ctx).depth = depth as i64;
             (*ctx).max_depth = limit as i64;
             (*ctx).err = -1;
-            (*ctx).traces.clear();
             (*ctx).rt = rt;
-            (*ctx).pending = None;
+            // (Left empty by `take_error`; not dropped on every call.)
+            if !(*ctx).traces.is_empty() || (*ctx).pending.is_some() {
+                (*ctx).traces.clear();
+                (*ctx).pending = None;
+            }
             (*ctx).env = env.as_ptr();
             let mut out = 0u64;
-            // Object or list returned: written directly into `result`.
-            let mut result = Value::Nil;
+            // Object or list returned: written directly into `result` (only then a value,
+            // not dropped on every call of a function returning a simple one).
+            let mut result = std::mem::MaybeUninit::<Value>::uninit();
             let out_ptr = match ret {
-                RegTy::Value => &mut result as *mut Value as *mut u64,
+                RegTy::Value => result.write(Value::Nil) as *mut Value as *mut u64,
                 _ => &mut out as *mut u64,
             };
             // `entry` is an entry point generated by `define_entry` with this signature;
@@ -6438,16 +6485,19 @@ impl Jit {
             let f: extern "C" fn(*mut JitCtx, *const u64, *mut u64) -> i32 =
                 std::mem::transmute(entry);
             let status = f(ctx, buf.as_ptr(), out_ptr);
-            if status == 2 {
-                return Ok((*ctx).returned.take().unwrap_or(Value::Nil));
-            }
             if status == 0 {
                 return Ok(match ret {
                     RegTy::Int => Value::Int(out as i64),
                     RegTy::Float => Value::Float(f64::from_bits(out)),
                     RegTy::Bool => Value::Bool(out & 1 == 1),
-                    RegTy::Value => result,
+                    RegTy::Value => result.assume_init(),
                 });
+            }
+            if ret == RegTy::Value {
+                result.assume_init_drop();
+            }
+            if status == 2 {
+                return Ok((*ctx).returned.take().unwrap_or(Value::Nil));
             }
             Err(take_error(&*jit, ctx))
         }
@@ -6473,7 +6523,12 @@ unsafe fn take_error(jit: &Jit, ctx: *mut JitCtx) -> Error {
                 e
             }
         };
-        for &t in (*ctx).traces.iter().take(16) {
+        // (At most 16 calls in all, as the interpreter keeps: an error of a resumption
+        // already has its own.)
+        for &t in &(*ctx).traces {
+            if e.trace.len() >= 16 {
+                break;
+            }
             let t = &jit.traces[t as usize];
             e.trace.push((t.name.to_string(), t.span));
         }

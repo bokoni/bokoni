@@ -32,6 +32,16 @@ pub struct Closure {
     pub ctx: Rc<[u32]>,
 }
 
+/// The function a built-in calls on each element (`Runtime::call_each`).
+#[derive(Default)]
+pub(crate) struct Repeated {
+    /// Its typed copy for the elements, compiled.
+    #[cfg_attr(not(any(feature = "jit", feature = "wasm-jit")), allow(dead_code))]
+    spec: Option<Rc<Proto>>,
+    #[cfg_attr(not(any(feature = "jit", feature = "wasm-jit")), allow(dead_code))]
+    tried: bool,
+}
+
 /// Evaluated arguments of a call.
 pub struct CallArgs {
     pub pos: Vec<Value>,
@@ -1461,6 +1471,66 @@ impl Runtime {
         }
     }
 
+    /// `f(a)` for each element of a built-in (`map`, `filter`…): after the first call, the
+    /// typed native code of `f` (a closure) is kept in `rep` and called directly while
+    /// the elements are of its parameter's type and the code is still in place.
+    pub(crate) fn call_each(&mut self, f: &Value, a: Value, span: Span, rep: &mut Repeated) -> R {
+        #[cfg(not(any(feature = "jit", feature = "wasm-jit")))]
+        let _ = rep;
+        #[cfg(any(feature = "jit", feature = "wasm-jit"))]
+        {
+            if let Some(spec) = &rep.spec
+                && let Value::Function(func) = f
+                && let Function::Script(c) = &**func
+                && self.depth + 1 < self.max_depth
+            {
+                let code = match &*spec.jit.borrow() {
+                    JitState::Native(code)
+                        if matches!(
+                            (code.params.first(), &a),
+                            (Some(RegTy::Int), Value::Int(_))
+                                | (Some(RegTy::Float), Value::Float(_))
+                                | (Some(RegTy::Bool), Value::Bool(_))
+                        ) =>
+                    {
+                        Some((code.entry, code.ret))
+                    }
+                    _ => None,
+                };
+                if let Some((entry, ret)) = code {
+                    let jit: *mut native::Jit = self.jit.as_mut().expect("compiled code");
+                    let (depth, max) = (self.depth + 1, self.max_depth);
+                    // SAFETY: as in `native_fast`.
+                    let r = unsafe {
+                        native::Jit::call(jit, self, entry, 1, 0, ret, [&a], &c.upvals, depth, max)
+                    };
+                    let spec = spec.clone();
+                    return r.map_err(|e| self.traced(e, &spec, span));
+                }
+            }
+            if !rep.tried
+                && self.jit_enabled
+                && let Value::Function(func) = f
+                && let Function::Script(c) = &**func
+                && c.proto.params.len() == 1
+            {
+                rep.tried = true;
+                let arg = a.clone();
+                let r = self.call1(f, a, span);
+                let spec = if c.proto.untyped() {
+                    untyped_spec(&c.proto, |k| (k == 0).then_some(&arg))
+                } else {
+                    Some(c.proto.clone())
+                };
+                rep.spec = spec.filter(|p| {
+                    matches!(&*p.jit.borrow(), JitState::Native(code) if code.params.len() == 1)
+                });
+                return r;
+            }
+        }
+        self.call1(f, a, span)
+    }
+
     /// Direct call of the typed native code of `proto`, already compiled, when the
     /// arguments are of exactly its native types (`int`, `float`, `bool`; `this` first for
     /// a method): no frame, no conversion. `None`: general path (which also produces the
@@ -1538,7 +1608,7 @@ impl Runtime {
             return None;
         }
         let method = match proto.kind {
-            ProtoKind::Function => false,
+            ProtoKind::Function | ProtoKind::Lambda => false,
             ProtoKind::Method if matches!(regs[0], Value::Object(_)) => true,
             _ => return None,
         };
@@ -1591,7 +1661,7 @@ impl Runtime {
             }
             let jit = self.jit.as_mut()?;
             jit.len_sym = self.syms.len;
-            jit.compile(proto, this, &mut self.globals, upvals);
+            jit.compile(proto, this, &mut self.globals, upvals, regs);
         }
         let (entry, n, by_ref, ret) = match &*proto.jit.borrow() {
             JitState::Native(code) => (
@@ -2318,7 +2388,8 @@ fn untyped_spec<'a>(
         (RtType::Int, Value::Int(_))
         | (RtType::Float, Value::Float(_))
         | (RtType::Bool, Value::Bool(_))
-        | (RtType::Str, Value::Str(_)) => true,
+        | (RtType::Str, Value::Str(_))
+        | (RtType::Fn, Value::Function(_)) => true,
         (RtType::List(e), Value::List(l)) => l
             .borrow()
             .first()
@@ -2344,6 +2415,9 @@ fn untyped_spec<'a>(
             Some(t) => Some((*t.ty).clone()),
             None => match arg(k)? {
                 Value::Str(_) => Some(RtType::Str),
+                // A function: any value in native code (`f(x)` called directly if it is
+                // the closure given to the call that compiles it).
+                Value::Function(_) => Some(RtType::Fn),
                 Value::List(l) => Some(RtType::List(Box::new(simple_ty(l.borrow().first()?)?))),
                 v => simple_ty(v),
             },
@@ -2363,6 +2437,7 @@ fn fits_params(spec: &Proto, regs: &[Value]) -> bool {
             | (RtType::Bool, Value::Bool(_)) => true,
             (RtType::List(e), Value::List(l)) => l.borrow().iter().all(|x| fits(x, e)),
             (RtType::Str, Value::Str(_)) | (RtType::Any, _) => true,
+            (RtType::Fn, Value::Function(_)) => true,
             _ => false,
         }
     }

@@ -583,10 +583,17 @@ impl Runtime {
             }
             (M::Sum, Value::List(l)) => {
                 n(0)?;
-                let items = l.borrow().clone();
+                // (`binary` runs no script code: the list cannot change meanwhile.)
+                let items = l.borrow();
                 let mut acc = Value::Int(0);
-                for v in items {
-                    acc = self.binary(BinOp::Add, acc, v, span)?;
+                for v in items.iter() {
+                    acc = match (&acc, v) {
+                        (Value::Int(a), Value::Int(b)) if let Some(s) = a.checked_add(*b) => {
+                            Value::Int(s)
+                        }
+                        (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
+                        _ => self.binary(BinOp::Add, acc, v.clone(), span)?,
+                    };
                 }
                 Ok(acc)
             }
@@ -622,29 +629,30 @@ impl Runtime {
                 n(1)?;
                 let f = args[0].clone();
                 let mut out = Vec::new();
+                let rep = &mut crate::vm::Repeated::default();
                 for v in iter_lazy(&recv) {
                     match m {
-                        M::Map => out.push(self.call1(&f, v, span)?),
+                        M::Map => out.push(self.call_each(&f, v, span, rep)?),
                         M::Filter => {
-                            if self.call1(&f, v.clone(), span)?.truthy() {
+                            if self.call_each(&f, v.clone(), span, rep)?.truthy() {
                                 out.push(v);
                             }
                         }
                         M::Each => {
-                            self.call1(&f, v, span)?;
+                            self.call_each(&f, v, span, rep)?;
                         }
                         M::Find => {
-                            if self.call1(&f, v.clone(), span)?.truthy() {
+                            if self.call_each(&f, v.clone(), span, rep)?.truthy() {
                                 return Ok(v);
                             }
                         }
                         M::Any => {
-                            if self.call1(&f, v, span)?.truthy() {
+                            if self.call_each(&f, v, span, rep)?.truthy() {
                                 return Ok(Value::Bool(true));
                             }
                         }
                         _ => {
-                            if !self.call1(&f, v, span)?.truthy() {
+                            if !self.call_each(&f, v, span, rep)?.truthy() {
                                 return Ok(Value::Bool(false));
                             }
                         }

@@ -485,12 +485,24 @@ namespaces, `trait` for shared behavior.
       writes into its cells), their result guessed too. Natively, a counter closure
       (300 k calls) 25 ms → 1.7 ms, a lambda of the function 28 ms → 1.2 ms; in Chrome,
       27.6 ms → 2.9 ms
+- [x] Closures given as arguments (`def apply(f, n)`, `f: (int): int`): a parameter of
+      a function type is any value in typed code, and the closure given to the call
+      that compiles the function is called directly (checked when calling: another
+      closure resumes in the interpreter): 300 k calls, 22 ms → 1.0 ms natively, 27 ms →
+      2.8 ms in Chrome
+- [x] Closures called by built-ins (`map`, `filter`, `each`, `find`, `any`, `all`):
+      compiled to typed code (lambdas were left to baseline code), their native code
+      found once per call of the built-in and called on each element; `sum` over the
+      list without copying it, integers and floats added in place (10 ns → 1.5 ns per
+      element); an error's call stack kept at 16 calls through resumptions too.
+      `map` / `filter` / `sum` over 100 k elements: 9.4 ms → 4.8 ms natively, 11.5 ms
+      → 5.4 ms in Chrome
 
 ### Next
 
-- [ ] Closures called by built-ins (`xs.map(|x| …)`, `filter`, `sum`…) and closures
-      received as arguments (`def apply(f, x)`): still called through the interpreter
-      (`map` / `filter` over 100 k elements: 11.5 ms natively, ×1.2)
+- [ ] Built-ins over lists in typed code (`xs.map(|x| …)` in a typed function): a loop
+      in native code calling the closure directly, rather than the interpreter's
+      built-in (which copies the list and calls through Rust on each element)
 - [ ] WebAssembly backend: typed code 4 to 6 times slower than a module written by hand
       (`fib(25)`: 1.0 ms against 0.2 ms in phase 0): addresses converted at each
       access, values kept in locals the translation could merge

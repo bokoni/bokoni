@@ -25,7 +25,9 @@ Bokoni writes machine code into memory and jumps to it. Two tiers:
   `bool`, a `type`, a list of them…) is compiled on its first call into straight native
   code: values in machine registers, fields read at their offset. The functions and
   closures it calls (a closure in a global, a lambda of the function:
-  `let inc = || c += 1`) are called directly, small ones inlined. 14 to 54 times faster
+  `let inc = || c += 1`, the closure given as an argument to the call that compiled it)
+  are called directly, small ones inlined; a built-in (`map`, `filter`…) calls the
+  closure's typed code. 14 to 54 times faster
   than the interpreter (`fib(25)`: 0.5 ms). Parameters without annotation get a copy
   typed for the arguments; a result without one is guessed (`guess_ret`: the type every
   `return` gives, the calls assumed to return their own guess), `def fib(n) = …`
@@ -105,13 +107,14 @@ Measured in Chrome (V8), the interpreter against the compiled code of the playgr
 | sum of a list of 200,000 `int`, twice | 14.4 ms | 2.7 ms |
 | `type` objects created and read, 100,000 | 15.4 ms | 5.0 ms |
 | dot product of two `type` objects, 1 M | 242 ms | 28 ms |
-| `map` / `filter` over 100,000 elements | 14.9 ms | 11.5 ms |
+| `map` / `filter` over 100,000 elements | 14.9 ms | 5.4 ms |
 | string interpolation, 100,000 | 5.7 ms | 5.3 ms |
 | a closure of the function called 300,000 times | 27.6 ms | 2.9 ms |
 | the same, reading a captured `float` | 34.6 ms | 2.8 ms |
+| a closure given as an argument, 300,000 calls | 27.0 ms | 2.8 ms |
 
-`map` / `filter` gain little, natively too (11.5 ms → 9.4 ms): a built-in calls its
-closure through the interpreter.
+A built-in (`map`, `filter`…) is the interpreter's code: it calls the closure's typed
+code on each element, the list itself copied first (the closure may change it).
 
 Tested under Bun ([`playground/web/test/`](../playground/web/test)), each program run
 interpreted, compiled as usual, and with every function compiled from its first call,

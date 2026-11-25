@@ -1239,6 +1239,32 @@ fn lambdas_of_a_function_are_called_directly() {
 }
 
 #[test]
+fn closures_given_as_arguments_and_to_built_ins() {
+    for src in [
+        // The closure given to the call that compiles the function: called directly.
+        "def apply(f, n: int): int\n  let t = 0\n  for i in 0...n\n    t += f(i)\n  end\n  t\nend\napply(|x| x * 2, 1000)",
+        "def apply(f: (int): int, n: int): int\n  let t = 0\n  for i in 0...n\n    t += f(i)\n  end\n  t\nend\nlet k = 3\n[apply(|x| x * k, 100), apply(|x| x - k, 100)]",
+        // Another closure, a built-in, a type, a closure of another result type.
+        "def apply(f, n)\n  let t = []\n  for i in 0...n\n    t << f(i)\n  end\n  t\nend\ntype P\n  x: int = 0\nend\n[apply(|x| x + 1, 3), apply(|x| x * 0.5, 3), apply(|x| \"#{x}\", 2), apply(print, 2), apply(|x| P(x: x), 2).len()]",
+        // Reassigned, recursive, capturing a variable it changes.
+        "def apply(f, n: int): int\n  let t = 0\n  for i in 0...n\n    t += f(i)\n    f = |x| x + 100 if i == 5\n  end\n  t\nend\napply(|x| x, 10)",
+        "def rec(f, n: int): int = if n == 0 then 0 else f(n) + rec(f, n - 1) end\nrec(|x| x * x, 100)",
+        "def run(): int\n  let seen = 0\n  def_each(|x| seen += x, 10)\n  seen\nend\ndef def_each(f, n: int)\n  for i in 0...n\n    f(i)\n  end\nend\nrun()",
+        // Errors in the closure: same message and call stack.
+        "def apply(f, n: int): int\n  let t = 0\n  for i in 0...n\n    t += f(i)\n  end\n  t\nend\napply(|x| 10 / (x - 5), 10)",
+        "def apply(f, n: int): int = if n == 0 then f(0) else apply(f, n - 1) end\napply(|x| x, 100000)",
+        // Built-ins calling a compiled closure on each element.
+        "let xs = (0...1000).to_list()\n[xs.map(|x| x * 2).sum(), xs.filter(|x| x % 3 == 0).len(), xs.find(|x| x > 500), xs.any(|x| x == 7), xs.all(|x| x >= 0)]",
+        "let xs = [1, 2, 3.5, 4]\n[xs.map(|x| x * 2), xs.map(|x: int| x * 2)]",
+        "[1, 2, 0, 4].map(|x| 12 / x)",
+        "[0.5, 1.5].sum() + [1, 2.5].sum() + [9223372036854775807, 1].sum()",
+        "let ys = [1, 2, 3]\nys.map(|x| begin ys << x\n x end)",
+    ] {
+        same(src);
+    }
+}
+
+#[test]
 fn hashes_records_tuples_in_native_code() {
     // Done by the interpreter's code from native code: same results and errors.
     for src in [
