@@ -1206,6 +1206,39 @@ fn closures_with_captured_variables() {
 }
 
 #[test]
+fn lambdas_of_a_function_are_called_directly() {
+    for src in [
+        // A counter in a register of the function that made it.
+        "def run(n: int): int\n  let c = 0\n  let inc = || c += 1\n  for i in 0...n\n    inc()\n  end\n  c\nend\nrun(1000)",
+        // Parameters, typed or not (a copy typed for the arguments), a result guessed.
+        "def run(n: int): float\n  let k = 0.5\n  let f = |x: int| x * k\n  let g = |a, b| a * b + 1\n  let t = 0.0\n  for i in 0...n\n    t += f(i) + g(i, 2)\n  end\n  t\nend\nrun(1000)",
+        // A new closure on each turn, its own captured variable.
+        "def run(n: int): int\n  let t = 0\n  for i in 0...n\n    let j = i * 2\n    let f = || j + 1\n    t += f()\n  end\n  t\nend\nrun(100)",
+        // A register given another lambda: not called directly.
+        "def run(n: int): int\n  let f = |x: int| x + 1\n  if n > 5 then f = |x: int| x * 2 end\n  let t = 0\n  for i in 0...n\n    t += f(i)\n  end\n  t\nend\n[run(3), run(10)]",
+        // A result of another type (resumed in the interpreter, after the call).
+        "def run(n: int)\n  let f = |x: int| if x > 50 then \"big\" else x end\n  let r = []\n  for i in 0...n\n    r << f(i)\n  end\n  r.last()\nend\nrun(100)",
+        // Errors in the lambda: same message and call stack.
+        "def run(d: int): int\n  let f = |x: int| x / d\n  let t = 0\n  for i in 0...10\n    t += f(i)\n  end\n  t\nend\nrun(0)",
+        "def run(): int\n  let f = |n: int| if n == 0 then 0 else 1 + f(n - 1) end\n  f(100000)\nend\nrun()",
+        // Called before the variable it reads is initialized.
+        "def run(): int\n  let f = || y * 2\n  let r = f()\n  let y = 21\n  r\nend\nrun()",
+        // Given to a built-in and called directly.
+        "def run(n: int): int\n  let sq = |x: int| x * x\n  let t = 0\n  for i in 0...n\n    t += sq(i)\n  end\n  t + [1, 2, 3].map(sq).sum()\nend\nrun(100)",
+        // Captured variables typed as the function writes them: a guess, checked.
+        "def run(n: int)\n  let c = 0\n  let f = || c = if c > 50 then c + 0.5 else c + 1 end\n  for i in 0...n\n    f()\n  end\n  [c, f()]\nend\nrun(100)",
+        "def run(n: int)\n  let k = 1\n  let f = |x: int| x * k\n  let t = 0\n  for i in 0...n\n    t += f(i)\n    k = 2.5 if i == 10\n  end\n  t\nend\nrun(100)",
+        "def run(n: int)\n  let k = 1\n  let f = |x: int| x + k\n  let t = 0\n  for i in 0...n\n    t += f(i)\n  end\n  k = \"s\"\n  [t, f(1)]\nend\nrun(100)",
+        // Captured by a lambda of a lambda.
+        "def run(n: int): int\n  let k = 3\n  let mk = || |x: int| x * k\n  let t = 0\n  for i in 0...n\n    t += mk()(i)\n  end\n  t\nend\nrun(100)",
+        // Closures of the same lambda in globals, captured variables of other types.
+        "def counter(step)\n  let n = 0\n  || n += step\nend\nlet a = counter(1)\nlet b = counter(0.5)\nlet t = 0\nfor i in 0...100\n  t += a() + b()\nend\n[t, a(), b()]",
+    ] {
+        same(src);
+    }
+}
+
+#[test]
 fn hashes_records_tuples_in_native_code() {
     // Done by the interpreter's code from native code: same results and errors.
     for src in [

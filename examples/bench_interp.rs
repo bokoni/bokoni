@@ -55,6 +55,10 @@ const PROGRAMS: &[(&str, &str)] = &[
         "def counter()\n  let n = 0\n  || n += 1\nend\nlet c = counter()\nlet last = 0\nfor i in 0...300000\n  last = c()\nend\nlast",
     ),
     (
+        "a lambda of the function, called (300 k)",
+        "def run(n: int): float\n  let k = 0.5\n  let f = |x: int| x * k\n  let t = 0.0\n  for i in 0...n\n    t += f(i)\n  end\n  t\nend\nrun(300000)",
+    ),
+    (
         "objects: construction and fields (100 k)",
         "type P\n  x: int = 0\n  y: int = 0\nend\nlet s = 0\nfor i in 0...100000\n  let p = P(x: i, y: 2)\n  s += p.x + p.y\nend\ns",
     ),

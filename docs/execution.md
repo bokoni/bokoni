@@ -23,7 +23,9 @@ Bokoni writes machine code into memory and jumps to it. Two tiers:
 
 - **Typed code**: a function whose parameters and return are annotated (`int`, `float`,
   `bool`, a `type`, a list of them…) is compiled on its first call into straight native
-  code: values in machine registers, fields read at their offset. 14 to 54 times faster
+  code: values in machine registers, fields read at their offset. The functions and
+  closures it calls (a closure in a global, a lambda of the function:
+  `let inc = || c += 1`) are called directly, small ones inlined. 14 to 54 times faster
   than the interpreter (`fib(25)`: 0.5 ms). Parameters without annotation get a copy
   typed for the arguments; a result without one is guessed (`guess_ret`: the type every
   `return` gives, the calls assumed to return their own guess), `def fib(n) = …`
@@ -96,19 +98,20 @@ Measured in Chrome (V8), the interpreter against the compiled code of the playgr
 
 | Program | Interpreter | Compiled |
 |---|---:|---:|
-| recursive `fib(25)` | 27.1 ms | 1.3 ms |
-| recursive `fib(30)` | 301 ms | 4.4 ms |
-| the same, without annotations | 314 ms | 4.7 ms |
-| `float`: harmonic series, 1 M iterations | 27.8 ms | 0.9 ms |
-| sum of a list of 200,000 `int`, twice | 13.7 ms | 2.6 ms |
-| `type` objects created and read, 100,000 | 14.8 ms | 4.9 ms |
-| dot product of two `type` objects, 1 M | 230 ms | 28 ms |
-| `map` / `filter` over 100,000 elements | 14.3 ms | 11.4 ms |
-| string interpolation, 100,000 | 5.7 ms | 5.0 ms |
-| a closure called 300,000 times | 29.3 ms | 30.2 ms |
+| recursive `fib(25)` | 28.2 ms | 1.0 ms |
+| recursive `fib(30)` | 305 ms | 4.3 ms |
+| the same, without annotations | 321 ms | 4.5 ms |
+| `float`: harmonic series, 1 M iterations | 28.1 ms | 0.8 ms |
+| sum of a list of 200,000 `int`, twice | 14.4 ms | 2.7 ms |
+| `type` objects created and read, 100,000 | 15.4 ms | 5.0 ms |
+| dot product of two `type` objects, 1 M | 242 ms | 28 ms |
+| `map` / `filter` over 100,000 elements | 14.9 ms | 11.5 ms |
+| string interpolation, 100,000 | 5.7 ms | 5.3 ms |
+| a closure of the function called 300,000 times | 27.6 ms | 2.9 ms |
+| the same, reading a captured `float` | 34.6 ms | 2.8 ms |
 
-The closure gains nothing natively either (21 ms → 19 ms): a call of a closure value goes
-through the interpreter.
+`map` / `filter` gain little, natively too (11.5 ms → 9.4 ms): a built-in calls its
+closure through the interpreter.
 
 Tested under Bun ([`playground/web/test/`](../playground/web/test)), each program run
 interpreted, compiled as usual, and with every function compiled from its first call,

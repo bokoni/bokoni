@@ -478,6 +478,28 @@ namespaces, `trait` for shared behavior.
 - [x] Typed JIT: a result without annotation guessed (`def fib(n)`: 4.9 ms → 1.1 ms
       natively for `fib(27)`); fixed: a call left to the interpreter was still inlined
       (a panic), a redefinition did not reach the callers of callers
+- [x] Closures called directly by typed code: a lambda of the function in a register
+      that holds no other (`let inc = || c += 1`), checked when calling, inlined if
+      small and capturing nothing; their captured variables typed as guesses, checked
+      on every read (from the values of a closure in a global, from what the function
+      writes into its cells), their result guessed too. Natively, a counter closure
+      (300 k calls) 25 ms → 1.7 ms, a lambda of the function 28 ms → 1.2 ms; in Chrome,
+      27.6 ms → 2.9 ms
+
+### Next
+
+- [ ] Closures called by built-ins (`xs.map(|x| …)`, `filter`, `sum`…) and closures
+      received as arguments (`def apply(f, x)`): still called through the interpreter
+      (`map` / `filter` over 100 k elements: 11.5 ms natively, ×1.2)
+- [ ] WebAssembly backend: typed code 4 to 6 times slower than a module written by hand
+      (`fib(25)`: 1.0 ms against 0.2 ms in phase 0): addresses converted at each
+      access, values kept in locals the translation could merge
+- [ ] wasmtime host: compiling costs about 1 ms and a few million units of fuel per
+      function; compile only after some calls, rather than run short scripts
+      (configurations) interpreted (`jit: 0`)
+- [ ] Size of the playground's module: 1.9 MB (606 KB compressed), most of it
+      Cranelift's IR; parts it does not use could be left out
+- [ ] A trait that includes another one (v0.9)
 
 ## Decisions that commit the JIT
 

@@ -56,6 +56,12 @@
 //!   its cell. A function's own cells are in its native frame (created on entry, dropped
 //!   on exit, given to the interpreter on a resumption); its lambdas are built by a
 //!   helper (`bk_closure`).
+//! - A closure called directly: one in a global, or one of the function's lambdas in a
+//!   register that holds no other (`lambda_regs`: `let inc = || c += 1`), checked when
+//!   calling (`bk_closure_env`), inlined if small and capturing nothing. Its captured
+//!   variables are typed as guesses, checked on every read: from the values of the
+//!   closure in the global, or from what the function writes into its cells
+//!   (`lambda_env`).
 //!
 //! Internal calling convention: `fn(ctx, params…) -> (status, result)`, status 0 = success,
 //! 1 = error (described in `ctx`). Each function also has an entry point for Rust:
@@ -1354,13 +1360,24 @@ extern "C" fn bk_assign_up(
     }
 }
 
-/// Before a direct call of the closure in global `slot`: its captured variables for the
-/// function called (`JitCtx::env`). 0, or 1 if the global no longer holds a closure of
-/// `proto` (resumed in the interpreter).
-extern "C" fn bk_global_env(ctx: *mut JitCtx, slot: u32, proto: *const Proto) -> i32 {
-    // SAFETY: `ctx.rt` is valid; the closure stays in the global during the call.
+/// Before a direct call of the closure in global `slot`, or in `v` (a register of the
+/// caller) if not null: its captured variables for the function called (`JitCtx::env`).
+/// 0, or 1 if it is not a closure of `proto` (resumed in the interpreter).
+extern "C" fn bk_closure_env(
+    ctx: *mut JitCtx,
+    slot: u32,
+    v: *const Value,
+    proto: *const Proto,
+) -> i32 {
+    // SAFETY: `ctx.rt` is valid; `v` is a slot of the caller's frame. The closure stays
+    // in the global or the register during the call.
     unsafe {
-        match &(*(*ctx).rt).globals.at(slot).value {
+        let v = if v.is_null() {
+            (*(*ctx).rt).globals.at(slot).value.as_ref()
+        } else {
+            Some(&*v)
+        };
+        match v {
             Some(Value::Function(f)) => match &**f {
                 Function::Script(c) if Rc::as_ptr(&c.proto) == proto => {
                     (*ctx).env = c.upvals.as_ptr();
@@ -1847,7 +1864,8 @@ fn guessed(p: &Proto) -> Option<RegTy> {
 /// while being guessed, any value). Its typed code then returns that type, as a typed copy
 /// does (`def fib(n) = …`: no value boxed at each call). A wrong guess costs nothing more
 /// than a resumption: the function returns its value with status 2 (`bk_resume`).
-fn guess_ret(p: &Proto, globals: &Globals, len: crate::intern::Symbol) {
+/// `env`: its captured variables, as for its analysis.
+fn guess_ret(p: &Proto, globals: &Globals, len: crate::intern::Symbol, env: &[Value]) {
     if p.ret.is_some()
         || p.ret_guess.get().is_some()
         || !matches!(p.kind, ProtoKind::Function | ProtoKind::Lambda)
@@ -1855,7 +1873,7 @@ fn guess_ret(p: &Proto, globals: &Globals, len: crate::intern::Symbol) {
         return;
     }
     p.ret_guess.set(Some(RegTy::Value));
-    let Some(plan) = analyze(p, None, globals, len, Vec::new()) else {
+    let Some(plan) = analyze(p, None, globals, len, env.to_vec()) else {
         return;
     };
     let mut guess = None;
@@ -2006,6 +2024,17 @@ fn value_jty(anns: &mut Vec<RtType>, t: &RtType) -> JTy {
         RtType::Str => JTy::Str,
         RtType::List(e) => JTy::List(intern_ann(anns, e)),
         t => jty(prim(t).expect("simple type")),
+    }
+}
+
+/// The values captured by the closure in a global slot (none if it captures nothing).
+fn global_env(globals: &Globals, slot: u32) -> Vec<Value> {
+    match &globals.at(slot).value {
+        Some(Value::Function(f)) => match &**f {
+            Function::Script(c) => c.upvals.iter().map(|u| u.borrow().clone()).collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
     }
 }
 
@@ -2223,6 +2252,8 @@ struct Analysis<'a> {
     /// Values of the captured variables when compiled (empty: unknown).
     env: Vec<Value>,
     steps: crate::intern::FxHashSet<usize>,
+    /// See `lambda_regs`.
+    lambdas: FxHashMap<Reg, u32>,
 }
 
 /// Function compiled and called directly; for a method, the type of `self` it is
@@ -2232,8 +2263,11 @@ struct Target {
     proto: Rc<Proto>,
     this: Option<Rc<crate::objects::TypeInfo>>,
     /// Method: the one declared by the class (`proto` may be its typed copy), checked
-    /// against the object's when calling.
+    /// against the object's when calling. A lambda: the one its closure must be of.
     declared: Option<Rc<Proto>>,
+    /// A lambda: its captured variables as the function that made it writes them (see
+    /// `lambda_env`).
+    env: Vec<Value>,
 }
 
 impl Target {
@@ -2689,6 +2723,7 @@ impl Analysis<'_> {
                         proto: m,
                         this: Some(owner),
                         declared: Some(declared),
+                        env: Vec::new(),
                     },
                 );
                 ret
@@ -2806,8 +2841,23 @@ impl Analysis<'_> {
             Call { f, site, .. } => {
                 let site = &p.calls[*site as usize];
                 match g(*f)? {
-                    JTy::Callee(slot) => {
-                        let mut callee = global_proto(self.globals, slot)?;
+                    // A global function, or a lambda of this function in a register.
+                    ft @ (JTy::Callee(_) | JTy::Boxed) => {
+                        // (Its captured variables: those of the closure in the global, or
+                        // as this function writes them.)
+                        let (declared, lambda, env) = match ft {
+                            JTy::Callee(slot) => (
+                                global_proto(self.globals, slot)?,
+                                false,
+                                global_env(self.globals, slot),
+                            ),
+                            _ => {
+                                let child = p.children[*self.lambdas.get(f)? as usize].clone();
+                                let env = lambda_env(p, &child);
+                                (child, true, env)
+                            }
+                        };
+                        let mut callee = declared.clone();
                         // Parameters not annotated: its copy for the types of the arguments.
                         if callee.untyped() {
                             let anns = &self.anns;
@@ -2853,7 +2903,7 @@ impl Analysis<'_> {
                             callee = callee.specialize(&tys);
                         }
                         // (Its result guessed before its signature is read.)
-                        guess_ret(&callee, self.globals, self.len);
+                        guess_ret(&callee, self.globals, self.len, &env);
                         let (cparams, _) = native_sig(&callee)?;
                         if site.block
                             || !site.named.is_empty()
@@ -2866,7 +2916,8 @@ impl Analysis<'_> {
                             Target {
                                 proto: callee.clone(),
                                 this: None,
-                                declared: None,
+                                env,
+                                declared: lambda.then_some(declared),
                             },
                         );
                         for (k, pt) in cparams.iter().enumerate() {
@@ -2929,6 +2980,7 @@ impl Analysis<'_> {
                                 proto: init.clone(),
                                 this: Some(owner),
                                 declared: Some(init),
+                                env: Vec::new(),
                             },
                         );
                         self.news.insert(key, info);
@@ -2954,6 +3006,77 @@ impl Analysis<'_> {
 }
 
 /// Register types of a compilable function; `None` if it is not compilable.
+/// The captured variables of `child`, a lambda of `p`, for its analysis: a value of the
+/// simple type `p` writes into a cell (`let k = 0.5`) if it always writes that type,
+/// otherwise `nil` (any value). Only a guess, checked on every read.
+fn lambda_env(p: &Proto, child: &Proto) -> Vec<Value> {
+    child
+        .captures
+        .iter()
+        .map(|c| {
+            let crate::ir::Capture::Cell(c) = *c else {
+                return Value::Nil;
+            };
+            let mut tys = p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.instrs)
+                .filter_map(|i| match i {
+                    Instr::SetCell(d, r) if *d == c => Some(p.regs[*r as usize]),
+                    _ => None,
+                });
+            let first = tys.next();
+            match first {
+                Some(t) if tys.all(|u| u == t) => match t {
+                    RegTy::Int => Value::Int(0),
+                    RegTy::Float => Value::Float(0.0),
+                    RegTy::Bool => Value::Bool(false),
+                    _ => Value::Nil,
+                },
+                _ => Value::Nil,
+            }
+        })
+        .collect()
+}
+
+/// Registers that only hold closures of one of the function's lambdas (`let inc = || …`):
+/// written by `Closure(r, child)` only, always the same child. A call of one is direct,
+/// the closure checked when calling (`bk_closure_env`).
+fn lambda_regs(p: &Proto) -> FxHashMap<Reg, u32> {
+    let mut regs: FxHashMap<Reg, Option<u32>> = FxHashMap::default();
+    if p.children.is_empty() {
+        return FxHashMap::default();
+    }
+    for b in &p.blocks {
+        for ins in &b.instrs {
+            if let Instr::Closure(d, c) = ins {
+                let e = regs.entry(*d).or_insert(Some(*c));
+                if *e != Some(*c) {
+                    *e = None;
+                }
+            } else {
+                for w in crate::outline::regs_of(p, ins).1 {
+                    regs.insert(w, None);
+                }
+            }
+        }
+        if let Term::IterNext { dst, .. } = b.term {
+            regs.insert(dst, None);
+        }
+    }
+    let others = p
+        .params
+        .iter()
+        .map(|q| q.reg)
+        .chain(p.handlers.iter().map(|h| h.reg));
+    for r in others {
+        regs.insert(r, None);
+    }
+    regs.into_iter()
+        .filter_map(|(r, c)| Some((r, c?)))
+        .collect()
+}
+
 fn analyze(
     p: &Proto,
     this: Option<Rc<crate::objects::TypeInfo>>,
@@ -2986,6 +3109,7 @@ fn analyze(
         global_objs: FxHashMap::default(),
         env,
         steps: Default::default(),
+        lambdas: lambda_regs(p),
         this: this.clone(),
     };
     // Typed IR registers: their type does not change.
@@ -3319,7 +3443,7 @@ helpers!(
     bk_up_get(_, _, _),
     bk_up_word(_, _, _, _),
     bk_assign_up(_, _, _, _, _),
-    bk_global_env(_, _, _),
+    bk_closure_env(_, _, _, _),
     bk_cells_init(_, _),
     bk_cells_drop(_, _),
     bk_cell_new(_, _),
@@ -3519,7 +3643,11 @@ impl Jit {
                 &[ptr, ptr, types::I32, types::I64, types::I32][..],
                 types::INVALID,
             ),
-            ("bk_global_env", &[ptr, types::I32, ptr][..], types::I32),
+            (
+                "bk_closure_env",
+                &[ptr, types::I32, ptr, ptr][..],
+                types::I32,
+            ),
             ("bk_cells_init", &[ptr, types::I64][..], types::INVALID),
             ("bk_cells_drop", &[ptr, types::I64][..], types::INVALID),
             ("bk_cell_new", &[ptr, types::I32][..], types::INVALID),
@@ -3645,8 +3773,15 @@ impl Jit {
             proto: root.clone(),
             this,
             declared: None,
+            env: Vec::new(),
         }];
-        while let Some(Target { proto: p, this, .. }) = todo.pop() {
+        while let Some(Target {
+            proto: p,
+            this,
+            env: guessed,
+            ..
+        }) = todo.pop()
+        {
             let key = Rc::as_ptr(&p) as usize;
             if plans.contains_key(&key) {
                 continue;
@@ -3665,13 +3800,14 @@ impl Jit {
                 continue;
             }
             // The captured variables of the function called: their types guessed from
-            // their values (checked on every read).
+            // their values, or for a lambda called directly from what the function that
+            // made it writes into them (checked on every read).
             let env: Vec<Value> = if Rc::ptr_eq(&p, root) {
                 env.iter().map(|c| c.borrow().clone()).collect()
             } else {
-                Vec::new()
+                guessed
             };
-            guess_ret(&p, globals, self.len_sym);
+            guess_ret(&p, globals, self.len_sym, &env);
             let plan = analyze(&p, this, globals, self.len_sym, env);
             if let Some(plan) = &plan {
                 todo.extend(plan.targets.values().cloned());
@@ -3879,7 +4015,7 @@ impl Jit {
             up_get_ref,
             up_word_ref,
             set_up_ref,
-            global_env_ref,
+            closure_env_ref,
             cells_init_ref,
             cells_drop_ref,
             cell_new_ref,
@@ -5723,11 +5859,21 @@ impl Jit {
                         build!(bx, *d, None, items, (*start..*start + *n).collect());
                     }
                     // Inlined function: its body here (it is redefined: this code is
-                    // recompiled).
-                    Call { dst, site, .. }
+                    // recompiled). A lambda of this function: the register checked first.
+                    Call { dst, f, site }
                         if inlines.contains_key(&(ins as *const Instr as usize)) =>
                     {
                         let (q, qp) = &inlines[&(ins as *const Instr as usize)];
+                        if tyof!(*f) == Some(JTy::Boxed) {
+                            let target = &plan.targets[&(ins as *const Instr as usize)];
+                            let declared = target.declared.as_ref().ok_or(())?;
+                            let sv = bx.ins().iconst(types::I32, 0);
+                            let vv = bx.use_var(uvar!(*f));
+                            let pv = bx.ins().iconst(types::I64, Rc::as_ptr(declared) as i64);
+                            let call = bx.ins().call(closure_env_ref, &[ctxv, sv, vv, pv]);
+                            let bad = bx.inst_results(call)[0];
+                            bail!(bx, bad);
+                        }
                         let (cparams, _) = native_sig(q).ok_or(())?;
                         let site = &p.calls[*site as usize];
                         let mut args = Vec::new();
@@ -5759,7 +5905,7 @@ impl Jit {
                         bx.def_var(dvar!(*dst), v);
                     }
                     Call { dst, f, site } => {
-                        let Some(JTy::Callee(_)) = tyof!(*f) else {
+                        let Some(ft @ (JTy::Callee(_) | JTy::Boxed)) = tyof!(*f) else {
                             return Err(());
                         };
                         let target = plan
@@ -5769,15 +5915,23 @@ impl Jit {
                         let (fref, q) = callee_refs[&target.key()].clone();
                         let (cparams, cret) = native_sig(&q).ok_or(())?;
                         // A closure: its captured variables, from the global (which must
-                        // still hold it).
-                        if !q.captures.is_empty() {
-                            let Some(JTy::Callee(s)) = tyof!(*f) else {
-                                return Err(());
+                        // still hold it), or from the register (a lambda of this function,
+                        // which must hold one of it: checked even without captures).
+                        if !q.captures.is_empty() || ft == JTy::Boxed {
+                            let (declared, sv, vv) = match ft {
+                                JTy::Callee(s) => (
+                                    global_proto(globals, s).ok_or(())?,
+                                    bx.ins().iconst(types::I32, s as i64),
+                                    bx.ins().iconst(types::I64, 0),
+                                ),
+                                _ => (
+                                    target.declared.clone().ok_or(())?,
+                                    bx.ins().iconst(types::I32, 0),
+                                    bx.use_var(uvar!(*f)),
+                                ),
                             };
-                            let declared = global_proto(globals, s).ok_or(())?;
-                            let sv = bx.ins().iconst(types::I32, s as i64);
                             let pv = bx.ins().iconst(types::I64, Rc::as_ptr(&declared) as i64);
-                            let call = bx.ins().call(global_env_ref, &[ctxv, sv, pv]);
+                            let call = bx.ins().call(closure_env_ref, &[ctxv, sv, vv, pv]);
                             let bad = bx.inst_results(call)[0];
                             bail!(bx, bad);
                         }
