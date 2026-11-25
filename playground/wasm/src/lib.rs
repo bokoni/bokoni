@@ -32,7 +32,7 @@ unsafe extern "C" {
 
 thread_local! {
     static RESULT: RefCell<String> = const { RefCell::new(String::new()) };
-    static JIT: Cell<bool> = const { Cell::new(true) };
+    static JIT: Cell<u32> = const { Cell::new(1) };
     /// The engine of `run_again`, kept from one call to the next.
     static KEPT: RefCell<Option<Engine>> = const { RefCell::new(None) };
 }
@@ -148,7 +148,10 @@ fn engine() -> Engine {
     bokoni::wasm_jit::set_compiler(Some(compile));
     let mut e = Engine::new();
     e.set_max_call_depth(MAX_CALL_DEPTH);
-    e.set_jit(JIT.with(Cell::get));
+    let jit = JIT.with(Cell::get);
+    e.set_jit(jit != 0);
+    e.set_jit_eager(jit >= 2);
+    bokoni::wasm_jit::set_structured(jit != 3);
     e
 }
 
@@ -158,18 +161,31 @@ fn compile(bytes: &[u8]) -> Option<u32> {
     u32::try_from(base).ok()
 }
 
-/// Typed functions compiled to WebAssembly (1, the default) or interpreted (0), from the
-/// next engine (`run_again` starts a new one).
+/// Functions compiled to WebAssembly (1, the default), every one from its first call (2,
+/// for tests; 3, also without structured control flow), or none (0), from the next
+/// engine (`run_again` starts a new one).
 #[unsafe(no_mangle)]
-pub extern "C" fn set_jit(on: u32) {
-    JIT.with(|j| j.set(on != 0));
+pub extern "C" fn set_jit(mode: u32) {
+    JIT.with(|j| j.set(mode));
     KEPT.with(|k| k.borrow_mut().take());
 }
 
-/// Number of functions compiled so far.
+/// Number of typed functions compiled so far.
 #[unsafe(no_mangle)]
 pub extern "C" fn jit_compiled() -> u32 {
     bokoni::wasm_jit::compiled_functions()
+}
+
+/// Number of functions compiled to baseline code so far.
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_baseline() -> u32 {
+    bokoni::wasm_jit::baseline_functions()
+}
+
+/// Number of functions compiled without structured control flow so far.
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_dispatched() -> u32 {
+    bokoni::wasm_jit::dispatched_functions()
 }
 
 /// Writes the JSON answer into `RESULT`.

@@ -8,6 +8,9 @@ on:
     paths:
       - "playground/**"
       - "src/**"
+      # (The tests run the programs of the Rust tests and of the specification.)
+      - "tests/**"
+      - "docs/syntax.md"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/playground.yml"

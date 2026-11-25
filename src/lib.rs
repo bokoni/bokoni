@@ -10,6 +10,8 @@
 //! ```
 
 pub mod ast;
+#[cfg(any(feature = "jit", feature = "wasm-jit"))]
+mod baseline;
 pub mod check;
 pub mod compile;
 pub mod diagnostic;

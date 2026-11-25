@@ -51,8 +51,9 @@ methods, lists and strings are compiled too; where an assumption of the native c
 not hold, the interpreter takes over at that point.
 Untyped functions get lighter native code that calls the interpreter for anything beyond
 simple arithmetic (about twice as fast), with exactly the same result. Inside WebAssembly,
-where Cranelift cannot run, typed functions are compiled to WebAssembly modules instead
-(`wasm-jit` feature, used by the playground; [docs/execution.md](docs/execution.md)).
+where Cranelift cannot run, functions are compiled to WebAssembly modules instead, in
+the same two tiers (`wasm-jit` feature, used by the playground;
+[docs/execution.md](docs/execution.md)).
 
 Macros, as in Crystal, generate code at parse time:
 
@@ -129,7 +130,7 @@ that contains itself is an error.
 **Try it: https://bokoni.github.io/bokoni/**
 
 [`playground/`](playground/README.md): Bokoni in the browser (the interpreter compiled to
-WebAssembly, its typed functions compiled to WebAssembly as it runs, a Monaco editor,
+WebAssembly, its functions compiled to WebAssembly as it runs, a Monaco editor,
 errors as one types). `cd playground/web && bun install &&
 bun run dev`.
 
@@ -159,5 +160,5 @@ cargo test --features serde                      # with serialization
 cargo run --release --example bench_parser       # parser vs peg
 cargo run --release --example bench_interp       # execution speed (with / without JIT)
 cargo build --no-default-features                # without the JIT (platforms without Cranelift)
-cargo build --no-default-features --features wasm-jit  # typed functions compiled to WebAssembly
+cargo build --no-default-features --features wasm-jit  # functions compiled to WebAssembly
 ```

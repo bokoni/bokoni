@@ -6,8 +6,8 @@ editor, the interpreter compiled to WebAssembly, run in a worker:
 every push to `main` that touches it).
 
 - `wasm/`: a small Rust crate around `bokoni`, without the Cranelift JIT (native code
-  cannot be generated inside WebAssembly) but with `wasm-jit`: typed functions are
-  compiled to WebAssembly modules, which the page instantiates (`bk_compile` in
+  cannot be generated inside WebAssembly) but with `wasm-jit`: functions are compiled to
+  WebAssembly modules, which the page instantiates (`bk_compile` in
   `web/src/bokoni.ts`; [docs/execution.md](../docs/execution.md)). It exports `run`
   (runs a script) and `check` (static checks only), each answering in JSON; what the
   script prints goes to an imported function as it happens. No `wasm-bindgen`.
@@ -24,7 +24,8 @@ bun install
 bun run dev        # builds the wasm module, then serves the page (http://localhost:5173)
 bun run build      # the site in dist/ (static files, relative paths: any host)
 bun run test       # the wasm module under Bun: output, errors, positions, examples,
-                   # compiled functions against the interpreter (BK_GEN=3000: more programs)
+                   # compiled functions against the interpreter, on random programs
+                   # (BK_GEN=3000: more) and on those of the Rust tests
 ```
 
 Needs the `wasm32-unknown-unknown` Rust target (`rustup target add wasm32-unknown-unknown`).
@@ -41,10 +42,10 @@ Needs the `wasm32-unknown-unknown` Rust target (`rustup target add wasm32-unknow
 
 ## Limits
 
-- Only functions computing with `int`, `float` and `bool` are compiled (annotated or
-  not): `fib(25)` in 0.5 ms in Chrome, as fast as the desktop JIT. The rest
-  (lists, strings, objects, closures) is interpreted: 5 to 60 times slower than the
-  desktop JIT on hot loops.
+- Functions computing with `int`, `float` and `bool` (annotated or not) are compiled to
+  straight code: `fib(25)` in 0.3 ms in Chrome, faster than the desktop JIT. The others
+  (lists, strings, objects, closures) to baseline code calling the interpreter: 1.3 to
+  2.3 times faster than interpreted, not as fast as the desktop JIT's typed code.
 - 400 nested calls at most (`MAX_CALL_DEPTH` in `wasm/src/lib.rs`): each one takes room
   on the browser's own stack, which cannot grow (about 1 MB in a Chrome worker, where
   about 680 fit). Deeper, a Bokoni error; a crash beyond (through other built-ins) is

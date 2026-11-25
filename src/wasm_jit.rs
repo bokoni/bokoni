@@ -1,37 +1,50 @@
-//! Compilation of typed functions to WebAssembly, for Bokoni itself running in
-//! WebAssembly, where the Cranelift JIT cannot (`wasm-jit` feature; `docs/execution.md`).
+//! Compilation of functions to WebAssembly, for Bokoni itself running in WebAssembly,
+//! where the Cranelift JIT cannot (`wasm-jit` feature; `docs/execution.md`).
 //!
 //! A function is written as a WebAssembly module (`wasm-encoder`), which the host compiles
 //! to machine code: the embedder gives a compiler (`set_compiler`) that instantiates the
 //! module against this program's memory and function table, appends its exports `f0`,
 //! `f1`… to that table and returns the index of the first one. A function pointer being
-//! an index in that table, Rust then calls the code like the Cranelift JIT's.
+//! an index in that table, Rust then calls the code like the Cranelift JIT's. Two tiers,
+//! as that JIT's:
 //!
-//! Phase 1: functions whose parameters are `int`, `float` or `bool` (annotated, or a copy
-//! typed for its arguments), whose result is too (annotated, or inferred: `Infer`), and
-//! whose body only computes with such values, compares, branches and calls such functions
-//! (recursion included). Any other function stays interpreted. Same rules as the interpreter: overflow, Euclidean division,
-//! division by zero, call depth, with the same messages and the same call stack.
+//! - Typed code (`Jit::compile`): functions whose parameters are `int`, `float` or `bool`
+//!   (annotated, or a copy typed for its arguments), whose result is too (annotated, or
+//!   inferred: `Infer`), and whose body only computes with such values, compares, branches
+//!   and calls such functions (recursion included). The same rules as the interpreter:
+//!   overflow, Euclidean division, division by zero, call depth, with the same messages
+//!   and the same call stack.
+//!   - Each function has an internal function, `(ctx, params…) -> (status, result)`
+//!     (status 0: success, 1: error, described in `ctx`), and an entry point for Rust
+//!     with the C ABI of the Cranelift JIT's: `extern "C" fn(ctx, *const u64 args, *mut
+//!     u64 result) -> i32`.
+//!   - The functions compiled together (one calling another not compiled yet) call each
+//!     other directly; one compiled before is called through the table
+//!     (`call_indirect`).
+//!   - A register holds a value of one native type at each point (`Plan`); one
+//!     WebAssembly local per register and type.
+//!   - Redefining a global function called (directly or not) invalidates the code,
+//!     which is compiled again when needed.
+//! - Baseline code (`Jit::compile_dynamic`): any other function without `rescue` /
+//!   `ensure`, its registers left in memory, the interpreter's code called for what it
+//!   does not do itself (`crate::baseline`).
 //!
-//! - Each function has an internal function, `(ctx, params…) -> (status, result)`
-//!   (status 0: success, 1: error, described in `ctx`), and an entry point for Rust with
-//!   the C ABI of the Cranelift JIT's: `extern "C" fn(ctx, *const u64 args, *mut u64
-//!   result) -> i32`.
-//! - The functions compiled together (one calling another not compiled yet) call each
-//!   other directly; one compiled before is called through the table (`call_indirect`).
-//! - Control flow: the blocks of the IR are dispatched by a loop over a `br_table` on the
-//!   block number; a jump to the next block falls through.
-//! - A register holds a value of one native type at each point (`Plan`); one WebAssembly
-//!   local per register and type.
-//! - Redefining a global function called (directly or not) invalidates the code, which is
-//!   compiled again when needed.
+//! Control flow (`control_flow`): structured (`loop`, `block`, `if`) from the IR's blocks
+//! when the graph is reducible, as Bokoni's are; otherwise a loop over a `br_table` on the
+//! block number.
 
 use crate::ast::BinOp;
+use crate::baseline::{FAST, Fast, FieldCache, bk_drop, bk_iter_next, bk_step};
 use crate::diagnostic::Error;
 use crate::globals::Globals;
 use crate::intern::{FxHashMap, Symbol};
-use crate::ir::{Instr, JitState, NativeCode, Proto, ProtoKind, Reg, RegTy, RtType, Script, Term};
+use crate::ir::{
+    Instr, JitState, NativeCode, NativeFrame, Proto, ProtoKind, Reg, RegTy, RtType, Script, Term,
+};
 use crate::span::Span;
+use crate::value::layout::{
+    BOOL_PAYLOAD, FIRST_HEAP_TAG, PAYLOAD, SIZE, TAG_BOOL, TAG_FLOAT, TAG_INT, TAG_NIL,
+};
 use crate::value::{Function as Func, Value};
 use crate::vm::Runtime;
 use std::cell::Cell;
@@ -50,6 +63,16 @@ pub type Compiler = fn(&[u8]) -> Option<u32>;
 thread_local! {
     static COMPILER: Cell<Option<Compiler>> = const { Cell::new(None) };
     static COMPILED: Cell<u32> = const { Cell::new(0) };
+    static BASELINE: Cell<u32> = const { Cell::new(0) };
+    static DISPATCHED: Cell<u32> = const { Cell::new(0) };
+    static STRUCTURED: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Structured control flow when possible (the default), or always the dispatch loop
+/// (tests of that loop).
+#[doc(hidden)]
+pub fn set_structured(on: bool) {
+    STRUCTURED.with(|c| c.set(on));
 }
 
 /// Sets the compiler of the generated modules (WebAssembly only: elsewhere, nothing is
@@ -58,9 +81,20 @@ pub fn set_compiler(compiler: Option<Compiler>) {
     COMPILER.with(|c| c.set(compiler));
 }
 
-/// Number of functions compiled so far (tests).
+/// Number of functions compiled so far, typed (tests).
 pub fn compiled_functions() -> u32 {
     COMPILED.with(Cell::get)
+}
+
+/// Number of functions compiled so far to baseline code (tests).
+pub fn baseline_functions() -> u32 {
+    BASELINE.with(Cell::get)
+}
+
+/// Number of functions whose control flow was not structured (its graph not reducible),
+/// so far (tests).
+pub fn dispatched_functions() -> u32 {
+    DISPATCHED.with(Cell::get)
 }
 
 /// Context shared with the generated code. The first three fields are read and written by
@@ -129,6 +163,9 @@ pub struct Jit {
     traces: Vec<TraceInfo>,
     /// Functions compiled (key: address of the `Proto`).
     compiled: FxHashMap<usize, Compiled>,
+    /// Field access caches of the baseline code (addresses held by the code).
+    #[allow(clippy::vec_box)]
+    field_caches: Vec<Box<FieldCache>>,
 }
 
 /// Type of a register for the generated code.
@@ -616,6 +653,23 @@ impl Jit {
             return None;
         }
         COMPILER.with(Cell::get)?;
+        // The layout of a `Value` the generated code reads and writes (`value::layout`).
+        let v = Value::Int(0x0102_0304_0506_0708);
+        let b = Value::Bool(true);
+        // SAFETY: reads within the values (`SIZE` bytes each).
+        let ok = size_of::<Value>() == SIZE as usize
+            && unsafe {
+                let p = &v as *const Value as *const u8;
+                let q = &b as *const Value as *const u8;
+                *p == TAG_INT
+                    && (p.add(PAYLOAD as usize) as *const i64).read_unaligned()
+                        == 0x0102_0304_0506_0708
+                    && *q == TAG_BOOL
+                    && *q.add(BOOL_PAYLOAD as usize) == 1
+            };
+        if !ok {
+            return None;
+        }
         Some(Jit {
             len_sym: Symbol(0),
             ctx: Box::new(Ctx {
@@ -627,6 +681,7 @@ impl Jit {
             errors: Vec::new(),
             traces: Vec::new(),
             compiled: FxHashMap::default(),
+            field_caches: Vec::new(),
         })
     }
 
@@ -805,40 +860,7 @@ impl Jit {
                 2 * i as u32 + 1,
             );
         }
-        let mut ts = TypeSection::new();
-        for (ps, rs) in &types.list {
-            ts.ty().function(ps.iter().copied(), rs.iter().copied());
-        }
-        let mut imports = ImportSection::new();
-        imports.import(
-            "env",
-            "memory",
-            EntityType::Memory(MemoryType {
-                minimum: 1,
-                maximum: None,
-                memory64: false,
-                shared: false,
-                page_size_log2: None,
-            }),
-        );
-        imports.import(
-            "env",
-            "table",
-            EntityType::Table(TableType {
-                element_type: RefType::FUNCREF,
-                table64: false,
-                minimum: 1,
-                maximum: None,
-                shared: false,
-            }),
-        );
-        let mut m = Module::new();
-        m.section(&ts)
-            .section(&imports)
-            .section(&funcs)
-            .section(&exports)
-            .section(&code);
-        m.finish()
+        assemble(&types, &funcs, &exports, &code)
     }
 
     fn error_id(&mut self, kind: ErrKind, span: Span, script: &Rc<Script>) -> i64 {
@@ -859,7 +881,6 @@ impl Jit {
         types: &mut Types,
     ) -> Function {
         let mut fx = Fx::new(p, plan);
-        let n = p.blocks.len() as u32;
         let trace_ty = types.index(vec![ValType::I32, ValType::I32], vec![]);
         let frem_ty = types.index(vec![ValType::F64, ValType::F64], vec![ValType::F64]);
         // Locals of every register and type it holds, then the scratch ones.
@@ -890,177 +911,547 @@ impl Jit {
             x.local_get(k as u32 + 1);
             x.local_set(fx.at(prm.reg, of(*t)));
         }
-        x.loop_(BlockType::Empty);
-        for _ in 0..n {
-            x.block(BlockType::Empty);
-        }
-        x.local_get(pc);
-        x.br_table(0..n, n - 1);
-        x.end();
-        for (bi, b) in p.blocks.iter().enumerate() {
-            // Depth of the dispatch loop from this block's code.
-            let to_loop = n - 1 - bi as u32;
-            let Some(entry) = &plan.entry[bi] else {
-                // Never reached.
-                x.unreachable();
-                if bi + 1 < n as usize {
-                    x.end();
-                }
-                continue;
-            };
-            let mut cur = entry.clone();
-            for (k, ins) in b.instrs.iter().enumerate() {
-                let span = b.spans[k];
-                let def = plan.defs[bi][k];
-                let ctx = Ctx2 {
-                    fx: &fx,
-                    cur: &cur,
-                    s,
-                    ret: plan.ret,
-                };
-                match ins {
-                    Instr::Call { dst, site, .. } => {
-                        let q = &plan.targets[&(bi, k)];
-                        let (cparams, cret) = (&q.params, q.ret);
-                        let depth_err = self.error_id(ErrKind::Depth, span, &p.script);
-                        // Depth: as the interpreter, an error at the call beyond the limit.
-                        x.local_get(0).i64_load(mem(DEPTH)).local_tee(s[0]);
-                        x.local_get(0).i64_load(mem(MAX_DEPTH)).i64_ge_s();
-                        x.if_(BlockType::Empty);
-                        ctx.fail(&mut x, depth_err);
-                        x.end();
-                        x.local_get(0).local_get(s[0]).i64_const(1).i64_add();
-                        x.i64_store(mem(DEPTH));
-                        x.local_get(0);
-                        let site = &p.calls[*site as usize];
-                        for (k, pt) in cparams.iter().enumerate() {
-                            let r = site.start + k as u32;
-                            ctx.get(&mut x, r);
-                            convert(&mut x, cur[r as usize].get().unwrap(), of(*pt));
-                        }
-                        match callees[&(Rc::as_ptr(&q.proto) as usize)] {
-                            Callee::Local(i) => {
-                                x.call(i);
-                            }
-                            Callee::Table(i) => {
-                                let ty = types.internal(cparams, cret);
-                                x.i32_const(i as i32).call_indirect(0, ty);
-                            }
-                        }
-                        let tmp = match cret {
-                            RegTy::Int => s[1],
-                            RegTy::Float => sf,
-                            _ => si,
-                        };
-                        x.local_set(tmp).local_set(st);
-                        x.local_get(0).local_get(s[0]).i64_store(mem(DEPTH));
-                        self.traces.push(TraceInfo {
-                            name: q.proto.name.clone(),
-                            span,
-                        });
-                        let tid = (self.traces.len() - 1) as i32;
-                        x.local_get(st).if_(BlockType::Empty);
-                        x.local_get(0)
-                            .i32_const(tid)
-                            .i32_const(table_index(bk_trace as *const () as usize))
-                            .call_indirect(0, trace_ty);
-                        x.i32_const(1);
-                        zero(&mut x, plan.ret);
-                        x.return_();
-                        x.end();
-                        let d = def.unwrap();
-                        x.local_get(tmp);
-                        convert(&mut x, of(cret), d);
-                        x.local_set(fx.at(*dst, d));
-                    }
-                    ins => {
-                        let mut err = |kind| self.error_id(kind, span, &p.script);
-                        ctx.instr(&mut x, ins, def, &mut err, frem_ty);
-                    }
-                }
-                if let (Some(d), Some(t)) = (written(ins), def) {
-                    cur[d as usize] = Lat::T(t);
-                }
-            }
-            let ctx = Ctx2 {
-                fx: &fx,
-                cur: &cur,
-                s,
-                ret: plan.ret,
-            };
-            let next = bi as u32 + 1;
-            let jump = |x: &mut InstructionSink, target: u32, extra: u32| {
-                if target != next || extra > 0 {
-                    x.i32_const(target as i32).local_set(pc).br(to_loop + extra);
-                }
-            };
-            match &b.term {
-                Term::Jump(t) => jump(&mut x, *t, 0),
-                Term::Branch { cond, then, else_ } => {
-                    match cur[*cond as usize].get().unwrap() {
-                        T::Bool => ctx.get(&mut x, *cond),
-                        T::Nil => {
-                            x.i32_const(0);
-                        }
-                        // A number is true.
-                        _ => {
-                            x.i32_const(1);
-                        }
-                    }
-                    x.if_(BlockType::Empty);
-                    jump(&mut x, *then, 1);
-                    x.end();
-                    jump(&mut x, *else_, 0);
-                }
-                Term::IfInt {
-                    op,
-                    a,
-                    b: y,
-                    then,
-                    else_,
-                } => {
-                    ctx.get(&mut x, *a);
-                    ctx.get(&mut x, *y);
-                    int_cmp(&mut x, *op);
-                    x.if_(BlockType::Empty);
-                    jump(&mut x, *then, 1);
-                    x.end();
-                    jump(&mut x, *else_, 0);
-                }
-                Term::IfIntK {
-                    op,
-                    a,
-                    k,
-                    then,
-                    else_,
-                } => {
-                    ctx.get(&mut x, *a);
-                    x.i64_const(*k);
-                    int_cmp(&mut x, *op);
-                    x.if_(BlockType::Empty);
-                    jump(&mut x, *then, 1);
-                    x.end();
-                    jump(&mut x, *else_, 0);
-                }
-                Term::Return { reg, .. } => {
-                    x.i32_const(0);
-                    ctx.get(&mut x, *reg);
-                    convert(&mut x, cur[*reg as usize].get().unwrap(), of(plan.ret));
-                    x.return_();
-                }
-                _ => unreachable!("rejected by the analysis"),
-            }
-            if bi + 1 < n as usize {
-                x.end();
-            }
-        }
-        // End of the dispatch loop: never reached (every block ends with a jump or a
-        // return).
-        x.end();
+        let reached: Vec<bool> = plan.entry.iter().map(Option::is_some).collect();
+        let mut tb = TypedBlocks {
+            jit: self,
+            p,
+            plan,
+            callees,
+            types,
+            fx: &fx,
+            s,
+            sf,
+            si,
+            st,
+            trace_ty,
+            frem_ty,
+        };
+        control_flow(&mut x, &successors(p), &reached, pc, &mut tb);
         x.unreachable();
         x.end();
         f
     }
+}
+
+/// The code of a typed function's blocks.
+struct TypedBlocks<'a> {
+    jit: &'a mut Jit,
+    p: &'a Proto,
+    plan: &'a Plan,
+    callees: &'a FxHashMap<usize, Callee>,
+    types: &'a mut Types,
+    fx: &'a Fx,
+    s: [u32; 4],
+    sf: u32,
+    si: u32,
+    st: u32,
+    trace_ty: u32,
+    frem_ty: u32,
+}
+
+impl Blocks for TypedBlocks<'_> {
+    fn block(&mut self, x: &mut InstructionSink, bi: usize) -> Exit {
+        let (p, plan, fx, s) = (self.p, self.plan, self.fx, self.s);
+        let b = &p.blocks[bi];
+        let Some(entry) = &plan.entry[bi] else {
+            // Never reached.
+            x.unreachable();
+            return Exit::Return;
+        };
+        let mut cur = entry.clone();
+        for (k, ins) in b.instrs.iter().enumerate() {
+            let span = b.spans[k];
+            let def = plan.defs[bi][k];
+            let ctx = Ctx2 {
+                fx,
+                cur: &cur,
+                s,
+                ret: plan.ret,
+            };
+            match ins {
+                Instr::Call { dst, site, .. } => {
+                    let q = &plan.targets[&(bi, k)];
+                    let (cparams, cret) = (&q.params, q.ret);
+                    let depth_err = self.jit.error_id(ErrKind::Depth, span, &p.script);
+                    // Depth: as the interpreter, an error at the call beyond the limit.
+                    x.local_get(0).i64_load(mem(DEPTH)).local_tee(s[0]);
+                    x.local_get(0).i64_load(mem(MAX_DEPTH)).i64_ge_s();
+                    x.if_(BlockType::Empty);
+                    ctx.fail(x, depth_err);
+                    x.end();
+                    x.local_get(0).local_get(s[0]).i64_const(1).i64_add();
+                    x.i64_store(mem(DEPTH));
+                    x.local_get(0);
+                    let site = &p.calls[*site as usize];
+                    for (k, pt) in cparams.iter().enumerate() {
+                        let r = site.start + k as u32;
+                        ctx.get(x, r);
+                        convert(x, cur[r as usize].get().unwrap(), of(*pt));
+                    }
+                    match self.callees[&(Rc::as_ptr(&q.proto) as usize)] {
+                        Callee::Local(i) => {
+                            x.call(i);
+                        }
+                        Callee::Table(i) => {
+                            let ty = self.types.internal(cparams, cret);
+                            x.i32_const(i as i32).call_indirect(0, ty);
+                        }
+                    }
+                    let tmp = match cret {
+                        RegTy::Int => s[1],
+                        RegTy::Float => self.sf,
+                        _ => self.si,
+                    };
+                    x.local_set(tmp).local_set(self.st);
+                    x.local_get(0).local_get(s[0]).i64_store(mem(DEPTH));
+                    self.jit.traces.push(TraceInfo {
+                        name: q.proto.name.clone(),
+                        span,
+                    });
+                    let tid = (self.jit.traces.len() - 1) as i32;
+                    x.local_get(self.st).if_(BlockType::Empty);
+                    x.local_get(0)
+                        .i32_const(tid)
+                        .i32_const(table_index(bk_trace as *const () as usize))
+                        .call_indirect(0, self.trace_ty);
+                    x.i32_const(1);
+                    zero(x, plan.ret);
+                    x.return_();
+                    x.end();
+                    let d = def.unwrap();
+                    x.local_get(tmp);
+                    convert(x, of(cret), d);
+                    x.local_set(fx.at(*dst, d));
+                }
+                ins => {
+                    let jit = &mut *self.jit;
+                    let mut err = |kind| jit.error_id(kind, span, &p.script);
+                    ctx.instr(x, ins, def, &mut err, self.frem_ty);
+                }
+            }
+            if let (Some(d), Some(t)) = (written(ins), def) {
+                cur[d as usize] = Lat::T(t);
+            }
+        }
+        let ctx = Ctx2 {
+            fx,
+            cur: &cur,
+            s,
+            ret: plan.ret,
+        };
+        match &b.term {
+            Term::Jump(t) => Exit::Jump(*t),
+            Term::Branch { cond, then, else_ } => {
+                match cur[*cond as usize].get().unwrap() {
+                    T::Bool => ctx.get(x, *cond),
+                    T::Nil => {
+                        x.i32_const(0);
+                    }
+                    // A number is true.
+                    _ => {
+                        x.i32_const(1);
+                    }
+                }
+                Exit::Cond(*then, *else_)
+            }
+            Term::IfInt {
+                op,
+                a,
+                b: y,
+                then,
+                else_,
+            } => {
+                ctx.get(x, *a);
+                ctx.get(x, *y);
+                int_cmp(x, *op);
+                Exit::Cond(*then, *else_)
+            }
+            Term::IfIntK {
+                op,
+                a,
+                k,
+                then,
+                else_,
+            } => {
+                ctx.get(x, *a);
+                x.i64_const(*k);
+                int_cmp(x, *op);
+                Exit::Cond(*then, *else_)
+            }
+            Term::Return { reg, .. } => {
+                x.i32_const(0);
+                ctx.get(x, *reg);
+                convert(x, cur[*reg as usize].get().unwrap(), of(plan.ret));
+                x.return_();
+                Exit::Return
+            }
+            _ => unreachable!("rejected by the analysis"),
+        }
+    }
+}
+
+// ─── Control flow ──────────────────────────────────────────────────────────
+
+/// How a block ends.
+enum Exit {
+    Jump(u32),
+    /// On the `i32` its code pushed: the first block if non-zero, the second otherwise.
+    Cond(u32, u32),
+    /// Its code returned (or cannot go on).
+    Return,
+}
+
+/// The code of a function's blocks, for `control_flow`.
+trait Blocks {
+    /// The code of block `b`, then of its terminator: its condition pushed, or its return.
+    fn block(&mut self, x: &mut InstructionSink, b: usize) -> Exit;
+}
+
+/// Successors of each block of `p`.
+fn successors(p: &Proto) -> Vec<Vec<u32>> {
+    p.blocks
+        .iter()
+        .map(|b| match &b.term {
+            Term::Jump(t) => vec![*t],
+            Term::Branch { then, else_, .. }
+            | Term::IfInt { then, else_, .. }
+            | Term::IfIntK { then, else_, .. } => vec![*then, *else_],
+            Term::IterNext { body, done, .. } => vec![*body, *done],
+            Term::Return { .. } | Term::Reraise(_) => vec![],
+        })
+        .collect()
+}
+
+/// Writes the control flow of the blocks (`succ`: their successors; only those `reached`
+/// can run). Structured when the graph is reducible (as Bokoni's are): one `loop` per loop
+/// header, one `block` per block reached by several forward edges (a merge), the others
+/// written inline where they are branched to (N. Ramsey, "Beyond Relooper", 2022).
+/// Otherwise a loop over a `br_table` on the block number (`pc`).
+fn control_flow(
+    x: &mut InstructionSink,
+    succ: &[Vec<u32>],
+    reached: &[bool],
+    pc: u32,
+    blocks: &mut impl Blocks,
+) {
+    match Structure::new(succ, reached).filter(|_| STRUCTURED.with(Cell::get)) {
+        Some(st) => {
+            let mut labels = Vec::new();
+            st.tree(x, &mut labels, 0, blocks);
+        }
+        None => {
+            DISPATCHED.with(|c| c.set(c.get() + 1));
+            dispatch(x, succ.len() as u32, reached, pc, blocks);
+        }
+    }
+}
+
+/// The dispatch loop: `pc` the block to run.
+fn dispatch(x: &mut InstructionSink, n: u32, reached: &[bool], pc: u32, blocks: &mut impl Blocks) {
+    x.loop_(BlockType::Empty);
+    for _ in 0..n {
+        x.block(BlockType::Empty);
+    }
+    x.local_get(pc);
+    x.br_table(0..n, n - 1);
+    x.end();
+    for (bi, &reach) in reached.iter().enumerate() {
+        // Depth of the dispatch loop from this block's code.
+        let to_loop = n - 1 - bi as u32;
+        let next = bi as u32 + 1;
+        let jump = |x: &mut InstructionSink, target: u32, extra: u32| {
+            if target != next || extra > 0 {
+                x.i32_const(target as i32).local_set(pc).br(to_loop + extra);
+            }
+        };
+        if !reach {
+            x.unreachable();
+        } else {
+            match blocks.block(x, bi) {
+                Exit::Jump(t) => jump(x, t, 0),
+                Exit::Cond(t, e) => {
+                    x.if_(BlockType::Empty);
+                    jump(x, t, 1);
+                    x.end();
+                    jump(x, e, 0);
+                }
+                Exit::Return => {}
+            }
+        }
+        if bi + 1 < n as usize {
+            x.end();
+        }
+    }
+    x.end();
+}
+
+/// Labels around the code being written, innermost last.
+#[derive(Clone, Copy, PartialEq)]
+enum Label {
+    /// The `loop` of a loop header: a branch to it goes back to the header.
+    Loop(u32),
+    /// The `block` followed by a merge block: a branch to it goes to that block.
+    Block(u32),
+    If,
+}
+
+/// A reducible control flow graph, for structured code.
+struct Structure {
+    /// Reverse postorder number of each block reached.
+    order: Vec<u32>,
+    header: Vec<bool>,
+    merge: Vec<bool>,
+    /// Children in the dominator tree.
+    children: Vec<Vec<u32>>,
+}
+
+const UNREACHED: u32 = u32::MAX;
+
+impl Structure {
+    fn new(succ: &[Vec<u32>], reached: &[bool]) -> Option<Structure> {
+        let n = succ.len();
+        let ok = |b: u32| reached[b as usize];
+        // Reverse postorder (iterative depth-first search).
+        let mut post = Vec::with_capacity(n);
+        let mut seen = vec![false; n];
+        let mut stack: Vec<(u32, usize)> = vec![(0, 0)];
+        seen[0] = true;
+        while let Some(&mut (b, ref mut k)) = stack.last_mut() {
+            let ss = &succ[b as usize];
+            if *k < ss.len() {
+                let s = ss[*k];
+                *k += 1;
+                if ok(s) && !seen[s as usize] {
+                    seen[s as usize] = true;
+                    stack.push((s, 0));
+                }
+            } else {
+                post.push(b);
+                stack.pop();
+            }
+        }
+        let rpo: Vec<u32> = post.iter().rev().copied().collect();
+        let mut order = vec![UNREACHED; n];
+        for (i, &b) in rpo.iter().enumerate() {
+            order[b as usize] = i as u32;
+        }
+        let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for &b in &rpo {
+            for &s in &succ[b as usize] {
+                if order[s as usize] != UNREACHED {
+                    preds[s as usize].push(b);
+                }
+            }
+        }
+        // Immediate dominators (Cooper, Harvey, Kennedy).
+        let mut idom = vec![UNREACHED; n];
+        idom[0] = 0;
+        let intersect = |idom: &[u32], mut a: u32, mut b: u32| {
+            while a != b {
+                while order[a as usize] > order[b as usize] {
+                    a = idom[a as usize];
+                }
+                while order[b as usize] > order[a as usize] {
+                    b = idom[b as usize];
+                }
+            }
+            a
+        };
+        loop {
+            let mut changed = false;
+            for &b in &rpo[1..] {
+                let mut new = UNREACHED;
+                for &q in &preds[b as usize] {
+                    if idom[q as usize] == UNREACHED {
+                        continue;
+                    }
+                    new = if new == UNREACHED {
+                        q
+                    } else {
+                        intersect(&idom, q, new)
+                    };
+                }
+                if idom[b as usize] != new {
+                    idom[b as usize] = new;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let dominates = |a: u32, mut b: u32| loop {
+            if a == b {
+                return true;
+            }
+            if b == 0 {
+                return false;
+            }
+            b = idom[b as usize];
+        };
+        let mut header = vec![false; n];
+        let mut forward_in = vec![0u32; n];
+        for &b in &rpo {
+            for &s in &succ[b as usize] {
+                if order[s as usize] == UNREACHED {
+                    continue;
+                }
+                if order[s as usize] <= order[b as usize] {
+                    // A back edge: to a block dominating its source, or the graph is not
+                    // reducible.
+                    if !dominates(s, b) {
+                        return None;
+                    }
+                    header[s as usize] = true;
+                } else {
+                    forward_in[s as usize] += 1;
+                }
+            }
+        }
+        let merge: Vec<bool> = forward_in.iter().map(|&k| k >= 2).collect();
+        let mut children = vec![Vec::new(); n];
+        let mut depth = vec![0u32; n];
+        for &b in &rpo[1..] {
+            let d = idom[b as usize];
+            children[d as usize].push(b);
+            depth[b as usize] = depth[d as usize] + 1;
+            // (The code is written recursively along the dominator tree.)
+            if depth[b as usize] > 400 {
+                return None;
+            }
+        }
+        Some(Structure {
+            order,
+            header,
+            merge,
+            children,
+        })
+    }
+
+    /// The code of block `b` and of the blocks it dominates.
+    fn tree(
+        &self,
+        x: &mut InstructionSink,
+        labels: &mut Vec<Label>,
+        b: u32,
+        blocks: &mut impl Blocks,
+    ) {
+        let mut merges: Vec<u32> = self.children[b as usize]
+            .iter()
+            .copied()
+            .filter(|&c| self.merge[c as usize])
+            .collect();
+        // The one written last (highest number) gets the outermost `block`.
+        merges.sort_by_key(|&c| std::cmp::Reverse(self.order[c as usize]));
+        if self.header[b as usize] {
+            x.loop_(BlockType::Empty);
+            labels.push(Label::Loop(b));
+            self.within(x, labels, b, &merges, blocks);
+            labels.pop();
+            x.end();
+        } else {
+            self.within(x, labels, b, &merges, blocks);
+        }
+    }
+
+    fn within(
+        &self,
+        x: &mut InstructionSink,
+        labels: &mut Vec<Label>,
+        b: u32,
+        merges: &[u32],
+        blocks: &mut impl Blocks,
+    ) {
+        if let Some((&y, rest)) = merges.split_first() {
+            x.block(BlockType::Empty);
+            labels.push(Label::Block(y));
+            self.within(x, labels, b, rest, blocks);
+            labels.pop();
+            x.end();
+            self.tree(x, labels, y, blocks);
+            return;
+        }
+        match blocks.block(x, b as usize) {
+            Exit::Jump(t) => self.branch(x, labels, b, t, blocks),
+            Exit::Cond(t, e) => {
+                x.if_(BlockType::Empty);
+                labels.push(Label::If);
+                self.branch(x, labels, b, t, blocks);
+                x.else_();
+                self.branch(x, labels, b, e, blocks);
+                labels.pop();
+                x.end();
+            }
+            Exit::Return => {}
+        }
+    }
+
+    /// From block `from` to block `to`: a branch, or `to`'s code here.
+    fn branch(
+        &self,
+        x: &mut InstructionSink,
+        labels: &mut Vec<Label>,
+        from: u32,
+        to: u32,
+        blocks: &mut impl Blocks,
+    ) {
+        let label = if self.order[to as usize] <= self.order[from as usize] {
+            Label::Loop(to)
+        } else if self.merge[to as usize] {
+            Label::Block(to)
+        } else {
+            self.tree(x, labels, to, blocks);
+            return;
+        };
+        let at = labels
+            .iter()
+            .rposition(|l| *l == label)
+            .expect("enclosing label");
+        x.br((labels.len() - 1 - at) as u32);
+    }
+}
+
+/// The bytes of a module of these functions, importing the program's memory and table.
+fn assemble(
+    types: &Types,
+    funcs: &FunctionSection,
+    exports: &ExportSection,
+    code: &CodeSection,
+) -> Vec<u8> {
+    let mut ts = TypeSection::new();
+    for (ps, rs) in &types.list {
+        ts.ty().function(ps.iter().copied(), rs.iter().copied());
+    }
+    let mut imports = ImportSection::new();
+    imports.import(
+        "env",
+        "memory",
+        EntityType::Memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        }),
+    );
+    imports.import(
+        "env",
+        "table",
+        EntityType::Table(TableType {
+            element_type: RefType::FUNCREF,
+            table64: false,
+            minimum: 1,
+            maximum: None,
+            shared: false,
+        }),
+    );
+    let mut m = Module::new();
+    m.section(&ts)
+        .section(&imports)
+        .section(funcs)
+        .section(exports)
+        .section(code);
+    m.finish()
 }
 
 /// The entry point for Rust of internal function `internal`:
@@ -1533,5 +1924,610 @@ unsafe fn take_error(jit: &Jit, ctx: *mut Ctx) -> Error {
         (*ctx).traces.clear();
         (*ctx).err = -1;
         e
+    }
+}
+
+// ─── Baseline compilation (untyped code) ───────────────────────────────────
+//
+// As the Cranelift JIT's (`crate::baseline`): any function without `rescue` / `ensure`.
+// Its registers stay `Value`s in the call's window, in this program's memory; the code
+// does the simple cases itself (constants, copies of scalar values, integer and float
+// arithmetic and comparisons, branches) and asks the helpers for the rest, the
+// interpreter's own code (`bk_step`) last, including the unusual cases (overflow…): the
+// semantics are the same by construction. Entry point: `extern "C" fn(*mut Runtime, *mut
+// NativeFrame) -> i32` (0: returned, its register in `NativeFrame::ret`; 1: error).
+
+/// Locals of a baseline function: its two parameters, then these.
+const B_REGS: u32 = 2;
+const B_A: u32 = 3;
+const B_B: u32 = 4;
+const B_R: u32 = 5;
+const B_Q: u32 = 6;
+const B_TA: u32 = 7;
+const B_TB: u32 = 8;
+const B_F: u32 = 9;
+const B_PC: u32 = 10;
+const B_X: u32 = 11;
+
+/// What the code of a baseline function needs.
+struct Base<'a> {
+    regs_ty: &'a [RegTy],
+    /// Types of the helpers: `(i32 × 5) -> i32` (`bk_step`, the fast ones), `bk_iter_next`,
+    /// `bk_drop`, `bk_frem`.
+    t_step: u32,
+    t_iter: u32,
+    t_drop: u32,
+}
+
+/// Offset of a register's value in the window.
+fn roff(r: Reg) -> u64 {
+    r as u64 * SIZE as u64
+}
+
+fn at(offset: u64, align: u32) -> MemArg {
+    MemArg {
+        offset,
+        align,
+        memory_index: 0,
+    }
+}
+
+fn fn_index(f: usize) -> i32 {
+    table_index(f)
+}
+
+impl Base<'_> {
+    fn tag(&self, x: &mut InstructionSink, r: Reg) {
+        x.local_get(B_REGS).i32_load8_u(at(roff(r), 0));
+    }
+
+    fn int(&self, x: &mut InstructionSink, r: Reg) {
+        x.local_get(B_REGS)
+            .i64_load(at(roff(r) + PAYLOAD as u64, 3));
+    }
+
+    fn float(&self, x: &mut InstructionSink, r: Reg) {
+        x.local_get(B_REGS)
+            .f64_load(at(roff(r) + PAYLOAD as u64, 3));
+    }
+
+    fn boolean(&self, x: &mut InstructionSink, r: Reg) {
+        x.local_get(B_REGS)
+            .i32_load8_u(at(roff(r) + BOOL_PAYLOAD as u64, 0));
+    }
+
+    /// Writes a scalar into register `d`: tag `tag`, payload in local `from` (none for
+    /// `nil`). A `value` register may hold a resource: dropped first.
+    fn write(&self, x: &mut InstructionSink, d: Reg, tag: u8, from: Option<u32>) {
+        if self.regs_ty[d as usize] == RegTy::Value {
+            self.tag(x, d);
+            x.i32_const(FIRST_HEAP_TAG as i32).i32_ge_u();
+            x.if_(BlockType::Empty);
+            x.local_get(B_REGS).i32_const(roff(d) as i32).i32_add();
+            x.i32_const(fn_index(bk_drop as *const () as usize))
+                .call_indirect(0, self.t_drop);
+            x.end();
+        }
+        x.local_get(B_REGS).i32_const(tag as i32);
+        x.i32_store8(at(roff(d), 0));
+        if let Some(l) = from {
+            x.local_get(B_REGS).local_get(l);
+            match tag {
+                TAG_INT => x.i64_store(at(roff(d) + PAYLOAD as u64, 3)),
+                TAG_FLOAT => x.f64_store(at(roff(d) + PAYLOAD as u64, 3)),
+                _ => x.i32_store8(at(roff(d) + BOOL_PAYLOAD as u64, 0)),
+            };
+        }
+    }
+
+    /// `bk_step` for `ins`: on an error, status 1 returned.
+    fn step(&self, x: &mut InstructionSink, ins: &Instr, span: Span) {
+        x.local_get(0).local_get(1);
+        x.i32_const(ins as *const Instr as usize as i32);
+        x.i32_const(span.start as i32).i32_const(span.end as i32);
+        x.i32_const(fn_index(bk_step as *const () as usize))
+            .call_indirect(0, self.t_step);
+        x.if_(BlockType::Empty).i32_const(1).return_().end();
+    }
+
+    /// A fast helper; if it does not handle the case, `bk_step`.
+    #[allow(clippy::too_many_arguments)]
+    fn fast(
+        &self,
+        x: &mut InstructionSink,
+        which: Fast,
+        a: u32,
+        b: u32,
+        p: usize,
+        ins: &Instr,
+        span: Span,
+    ) {
+        x.local_get(0).local_get(1);
+        x.i32_const(a as i32)
+            .i32_const(b as i32)
+            .i32_const(p as i32);
+        x.i32_const(fn_index(FAST[which as usize].1 as *const () as usize))
+            .call_indirect(0, self.t_step);
+        x.if_(BlockType::Empty);
+        self.step(x, ins, span);
+        x.end();
+    }
+
+    /// Truthiness of a register (`nil` and `false` are false), as an `i32`.
+    fn truthy(&self, x: &mut InstructionSink, r: Reg) {
+        match self.regs_ty[r as usize] {
+            RegTy::Bool => {
+                self.boolean(x, r);
+            }
+            RegTy::Int | RegTy::Float => {
+                x.i32_const(1);
+            }
+            RegTy::Value => {
+                self.tag(x, r);
+                x.local_tee(B_TA).i32_const(TAG_NIL as i32).i32_eq();
+                x.local_get(B_TA).i32_const(TAG_BOOL as i32).i32_eq();
+                self.boolean(x, r);
+                x.i32_eqz().i32_and().i32_or().i32_eqz();
+            }
+        }
+    }
+
+    /// Integer operation of locals `B_A` and `B_B` into register `d`; an edge case
+    /// (overflow, division by zero) branches out `slow` levels up, before writing.
+    fn int_op(&self, x: &mut InstructionSink, op: BinOp, d: Reg, slow: u32) {
+        let (a, b, r, q) = (B_A, B_B, B_R, B_Q);
+        match op {
+            BinOp::Add | BinOp::Sub => {
+                x.local_get(a).local_get(b);
+                if op == BinOp::Add {
+                    x.i64_add().local_set(r);
+                    x.local_get(a).local_get(r).i64_xor();
+                    x.local_get(b).local_get(r).i64_xor();
+                } else {
+                    x.i64_sub().local_set(r);
+                    x.local_get(a).local_get(b).i64_xor();
+                    x.local_get(a).local_get(r).i64_xor();
+                }
+                x.i64_and().i64_const(0).i64_lt_s().br_if(slow);
+            }
+            BinOp::Mul => {
+                x.local_get(a).local_get(b).i64_mul().local_set(r);
+                // Overflow: a != 0 and (a == -1 ? b == MIN : r / a != b), the division
+                // by 1 when it would trap.
+                x.local_get(a).i64_const(0).i64_ne();
+                x.local_get(a).i64_const(-1).i64_eq();
+                x.local_get(b).i64_const(i64::MIN).i64_eq();
+                x.i32_and();
+                x.local_get(a).i64_const(-1).i64_ne();
+                x.local_get(r);
+                x.local_get(a).i64_const(1);
+                x.local_get(a).i64_const(0).i64_ne();
+                x.local_get(a).i64_const(-1).i64_ne();
+                x.i32_and().select();
+                x.i64_div_s().local_get(b).i64_ne();
+                x.i32_and().i32_or().i32_and().br_if(slow);
+            }
+            BinOp::Div | BinOp::Rem => {
+                x.local_get(b).i64_eqz().br_if(slow);
+                x.local_get(a).i64_const(i64::MIN).i64_eq();
+                x.local_get(b).i64_const(-1).i64_eq();
+                x.i32_and().br_if(slow);
+                x.local_get(a).local_get(b).i64_div_s().local_set(q);
+                x.local_get(a).local_get(b).i64_rem_s().local_set(r);
+                if op == BinOp::Div {
+                    x.local_get(q).i64_const(1).i64_sub();
+                    x.local_get(q).i64_const(1).i64_add();
+                    x.local_get(b).i64_const(0).i64_gt_s();
+                    x.select();
+                    x.local_get(q);
+                } else {
+                    x.local_get(r).local_get(b).i64_sub();
+                    x.local_get(r).local_get(b).i64_add();
+                    x.local_get(b).i64_const(0).i64_lt_s();
+                    x.select();
+                    x.local_get(r);
+                }
+                x.local_get(r).i64_const(0).i64_lt_s();
+                x.select().local_set(r);
+            }
+            op => {
+                x.local_get(a).local_get(b);
+                int_cmp(x, op);
+                x.local_set(B_X);
+                self.write(x, d, TAG_BOOL, Some(B_X));
+                return;
+            }
+        }
+        self.write(x, d, TAG_INT, Some(r));
+    }
+
+    /// Float operation (not `%`) of the two values on the stack into register `d`.
+    fn float_op(&self, x: &mut InstructionSink, op: BinOp, d: Reg) {
+        match op {
+            BinOp::Add => x.f64_add(),
+            BinOp::Sub => x.f64_sub(),
+            BinOp::Mul => x.f64_mul(),
+            BinOp::Div => x.f64_div(),
+            op => {
+                float_cmp(x, op);
+                x.local_set(B_X);
+                self.write(x, d, TAG_BOOL, Some(B_X));
+                return;
+            }
+        };
+        x.local_set(B_F);
+        self.write(x, d, TAG_FLOAT, Some(B_F));
+    }
+
+    /// `ins` with its fast path `fast` (which branches out one level up for the slow path,
+    /// two levels up once done), `bk_step` otherwise.
+    fn with_slow(
+        &self,
+        x: &mut InstructionSink,
+        ins: &Instr,
+        span: Span,
+        fast: impl FnOnce(&mut InstructionSink),
+    ) {
+        x.block(BlockType::Empty);
+        x.block(BlockType::Empty);
+        fast(x);
+        x.br(1);
+        x.end();
+        self.step(x, ins, span);
+        x.end();
+    }
+
+    /// Code of an instruction.
+    #[allow(clippy::vec_box)]
+    fn instr(
+        &self,
+        x: &mut InstructionSink,
+        ins: &Instr,
+        span: Span,
+        caches: &mut Vec<Box<FieldCache>>,
+    ) {
+        use Instr::*;
+        let ty = |r: Reg| self.regs_ty[r as usize];
+        match ins {
+            GetUp(r, u) => self.fast(x, Fast::GetUp, *r, *u, 0, ins, span),
+            SetUp(u, a) => self.fast(x, Fast::SetUp, *u, *a, 0, ins, span),
+            GetCell(r, c) => self.fast(x, Fast::GetCell, *r, *c, 0, ins, span),
+            SetCell(c, a) => self.fast(x, Fast::SetCell, *c, *a, 0, ins, span),
+            GetGlobal(r, g) => self.fast(x, Fast::GetGlobal, *r, *g, 0, ins, span),
+            SetGlobal(g, a) => self.fast(x, Fast::SetGlobal, *g, *a, 0, ins, span),
+            Field(r, a, name, _) | FieldAs(r, a, name, _) => {
+                let want = match ins {
+                    FieldAs(.., t) => *t,
+                    _ => RegTy::Value,
+                };
+                caches.push(Box::new(FieldCache {
+                    info: None,
+                    idx: 0,
+                    name: *name,
+                    want,
+                }));
+                let p = &**caches.last().unwrap() as *const FieldCache as usize;
+                self.fast(x, Fast::Field, *r, *a, p, ins, span);
+            }
+            Call { .. } => {
+                x.local_get(0).local_get(1);
+                x.i32_const(span.start as i32).i32_const(span.end as i32);
+                x.i32_const(ins as *const Instr as usize as i32);
+                x.i32_const(fn_index(FAST[Fast::Call as usize].1 as *const () as usize))
+                    .call_indirect(0, self.t_step);
+                x.if_(BlockType::Empty).i32_const(1).return_().end();
+            }
+            // The expected tag, or an `int` to `float`; otherwise the interpreter produces
+            // the error.
+            Guard(r, a, t) if *t != RegTy::Value && ty(*r) == *t => {
+                self.with_slow(x, ins, span, |x| {
+                    let (tag, local) = match t {
+                        RegTy::Int => (TAG_INT, B_A),
+                        RegTy::Float => (TAG_FLOAT, B_F),
+                        _ => (TAG_BOOL, B_X),
+                    };
+                    self.tag(x, *a);
+                    x.local_tee(B_TA).i32_const(tag as i32).i32_eq();
+                    x.if_(BlockType::Empty);
+                    match t {
+                        RegTy::Int => self.int(x, *a),
+                        RegTy::Float => self.float(x, *a),
+                        _ => self.boolean(x, *a),
+                    }
+                    x.local_set(local);
+                    self.write(x, *r, tag, Some(local));
+                    x.br(2);
+                    x.end();
+                    if *t == RegTy::Float {
+                        x.local_get(B_TA).i32_const(TAG_INT as i32).i32_eq();
+                        x.if_(BlockType::Empty);
+                        self.int(x, *a);
+                        x.f64_convert_i64_s().local_set(B_F);
+                        self.write(x, *r, TAG_FLOAT, Some(B_F));
+                        x.br(2);
+                        x.end();
+                    }
+                    x.br(0);
+                });
+            }
+            Int(r, n) => {
+                x.i64_const(*n).local_set(B_A);
+                self.write(x, *r, TAG_INT, Some(B_A));
+            }
+            Float(r, f) => {
+                x.f64_const((*f).into()).local_set(B_F);
+                self.write(x, *r, TAG_FLOAT, Some(B_F));
+            }
+            Bool(r, b) => {
+                x.i32_const(*b as i32).local_set(B_X);
+                self.write(x, *r, TAG_BOOL, Some(B_X));
+            }
+            Nil(r) => self.write(x, *r, TAG_NIL, None),
+            Move(dst, a) if ty(*a) != RegTy::Value => {
+                let (tag, local) = match ty(*a) {
+                    RegTy::Int => {
+                        self.int(x, *a);
+                        (TAG_INT, B_A)
+                    }
+                    RegTy::Float => {
+                        self.float(x, *a);
+                        (TAG_FLOAT, B_F)
+                    }
+                    _ => {
+                        self.boolean(x, *a);
+                        (TAG_BOOL, B_X)
+                    }
+                };
+                x.local_set(local);
+                self.write(x, *dst, tag, Some(local));
+            }
+            // Copy of a value: direct if it is scalar, otherwise through the interpreter.
+            Move(dst, a) if ty(*dst) == RegTy::Value => {
+                self.with_slow(x, ins, span, |x| {
+                    self.tag(x, *a);
+                    x.local_tee(B_TA)
+                        .i32_const(FIRST_HEAP_TAG as i32)
+                        .i32_ge_u();
+                    x.br_if(0);
+                    // Both words: the payload of a `bool` is in the first one.
+                    x.local_get(B_REGS).i64_load(at(roff(*a), 3)).local_set(B_A);
+                    x.local_get(B_REGS)
+                        .i64_load(at(roff(*a) + 8, 3))
+                        .local_set(B_B);
+                    self.write(x, *dst, TAG_NIL, None);
+                    x.local_get(B_REGS)
+                        .local_get(B_A)
+                        .i64_store(at(roff(*dst), 3));
+                    x.local_get(B_REGS)
+                        .local_get(B_B)
+                        .i64_store(at(roff(*dst) + 8, 3));
+                });
+            }
+            IBin(op, r, a, b) => {
+                self.with_slow(x, ins, span, |x| {
+                    self.int(x, *a);
+                    x.local_set(B_A);
+                    self.int(x, *b);
+                    x.local_set(B_B);
+                    self.int_op(x, *op, *r, 0);
+                });
+            }
+            IBinK(op, r, a, k) => {
+                self.with_slow(x, ins, span, |x| {
+                    self.int(x, *a);
+                    x.local_set(B_A);
+                    x.i64_const(*k).local_set(B_B);
+                    self.int_op(x, *op, *r, 0);
+                });
+            }
+            FBin(op, r, a, b) if *op != BinOp::Rem => {
+                self.float(x, *a);
+                self.float(x, *b);
+                self.float_op(x, *op, *r);
+            }
+            IToF(r, a) => {
+                self.int(x, *a);
+                x.f64_convert_i64_s().local_set(B_F);
+                self.write(x, *r, TAG_FLOAT, Some(B_F));
+            }
+            FNeg(r, a) => {
+                self.float(x, *a);
+                x.f64_neg().local_set(B_F);
+                self.write(x, *r, TAG_FLOAT, Some(B_F));
+            }
+            Not(r, a) => {
+                self.truthy(x, *a);
+                x.i32_eqz().local_set(B_X);
+                self.write(x, *r, TAG_BOOL, Some(B_X));
+            }
+            // Generic operation: inline for two integers or two floats.
+            Bin(op, r, a, b) if is_arith(*op) || is_cmp(*op) => {
+                self.with_slow(x, ins, span, |x| {
+                    self.tag(x, *a);
+                    x.local_set(B_TA);
+                    self.tag(x, *b);
+                    x.local_set(B_TB);
+                    x.block(BlockType::Empty);
+                    x.local_get(B_TA).i32_const(TAG_INT as i32).i32_eq();
+                    x.local_get(B_TB).i32_const(TAG_INT as i32).i32_eq();
+                    x.i32_and().i32_eqz().br_if(0);
+                    self.int(x, *a);
+                    x.local_set(B_A);
+                    self.int(x, *b);
+                    x.local_set(B_B);
+                    self.int_op(x, *op, *r, 1);
+                    x.br(2);
+                    x.end();
+                    if *op == BinOp::Rem {
+                        x.br(0);
+                    } else {
+                        x.local_get(B_TA).i32_const(TAG_FLOAT as i32).i32_eq();
+                        x.local_get(B_TB).i32_const(TAG_FLOAT as i32).i32_eq();
+                        x.i32_and().i32_eqz().br_if(0);
+                        self.float(x, *a);
+                        self.float(x, *b);
+                        self.float_op(x, *op, *r);
+                    }
+                });
+            }
+            _ => self.step(x, ins, span),
+        }
+    }
+}
+
+/// The code of a baseline function's blocks.
+struct BaseBlocks<'a> {
+    b: &'a Base<'a>,
+    p: &'a Proto,
+    #[allow(clippy::vec_box)]
+    caches: &'a mut Vec<Box<FieldCache>>,
+}
+
+impl Blocks for BaseBlocks<'_> {
+    fn block(&mut self, x: &mut InstructionSink, bi: usize) -> Exit {
+        let b = self.b;
+        let blk = &self.p.blocks[bi];
+        for (ins, &span) in blk.instrs.iter().zip(&blk.spans) {
+            b.instr(x, ins, span, self.caches);
+        }
+        match &blk.term {
+            Term::Reraise(_) => unreachable!("function with handlers compiled"),
+            Term::Jump(t) => Exit::Jump(*t),
+            Term::Branch { cond, then, else_ } => {
+                b.truthy(x, *cond);
+                Exit::Cond(*then, *else_)
+            }
+            Term::IfInt {
+                op,
+                a,
+                b: y,
+                then,
+                else_,
+            } => {
+                b.int(x, *a);
+                b.int(x, *y);
+                int_cmp(x, *op);
+                Exit::Cond(*then, *else_)
+            }
+            Term::IfIntK {
+                op,
+                a,
+                k,
+                then,
+                else_,
+            } => {
+                b.int(x, *a);
+                x.i64_const(*k);
+                int_cmp(x, *op);
+                Exit::Cond(*then, *else_)
+            }
+            Term::Return { reg, shape } => {
+                x.local_get(1).i32_const(*reg as i32);
+                x.i32_store(at(std::mem::offset_of!(NativeFrame, ret) as u64, 2));
+                x.local_get(1).i32_const(shape.unwrap_or(u32::MAX) as i32);
+                x.i32_store(at(std::mem::offset_of!(NativeFrame, ret_shape) as u64, 2));
+                x.i32_const(0).return_();
+                Exit::Return
+            }
+            Term::IterNext {
+                iter,
+                dst,
+                body,
+                done,
+            } => {
+                x.local_get(1)
+                    .i32_const(*iter as i32)
+                    .i32_const(*dst as i32);
+                x.i32_const(fn_index(bk_iter_next as *const () as usize))
+                    .call_indirect(0, b.t_iter);
+                Exit::Cond(*body, *done)
+            }
+        }
+    }
+}
+
+impl Jit {
+    /// Compiles `p` to baseline code; returns its entry point (a table index).
+    pub fn compile_dynamic(&mut self, p: &Proto) -> Option<usize> {
+        // `rescue` / `ensure`: left to the interpreter.
+        if !p.handlers.is_empty() {
+            return None;
+        }
+        let compiler = COMPILER.with(Cell::get)?;
+        let mut types = Types::default();
+        let entry_ty = types.index(vec![ValType::I32; 2], vec![ValType::I32]);
+        let b = Base {
+            regs_ty: &p.regs,
+            t_step: types.index(vec![ValType::I32; 5], vec![ValType::I32]),
+            t_iter: types.index(vec![ValType::I32; 3], vec![ValType::I32]),
+            t_drop: types.index(vec![ValType::I32], vec![]),
+        };
+        let mut f = Function::new([
+            (1, ValType::I32),
+            (4, ValType::I64),
+            (2, ValType::I32),
+            (1, ValType::F64),
+            (2, ValType::I32),
+        ]);
+        let mut x = f.instructions();
+        x.local_get(1)
+            .i32_load(at(std::mem::offset_of!(NativeFrame, regs) as u64, 2))
+            .local_set(B_REGS);
+        let reached = vec![true; p.blocks.len()];
+        let mut bb = BaseBlocks {
+            b: &b,
+            p,
+            caches: &mut self.field_caches,
+        };
+        control_flow(&mut x, &successors(p), &reached, B_PC, &mut bb);
+        x.unreachable();
+        x.end();
+        let mut funcs = FunctionSection::new();
+        funcs.function(entry_ty);
+        let mut code = CodeSection::new();
+        code.function(&f);
+        let mut exports = ExportSection::new();
+        exports.export("f0", ExportKind::Func, 0);
+        let base = compiler(&assemble(&types, &funcs, &exports, &code))?;
+        BASELINE.with(|c| c.set(c.get() + 1));
+        Some(base as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn structure(succ: &[&[u32]]) -> Option<Structure> {
+        let succ: Vec<Vec<u32>> = succ.iter().map(|s| s.to_vec()).collect();
+        Structure::new(&succ, &vec![true; succ.len()])
+    }
+
+    #[test]
+    fn loops_and_merges() {
+        // 0 → 1; 1 → 2 | 4; 2 → 3 | 1 (back); 3 → 1 (back); 4: return.
+        let s = structure(&[&[1], &[2, 4], &[3, 1], &[1], &[]]).unwrap();
+        assert_eq!(s.header, [false, true, false, false, false]);
+        assert_eq!(s.merge, [false; 5]);
+        // An `if` whose branches meet: 0 → 1 | 2; 1 → 3; 2 → 3.
+        let s = structure(&[&[1, 2], &[3], &[3], &[]]).unwrap();
+        assert_eq!(s.merge, [false, false, false, true]);
+        let mut c = s.children[0].clone();
+        c.sort();
+        assert_eq!(c, [1, 2, 3]);
+    }
+
+    #[test]
+    fn irreducible_graphs_are_not_structured() {
+        // Two entries into the loop 1 ⇄ 2.
+        assert!(structure(&[&[1, 2], &[2], &[1]]).is_none());
+    }
+
+    #[test]
+    fn unreached_blocks_are_left_out() {
+        let succ = vec![vec![2], vec![1], vec![]];
+        let s = Structure::new(&succ, &[true, false, true]).unwrap();
+        assert_eq!(s.order[1], UNREACHED);
+        assert!(!s.header[1]);
     }
 }

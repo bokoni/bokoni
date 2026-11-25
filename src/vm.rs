@@ -155,7 +155,7 @@ pub struct Runtime {
     #[cfg(any(feature = "jit", feature = "wasm-jit"))]
     pub(crate) jit: Option<native::Jit>,
     /// Error raised while running baseline native code, waiting to be propagated.
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "wasm-jit"))]
     pending: Option<Error>,
 }
 
@@ -205,7 +205,7 @@ impl Runtime {
             gc_calls: GC_CALLS,
             #[cfg(any(feature = "jit", feature = "wasm-jit"))]
             jit: None,
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "wasm-jit"))]
             pending: None,
         }
     }
@@ -296,7 +296,7 @@ impl Runtime {
         if let Some(r) = self.native_fast(&c.proto, None, args, span, &c.upvals) {
             return r;
         }
-        #[cfg(feature = "jit")]
+        #[cfg(any(feature = "jit", feature = "wasm-jit"))]
         if let Some(r) = self.invoke_native(c, args, span) {
             return r;
         }
@@ -508,7 +508,7 @@ impl Runtime {
             None if proto.ncells == 0 => Vec::new(),
             None => new_cells(proto.ncells),
         };
-        #[cfg(feature = "jit")]
+        #[cfg(any(feature = "jit", feature = "wasm-jit"))]
         if b0 == 0
             && k0 == 0
             && let Some(entry) = self.dyn_entry(proto)
@@ -1358,7 +1358,7 @@ impl Runtime {
     /// does not need: generic binding (unannotated parameters), typed JIT attempt,
     /// cells. `None`: general path (including the stack check, one call level out of
     /// `STACK_CHECK`).
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "wasm-jit"))]
     #[inline]
     fn invoke_native(&mut self, c: &Closure, args: &[Value], span: Span) -> Option<R> {
         let proto = &c.proto;
@@ -1388,7 +1388,7 @@ impl Runtime {
 
     /// Entry point of `proto`'s baseline native code, compiled on the second call (or the
     /// first if it contains a loop).
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "wasm-jit"))]
     #[inline]
     fn dyn_entry(&mut self, proto: &Proto) -> Option<usize> {
         match proto.jit_dyn.get() {
@@ -1405,7 +1405,7 @@ impl Runtime {
             return None;
         }
         if self.jit.is_none() {
-            match crate::jit::Jit::new() {
+            match native::Jit::new() {
                 Some(j) => self.jit = Some(j),
                 None => {
                     self.jit_enabled = false;
@@ -1418,12 +1418,12 @@ impl Runtime {
         (e != 1).then_some(e)
     }
 
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "wasm-jit"))]
     pub(crate) fn set_pending(&mut self, e: Error) {
         self.pending = Some(e);
     }
 
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "wasm-jit"))]
     fn run_native(
         &mut self,
         entry: usize,

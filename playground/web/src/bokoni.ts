@@ -41,6 +41,8 @@ interface Exports {
   result_len(): number;
   set_jit(on: number): void;
   jit_compiled(): number;
+  jit_baseline(): number;
+  jit_dispatched(): number;
 }
 
 const encoder = new TextEncoder();
@@ -101,14 +103,27 @@ export class Bokoni {
     return this.call("run_again", src);
   }
 
-  /** Typed functions compiled to WebAssembly (the default), or all interpreted. */
-  setJit(on: boolean) {
-    this.x.set_jit(on ? 1 : 0);
+  /**
+   * Functions compiled to WebAssembly (the default), every one from its first call
+   * (`"eager"`, for tests; `"dispatch"`, also without structured control flow), or none.
+   */
+  setJit(on: boolean | "eager" | "dispatch") {
+    this.x.set_jit(on === "dispatch" ? 3 : on === "eager" ? 2 : on ? 1 : 0);
   }
 
-  /** Number of functions compiled to WebAssembly so far. */
+  /** Number of typed functions compiled to WebAssembly so far. */
   get compiled(): number {
     return this.x.jit_compiled();
+  }
+
+  /** Number of other functions compiled to WebAssembly (baseline code) so far. */
+  get baseline(): number {
+    return this.x.jit_baseline();
+  }
+
+  /** Number of compiled functions whose control flow could not be structured. */
+  get dispatched(): number {
+    return this.x.jit_dispatched();
   }
 
   /** Static checks only: the script is compiled, not run. */

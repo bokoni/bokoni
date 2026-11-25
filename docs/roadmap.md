@@ -471,8 +471,11 @@ namespaces, `trait` for shared behavior.
       typed functions (`int` / `float` / `bool`) written as WebAssembly modules with
       `wasm-encoder`, instantiated by the host against the program's memory and function
       table, called through function pointers; used by the playground (`fib(25)`: 26.6 ms
-      → 0.5 ms in Chrome). Same answers as the interpreter: edge cases, examples, random
-      programs (`playground/web/test/jit.test.ts`)
+      → 0.3 ms in Chrome); results without annotation inferred; baseline code for the
+      other functions (`src/baseline.rs`, the helpers shared with Cranelift's); structured
+      control flow ("Beyond Relooper"). Same answers as the interpreter: edge cases,
+      examples, random programs, the programs of the Rust tests
+      (`playground/web/test/`)
 
 ## Decisions that commit the JIT
 

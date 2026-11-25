@@ -1,6 +1,7 @@
-// Typed functions compiled to WebAssembly (`bokoni::wasm_jit`) against the interpreter:
-// the same answer (value, errors, positions, call stack) for each program, run once
-// interpreted and once compiled.
+// Functions compiled to WebAssembly (`bokoni::wasm_jit`) against the interpreter: the
+// same answer (value, errors, positions, call stack) for each program, run interpreted,
+// compiled as usual, and with every function compiled from its first call (`eager`: the
+// baseline code of the untyped ones).
 
 import { beforeAll, describe, expect, test } from "bun:test";
 import { Bokoni } from "../src/bokoni";
@@ -15,22 +16,28 @@ beforeAll(async () => {
   bk = await Bokoni.instantiate(await WebAssembly.compile(bytes), (t) => (printed += t));
 });
 
-/** Runs `src` interpreted, then compiled: both answers and what each printed. */
+/**
+ * Runs `src` interpreted, compiled, then compiled eagerly: the answers and what each
+ * printed; the typed functions compiled (as usual).
+ */
 function both(src: string) {
-  bk.setJit(false);
-  printed = "";
-  const interpreted = { answer: bk.run(src), printed };
-  bk.setJit(true);
-  printed = "";
+  const run = (mode: boolean | "eager") => {
+    bk.setJit(mode);
+    printed = "";
+    return { answer: bk.run(src), printed };
+  };
+  const interpreted = run(false);
   const before = bk.compiled;
-  const compiled = { answer: bk.run(src), printed };
-  return { interpreted, compiled, functions: bk.compiled - before };
+  const compiled = run(true);
+  const functions = bk.compiled - before;
+  return { interpreted, compiled, eager: run("eager"), functions };
 }
 
-/** Same answer both ways; returns the number of functions compiled. */
+/** The same answers; returns the number of typed functions compiled. */
 function same(src: string): number {
   const r = both(src);
   expect(r.compiled).toEqual(r.interpreted);
+  expect(r.eager).toEqual(r.interpreted);
   return r.functions;
 }
 
@@ -107,7 +114,7 @@ def norm(a: float, b: float): float = sq(a) + sq(b)
     expect(same(src)).toBeGreaterThanOrEqual(2);
   });
 
-  test("results of different types: interpreted", () => {
+  test("results of different types: not typed", () => {
     // (An `int` and a `float`: no one native type, unlike `: float`, which converts.)
     expect(same("def f(n) = if n > 0 then 1 else 2.5 end\n[f(1), f(-1)]")).toBe(0);
     expect(same("def f(n): float = n * 2\n[f(1), f(-1)]")).toBe(1);
@@ -170,6 +177,7 @@ test("every example: the same output", () => {
   for (const ex of examples) {
     const r = both(ex.code);
     expect({ name: ex.name, ...r.compiled }).toEqual({ name: ex.name, ...r.interpreted });
+    expect({ name: ex.name, ...r.eager }).toEqual({ name: ex.name, ...r.interpreted });
   }
 });
 
@@ -180,9 +188,11 @@ test("generated programs: the same answer", () => {
   for (let seed = 1; seed <= n; seed++) {
     const src = program(seed);
     const r = both(src);
-    if (JSON.stringify(r.compiled) !== JSON.stringify(r.interpreted)) {
-      // The program, to reproduce it.
-      expect({ seed, src, ...r.compiled }).toEqual({ seed, src, ...r.interpreted });
+    for (const got of [r.compiled, r.eager]) {
+      if (JSON.stringify(got) !== JSON.stringify(r.interpreted)) {
+        // The program, to reproduce it.
+        expect({ seed, src, ...got }).toEqual({ seed, src, ...r.interpreted });
+      }
     }
     compiled += r.functions;
     if (r.interpreted.answer.diagnostics.length) errors++;
