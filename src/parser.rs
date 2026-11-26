@@ -1584,8 +1584,10 @@ impl Parser<'_, '_> {
                             f.name_span,
                         ))
                     }
-                    Member::Include(_, _, span) if kind != TypeDeclKind::Class => {
-                        Some(("`include` is only allowed in a `class`", *span))
+                    Member::Include(_, _, span)
+                        if !matches!(kind, TypeDeclKind::Class | TypeDeclKind::Trait) =>
+                    {
+                        Some(("`include` is only allowed in a `class` or a `trait`", *span))
                     }
                     Member::Field(f) if kind == TypeDeclKind::Trait => {
                         Some(("a `trait` has no fields: it only describes methods", f.span))

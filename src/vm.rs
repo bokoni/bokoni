@@ -2329,8 +2329,11 @@ impl TypeInfo {
         for tr in &traits {
             methods.extend(tr.methods.iter().map(|(n, m)| (*n, m.clone())));
             required.extend(tr.required.iter().cloned());
-            if !all_traits.iter().any(|x| Rc::ptr_eq(x, tr)) {
-                all_traits.push(tr.clone());
+            // (And the traits it includes.)
+            for x in tr.traits.iter().chain([tr]) {
+                if !all_traits.iter().any(|y| Rc::ptr_eq(x, y)) {
+                    all_traits.push(x.clone());
+                }
             }
         }
         methods.extend(t.methods.iter().cloned());

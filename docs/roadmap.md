@@ -225,7 +225,8 @@ namespaces, `trait` for shared behavior.
 - [x] `abstract class`: not instantiable, may declare `abstract def`s
 - [x] `TypeDesc::traits`, `TypeDesc::is_abstract`, `DeclKind::Trait`
 - [x] Generic traits (`Comparable(T)`, v0.12)
-- [ ] A trait that includes another one
+- [x] A trait that includes another one: its methods and required methods, its type
+      (a class including `Greeter` is a `Named`), generic arguments passed on
 
 ### v0.10 — Modules and files
 
@@ -544,7 +545,6 @@ namespaces, `trait` for shared behavior.
 - [ ] Typed calls return a status with their result (two values): in V8, half the time
       of a recursive `fib` (`fib(30)` written by hand: 1.3 ms returning one value,
       2.4 ms returning two); an exception for the rare cases was no faster
-- [ ] A trait that includes another one (v0.9)
 
 ## Decisions that commit the JIT
 

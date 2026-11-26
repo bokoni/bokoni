@@ -1089,6 +1089,10 @@ impl Checker<'_> {
         for (k, tid) in includes.into_iter().enumerate() {
             let args = g.trait_args.get(k).map_or(&[][..], |a| &a[..]);
             let targs = self.type_args(tid, args, Span::new(0, 0));
+            let tm = self.args_subst(tid, &targs);
+            for (k, v) in &self.types[tid].supers {
+                supers.insert(*k, v.iter().map(|t| self.subst(t, &tm)).collect());
+            }
             supers.insert(tid, targs);
         }
         self.types[id].supers = supers;
@@ -1928,7 +1932,16 @@ impl Checker<'_> {
                     {
                         let targs = self.type_args(tid, args, *span);
                         let tm = self.args_subst(tid, &targs);
+                        // The traits it includes, their arguments in terms of these.
+                        for (k, v) in &self.types[tid].supers {
+                            supers.insert(*k, v.iter().map(|t| self.subst(t, &tm)).collect());
+                        }
                         supers.insert(tid, targs);
+                        for k in self.types[tid].traits.clone() {
+                            if !traits.contains(&k) {
+                                traits.push(k);
+                            }
+                        }
                         let tr = &self.types[tid];
                         for (name, sig) in &tr.methods {
                             let sig = &self.subst_sig(sig, &tm);

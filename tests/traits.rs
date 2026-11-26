@@ -205,8 +205,12 @@ fn trait_errors() {
         "a `trait` has no fields: it only describes methods",
     );
     check(
-        "trait X\n  include Greet\nend",
-        "`include` is only allowed in a `class`",
+        "type X\n  include Greet\nend",
+        "`include` is only allowed in a `class` or a `trait`",
+    );
+    check(
+        "trait X\n  include X\nend",
+        "`X` is not a trait declared before `X`",
     );
     check("trait X\n  def f() = @x\nend", "`X` has no field `@x`");
     check(
@@ -238,4 +242,105 @@ fn trait_errors() {
         out.contains("`Greet` is a trait: it cannot be instantiated"),
         "{out}"
     );
+}
+
+const NAMED: &str = "trait Named
+  abstract def name(): str
+  def tag(): str = \"<#{self.name()}>\"
+end
+trait Greet
+  include Named
+  def greet(): str = \"Hello #{self.name()} #{self.tag()}\"
+end
+";
+
+#[test]
+fn traits_that_include_traits() {
+    // A class including `Greet` is also a `Named`: its methods, its type.
+    let src = format!(
+        "{NAMED}class User
+  include Greet
+  def init(@n: str)
+  end
+  def name(): str = @n
+end
+def show(x: Named): str = x.tag()
+def up(x: Greet): Named = x
+let gs: [Named] = [User(\"a\"), up(User(\"b\"))]
+[User(\"ann\").greet(), show(User(\"bo\")), gs.map(|g| g.tag()), User(\"c\").is_a?(Named), User(\"c\").is_a?(Greet)]"
+    );
+    assert_eq!(
+        run(&src),
+        "=> [\"Hello ann <ann>\", \"<bo>\", [\"<a>\", \"<b>\"], true, true]"
+    );
+    // A method required by the included trait: provided by the trait including it, or
+    // by the class; otherwise an error naming the trait that requires it.
+    let src = format!(
+        "{NAMED}trait Fixed\n  include Named\n  def name(): str = \"f\"\nend\nclass F\n  include Fixed\nend\nF().tag()"
+    );
+    assert_eq!(run(&src), "=> \"<f>\"");
+    let err = run(&format!("{NAMED}class U\n  include Greet\nend"));
+    assert!(err.contains("`U` must define `name` (required by `Named`)"), "{err}");
+    let err = run_mode(&format!("{NAMED}class U\n  include Greet\nend"), false, false, false);
+    assert!(err.contains("`U` must define `name` (required by `Named`)"), "{err}");
+    // Not a `Greet` for including only `Named`.
+    let err = run(&format!(
+        "{NAMED}class U\n  include Named\n  def name(): str = \"u\"\nend\ndef f(x: Greet) = x\nf(U())"
+    ));
+    assert!(err.contains("expected type `Greet` for `x`, got `U`"), "{err}");
+    // Without static checks: checked when calling.
+    let out = run_mode(
+        &format!("{NAMED}class U\n  include Named\n  def name(): str = \"u\"\nend\ndef f(x: Greet) = x\nf(U())"),
+        false,
+        false,
+        false,
+    );
+    assert!(out.contains("Greet"), "{out}");
+    // Generic: the arguments passed on (`Ord(T)` includes `Eq(T)`).
+    let src = "trait Eq(T)
+  abstract def eq(o: T): bool
+  def ne(o: T): bool = not self.eq(o)
+end
+trait Ord(T)
+  include Eq(T)
+  abstract def cmp(o: T): int
+  def eq(o: T): bool = self.cmp(o) == 0
+end
+class M
+  include Ord(M)
+  def init(@c: int)
+  end
+  def c = @c
+  def cmp(o: M): int = @c - o.c
+end
+def same(a: T, b: T): bool forall T: Eq(T) = a.eq(b)
+[M(1).ne(M(2)), same(M(3), M(3)), M(1).is_a?(Eq)]";
+    assert_eq!(run(src), "=> [true, true, true]");
+    let err = run(&format!(
+        "{src}\ndef f(x: Eq(int)) = x\nf(M(1))"
+    ));
+    assert!(err.contains("expected type `Eq(int)` for `x`, got `M`"), "{err}");
+}
+
+#[test]
+fn included_traits_from_a_previous_script() {
+    let mut e = Engine::new();
+    e.set_output(|_| {});
+    e.eval(NAMED).unwrap();
+    e.eval("trait Loud\n  include Greet\n  def loud(): str = self.greet().upper()\nend")
+        .unwrap();
+    e.eval("class Bot\n  include Loud\n  def name(): str = \"bot\"\nend\ndef show(x: Named): str = x.tag()")
+        .unwrap();
+    assert_eq!(
+        e.eval_as::<String>("Bot().loud() + show(Bot())").unwrap(),
+        "HELLO BOT <BOT><bot>"
+    );
+    let err = e
+        .eval("class Mute\n  include Loud\nend")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("`Mute` must define `name` (required by `Named`)"), "{err}");
+    let ty = e.type_info("Bot").unwrap();
+    assert_eq!(ty.traits, ["Named", "Greet", "Loud"]);
+    assert_eq!(e.type_info("Loud").unwrap().traits, ["Named", "Greet"]);
 }

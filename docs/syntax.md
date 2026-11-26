@@ -699,7 +699,32 @@ welcome(User("ann"))                        # "Hello ann"
   trait or by the parent counts.
 - A trait has no fields and is not instantiated; it is nominal: only the classes that
   `include` it are of its type (`x: Greet`, `[Greet]`, `rescue e: Retryable`).
-- `include` only in a class; a trait does not include another one (yet).
+- `include` in a class or a trait. A trait that includes another one has its methods
+  and requires what it requires; a class that includes it is of both types:
+
+```ruby
+trait Named
+  abstract def name(): str
+  def tag(): str = "<#{self.name()}>"
+end
+
+trait Greeter
+  include Named
+  def hello(): str = "Hello #{self.tag()}"
+end
+
+class Bot
+  include Greeter
+  def name(): str = "bot"
+end
+
+def show(x: Named): str = x.tag()
+show(Bot())                                 # "<bot>": a `Greeter` is a `Named`
+Bot().hello()                               # "Hello <bot>"
+```
+
+  A generic trait passes its arguments on (`trait Ord(T)` with `include Eq(T)`); the
+  trait included is declared before.
 
 ### Abstract classes
 
