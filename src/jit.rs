@@ -1520,7 +1520,77 @@ extern "C" fn bk_each(
         let mut kept = Vec::with_capacity(if call.op == EachOp::Map { n } else { 0 });
         // A `map` element not of the native result's type.
         let mut other = false;
-        for k in 0..n {
+        // The closure's result `r` for element `v`.
+        macro_rules! accept {
+            ($r:expr, $v:expr) => {
+                match call.op {
+                    EachOp::Map => kept.push($r),
+                    EachOp::Filter => {
+                        if $r.truthy() {
+                            kept.push($v.clone());
+                        }
+                    }
+                    EachOp::Each => {}
+                    EachOp::Any if $r.truthy() => {
+                        *out = 1;
+                        return 0;
+                    }
+                    EachOp::All if !$r.truthy() => {
+                        *out = 0;
+                        return 0;
+                    }
+                    EachOp::Any | EachOp::All => {}
+                }
+            };
+        }
+        let mut start = 0;
+        // A closure that changes no list and calls nothing, its native code returning a
+        // simple value: the list read in place, its code looked up once (nothing it does
+        // can replace it), until a status other than 0.
+        let fast = match &*call.proto.jit.borrow() {
+            JitState::Native(code) if call.pure && code.params.len() == 1 => {
+                Some((code.entry, code.ret)).filter(|(_, r)| *r != RegTy::Value)
+            }
+            _ => None,
+        };
+        if let Some((entry, ret)) = fast {
+            let code: extern "C" fn(*mut JitCtx, *const u64, *mut u64) -> i32 =
+                std::mem::transmute(entry);
+            let items = l.borrow();
+            (*ctx).env = c.upvals.as_ptr();
+            while start < n {
+                let v = &items[start];
+                let arg = match (call.param, v) {
+                    (RegTy::Float, Value::Int(i)) => (*i as f64).to_bits(),
+                    (_, Value::Int(i)) => *i as u64,
+                    (_, Value::Float(x)) => x.to_bits(),
+                    (_, Value::Bool(b)) => *b as u64,
+                    _ => return 3,
+                };
+                let mut word = 0u64;
+                (*ctx).depth = depth + 1;
+                let status = code(ctx, &arg, &mut word);
+                (*ctx).depth = depth;
+                let r = match status {
+                    0 => match ret {
+                        RegTy::Int => Value::Int(word as i64),
+                        RegTy::Float => Value::Float(f64::from_bits(word)),
+                        _ => Value::Bool(word & 1 == 1),
+                    },
+                    2 => {
+                        other = true;
+                        (*ctx).returned.take().unwrap_or(Value::Nil)
+                    }
+                    _ => return 1,
+                };
+                start += 1;
+                accept!(r, v);
+                if status != 0 {
+                    break;
+                }
+            }
+        }
+        for k in start..n {
             let item;
             let v = match copy.get(k) {
                 Some(v) => v,
@@ -1580,24 +1650,7 @@ extern "C" fn bk_each(
                     }
                 }
             };
-            match call.op {
-                EachOp::Map => kept.push(r),
-                EachOp::Filter => {
-                    if r.truthy() {
-                        kept.push(v.clone());
-                    }
-                }
-                EachOp::Each => {}
-                EachOp::Any if r.truthy() => {
-                    *out = 1;
-                    return 0;
-                }
-                EachOp::All if !r.truthy() => {
-                    *out = 0;
-                    return 0;
-                }
-                EachOp::Any | EachOp::All => {}
-            }
+            accept!(r, v);
         }
         let v = match call.op {
             EachOp::Any => {

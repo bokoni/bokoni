@@ -519,10 +519,16 @@ namespaces, `trait` for shared behavior.
 - [x] Compiling deep in a recursion (Cranelift needs more stack than a call): on a
       stack grown on the heap first; the recursion through `map` overflowed the stack
 
+- [x] `bk_each` for a closure that changes no list: the list read in place and the
+      closure's code looked up once, until a status other than 0 (about 12 ns → 5 ns
+      per element; the closure itself takes under 2). `map` then `filter`, 100 k
+      elements, 10 times in a typed function: 28 ms → 14.8 ms natively, 34 ms → 21 ms
+      in Chrome; faster than the same written with `for` loops and `<<`
+
 ### Next
 
-- [ ] The same loop in native code (no call through Rust per element, about 12 ns
-      now), the closure inlined when small
+- [ ] The same loop in native code, the closure inlined when small: about 2 ns of the
+      5 left per element (the call of the entry point, the `Value` built)
 - [ ] Typed calls return a status with their result (two values): in V8, half the time
       of a recursive `fib` (`fib(30)` written by hand: 1.3 ms returning one value,
       2.4 ms returning two); an exception for the rare cases was no faster
