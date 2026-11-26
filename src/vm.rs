@@ -132,6 +132,11 @@ pub(crate) const STACK_GROW: usize = 2 * 1024 * 1024;
 /// The stack is only checked once every `STACK_CHECK` call levels: the red zone easily
 /// covers those calls (under 32 KiB each).
 const STACK_CHECK: usize = 8;
+/// Compiling (Cranelift) needs more stack than a call: it may start deep in a recursion.
+#[cfg(any(feature = "jit", feature = "wasm-jit"))]
+const COMPILE_RED_ZONE: usize = 1024 * 1024;
+#[cfg(any(feature = "jit", feature = "wasm-jit"))]
+const COMPILE_STACK: usize = 4 * 1024 * 1024;
 
 /// Interpreter state: names, global variables, `print` output.
 pub struct Runtime {
@@ -1421,7 +1426,11 @@ impl Runtime {
                 }
             }
         }
-        let e = self.jit.as_mut()?.compile_dynamic(proto).unwrap_or(1);
+        let jit = self.jit.as_mut()?;
+        let e = stacker::maybe_grow(COMPILE_RED_ZONE, COMPILE_STACK, || {
+            jit.compile_dynamic(proto)
+        })
+        .unwrap_or(1);
         proto.jit_dyn.set(e);
         (e != 1).then_some(e)
     }
@@ -1668,7 +1677,10 @@ impl Runtime {
                 any: self.syms.any,
                 all: self.syms.all,
             };
-            jit.compile(proto, this, &mut self.globals, upvals, regs);
+            let globals = &mut self.globals;
+            stacker::maybe_grow(COMPILE_RED_ZONE, COMPILE_STACK, || {
+                jit.compile(proto, this, globals, upvals, regs)
+            });
         }
         let (entry, n, by_ref, ret) = match &*proto.jit.borrow() {
             JitState::Native(code) => (

@@ -85,7 +85,9 @@ The translation:
 - Stack slots live in an area of the program's memory used as a stack, a function's
   frame taken there on its first use (a typed function's slots mostly serve its
   resumptions, rarely taken). Values nothing uses are not computed, stores into slots
-  nothing reads not made.
+  nothing reads not made. A value used once in its block, with no store or call in
+  between, is computed where it is used rather than kept in a local; a constant at each
+  use (modules a quarter smaller).
 - Control flow is structured, as a compiler from a structured language would write it
   (N. Ramsey, "Beyond Relooper", 2022): a `loop` for each loop header, a `block` before
   each block reached by several forward edges, the others written inline where they are
@@ -106,7 +108,7 @@ Measured in Chrome (V8), the interpreter against the compiled code of the playgr
 | `float`: harmonic series, 1 M iterations | 28.1 ms | 0.8 ms |
 | sum of a list of 200,000 `int`, twice | 14.4 ms | 2.7 ms |
 | `type` objects created and read, 100,000 | 15.4 ms | 5.0 ms |
-| dot product of two `type` objects, 1 M | 242 ms | 28 ms |
+| dot product of two `type` objects, 1 M | 233 ms | 9.3 ms |
 | `map` / `filter` over 100,000 elements | 14.9 ms | 5.4 ms |
 | string interpolation, 100,000 | 5.7 ms | 5.3 ms |
 | a closure of the function called 300,000 times | 27.6 ms | 2.9 ms |

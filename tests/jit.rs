@@ -1298,6 +1298,25 @@ fn list_methods_with_closures_in_typed_code() {
 }
 
 #[test]
+fn copies_of_values_set_once_are_borrowed() {
+    // A copy of a value written once, on entry, borrows it (not copied through Rust):
+    // same results, the value still freed once.
+    for src in [
+        "type V\n  x: float\n  y: float\nend\ndef dot(a: V, b: V): float = a.x * b.x + a.y * b.y\ndef f(n: int): float\n  let a = V(x: 1.5, y: 2.0)\n  let b = V(x: 0.5, y: 4.0)\n  let s = 0.0\n  for i in 0...n\n    s += dot(a, b)\n  end\n  s\nend\nf(1000)",
+        // Returned, kept in a list, the original reassigned (not borrowed then).
+        "type P\n  x: int\nend\ndef f(n: int): P\n  let p = P(x: n)\n  let q = p\n  q\nend\nf(3).x",
+        "type P\n  x: int\nend\ndef f(n: int): [P]\n  let p = P(x: n)\n  let out: [P] = []\n  for i in 0...3\n    let q = p\n    out << q\n  end\n  out\nend\nf(4).map(|p| p.x)",
+        "type P\n  x: int\nend\ndef f(n: int): int\n  let p = P(x: 1)\n  let t = 0\n  for i in 0...n\n    let q = p\n    p = P(x: i)\n    t += q.x + p.x\n  end\n  t\nend\nf(5)",
+        "def f(xs: [int]): int\n  let ys = xs\n  ys << 4\n  xs.len() + ys.len()\nend\nf([1, 2])",
+        "def f(s: str, n: int): str\n  let t = s + \"!\"\n  let out = \"\"\n  for i in 0...n\n    let u = t\n    out = out + u\n  end\n  out\nend\nf(\"a\", 3)",
+        // Resumed in the interpreter while borrowed.
+        "type P\n  x: int\nend\ndef g(p: P, i: int) = if i == 3 then p.x * 0.5 else p.x end\ndef f(n: int)\n  let p = P(x: 7)\n  let t = 0.0\n  for i in 0...n\n    let q = p\n    t += g(q, i)\n  end\n  [t, p.x]\nend\nf(6)",
+    ] {
+        same(src);
+    }
+}
+
+#[test]
 fn hashes_records_tuples_in_native_code() {
     // Done by the interpreter's code from native code: same results and errors.
     for src in [

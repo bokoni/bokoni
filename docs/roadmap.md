@@ -507,13 +507,25 @@ namespaces, `trait` for shared behavior.
       in a typed function: 112 ms interpreted, 28 ms natively (about 45 ms through the
       built-ins); in Chrome, 153 ms → 34 ms
 
+- [x] WebAssembly backend measured against `fib` written by hand: with the same checks
+      (overflow, call depth, status returned), the generated code is 25% slower in
+      Chrome, not 4 to 6 times; the rest is what the language asks. Values used once
+      computed where they are used, constants at each use: modules 25% smaller (the
+      playground's examples, 45 KB → 34 KB), no faster (V8 and JavaScriptCore already
+      do it)
+- [x] A copy of an object (or list, string) written once on entry borrows it rather
+      than being copied through Rust on each use: `dot(a, b)` over two `type` objects,
+      1 M calls, 28 ms → 9.3 ms in Chrome, 4 times faster natively
+- [x] Compiling deep in a recursion (Cranelift needs more stack than a call): on a
+      stack grown on the heap first; the recursion through `map` overflowed the stack
+
 ### Next
 
 - [ ] The same loop in native code (no call through Rust per element, about 12 ns
       now), the closure inlined when small
-- [ ] WebAssembly backend: typed code 4 to 6 times slower than a module written by hand
-      (`fib(25)`: 1.0 ms against 0.2 ms in phase 0): addresses converted at each
-      access, values kept in locals the translation could merge
+- [ ] Typed calls return a status with their result (two values): in V8, half the time
+      of a recursive `fib` (`fib(30)` written by hand: 1.3 ms returning one value,
+      2.4 ms returning two); an exception for the rare cases was no faster
 - [ ] wasmtime host: compiling costs about 1 ms and a few million units of fuel per
       function; compile only after some calls, rather than run short scripts
       (configurations) interpreted (`jit: 0`)

@@ -522,6 +522,8 @@ struct Translator<'a> {
     live: FxHashSet<Value>,
     /// Stores into stack slots nothing reads.
     dead_stores: FxHashSet<ir::Inst>,
+    /// Values computed where they are used rather than kept in a local (`trees`).
+    inline: FxHashSet<Value>,
 }
 
 /// Instructions whose effect is more than their results.
@@ -561,8 +563,10 @@ impl<'a> Translator<'a> {
             failed: false,
             live: FxHashSet::default(),
             dead_stores: FxHashSet::default(),
+            inline: FxHashSet::default(),
         };
         t.liveness();
+        t.trees();
         // The parameters: those of the entry block.
         let entry = *t.blocks.first().ok_or(())?;
         for (k, v) in func.dfg.block_params(entry).iter().enumerate() {
@@ -691,6 +695,87 @@ impl<'a> Translator<'a> {
         }
     }
 
+    /// The values computed where they are used, as a compiler from expressions would
+    /// write them: constants, at each use; a value used once, by an instruction of the
+    /// same block, when nothing with an effect (a store, a call) comes in between. Their
+    /// operands keep their value there: each value has its own local, and a block's
+    /// parameters are assigned only on the edges into it.
+    fn trees(&mut self) {
+        let f = self.func;
+        let dfg = &f.dfg;
+        // Uses of each value (a block's arguments included), and the last user.
+        let mut uses: FxHashMap<Value, (u32, ir::Inst)> = FxHashMap::default();
+        for b in f.layout.blocks() {
+            for i in f.layout.block_insts(b) {
+                for v in dfg.inst_values(i) {
+                    let e = uses.entry(dfg.resolve_aliases(v)).or_insert((0, i));
+                    e.0 += 1;
+                    e.1 = i;
+                }
+            }
+        }
+        for b in f.layout.blocks() {
+            let insts: Vec<ir::Inst> = f.layout.block_insts(b).collect();
+            let at: FxHashMap<ir::Inst, usize> =
+                insts.iter().enumerate().map(|(k, i)| (*i, k)).collect();
+            // Where each instruction's code is written: its place, or its user's.
+            let mut pos: Vec<usize> = (0..insts.len()).collect();
+            for k in (0..insts.len()).rev() {
+                let i = insts[k];
+                let data = dfg.insts[i];
+                let [r] = dfg.inst_results(i) else {
+                    continue;
+                };
+                let r = *r;
+                if !self.live.contains(&r) {
+                    continue;
+                }
+                if matches!(
+                    data,
+                    InstructionData::UnaryImm { .. } | InstructionData::UnaryIeee64 { .. }
+                ) {
+                    self.inline.insert(r);
+                    continue;
+                }
+                let pure = match data {
+                    InstructionData::Binary { opcode, .. } => !matches!(
+                        opcode,
+                        Opcode::SaddOverflow
+                            | Opcode::SsubOverflow
+                            | Opcode::SmulOverflow
+                            | Opcode::Sdiv
+                            | Opcode::Srem
+                    ),
+                    // (`iabs` uses a scratch local.)
+                    InstructionData::Unary { opcode, .. } => opcode != Opcode::Iabs,
+                    InstructionData::LoadNoOffset { .. }
+                    | InstructionData::IntCompare { .. }
+                    | InstructionData::FloatCompare { .. }
+                    | InstructionData::Ternary { .. }
+                    | InstructionData::Load { .. } => true,
+                    _ => false,
+                };
+                let Some(&(1, user)) = uses.get(&r) else {
+                    continue;
+                };
+                let Some(&u) = at.get(&user) else {
+                    continue;
+                };
+                if !pure || u <= k {
+                    continue;
+                }
+                let end = pos[u];
+                let clear = insts[k + 1..end]
+                    .iter()
+                    .all(|j| !effect(dfg.insts[*j].opcode()));
+                if clear {
+                    self.inline.insert(r);
+                    pos[k] = end;
+                }
+            }
+        }
+    }
+
     fn scratch(&mut self, t: ValType) -> u32 {
         self.decl.push(t);
         self.nparams + self.decl.len() as u32 - 1
@@ -720,6 +805,16 @@ impl<'a> Translator<'a> {
     }
 
     fn get(&mut self, x: &mut InstructionSink, v: Value) {
+        let v = self.value(v);
+        if self.inline.contains(&v) {
+            let ir::ValueDef::Result(i, _) = self.func.dfg.value_def(v) else {
+                unreachable!("an instruction's result");
+            };
+            if self.emit(x, i, false).is_err() {
+                self.failed = true;
+            }
+            return;
+        }
         let l = self.local(v);
         x.local_get(l);
     }
@@ -825,16 +920,30 @@ impl<'a> Translator<'a> {
         }
     }
 
-    /// Writes instruction `inst` (not a terminator).
+    /// Writes instruction `inst` (not a terminator), unless its result is computed where
+    /// it is used.
     fn inst(&mut self, x: &mut InstructionSink, inst: ir::Inst) -> Result<(), ()> {
         let dfg = &self.func.dfg;
+        if let [r] = dfg.inst_results(inst)
+            && self.inline.contains(r)
+        {
+            return Ok(());
+        }
+        self.emit(x, inst, true)
+    }
+
+    /// The code of instruction `inst`: its result left on the stack, or assigned to its
+    /// local if `keep`.
+    fn emit(&mut self, x: &mut InstructionSink, inst: ir::Inst, keep: bool) -> Result<(), ()> {
+        let dfg = &self.func.dfg;
         let data = dfg.insts[inst];
-        if self.dead_stores.contains(&inst)
-            || (!effect(data.opcode())
-                && dfg
-                    .inst_results(inst)
-                    .iter()
-                    .all(|r| !self.live.contains(r)))
+        if keep
+            && (self.dead_stores.contains(&inst)
+                || (!effect(data.opcode())
+                    && dfg
+                        .inst_results(inst)
+                        .iter()
+                        .all(|r| !self.live.contains(r))))
         {
             return Ok(());
         }
@@ -1123,6 +1232,7 @@ impl<'a> Translator<'a> {
             _ => return Err(()),
         }
         match results.as_slice() {
+            [_] if !keep => Ok(()),
             [r] => {
                 self.set(x, *r);
                 Ok(())

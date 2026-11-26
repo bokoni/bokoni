@@ -4549,6 +4549,45 @@ impl Jit {
                         | Instr::SetCell(..)
                 )
         });
+        // Registers written once, in the entry block (not branched to): their value stays
+        // the same until the function returns, a copy of it can borrow it.
+        let stable = {
+            let mut writes = vec![0u32; nregs];
+            let mut count = |r: Reg, n: u32| {
+                if let Some(w) = writes.get_mut(r as usize) {
+                    *w += n;
+                }
+            };
+            for (bi, b) in p.blocks.iter().enumerate() {
+                // (Written in another block: never stable.)
+                let n = if bi == 0 { 1 } else { 2 };
+                for ins in &b.instrs {
+                    let w = match ins {
+                        Instr::Const(d, _) => Some(*d),
+                        other => reads_writes(p, other).and_then(|(_, w)| w),
+                    };
+                    for w in w.into_iter().chain(extra_writes(ins)) {
+                        count(w, n);
+                    }
+                }
+                if let Term::IterNext { dst, .. } = &b.term {
+                    count(*dst, 2);
+                }
+            }
+            let entry_reached = p.blocks.iter().any(|b| match &b.term {
+                Term::Jump(t) => *t == 0,
+                Term::Branch { then, else_, .. }
+                | Term::IfInt { then, else_, .. }
+                | Term::IfIntK { then, else_, .. } => *then == 0 || *else_ == 0,
+                Term::IterNext { body, done, .. } => *body == 0 || *done == 0,
+                Term::Return { .. } | Term::Reraise(_) => false,
+            });
+            let mut stable: Vec<bool> = writes.iter().map(|w| *w == 1 && !entry_reached).collect();
+            for h in &p.handlers {
+                stable[h.reg as usize] = false;
+            }
+            stable
+        };
         let mut written = vec![false; nregs];
         loop {
             let mut changed = false;
@@ -4557,9 +4596,12 @@ impl Jit {
                     let (w, from_borrowed) = match ins {
                         // A string literal: the function's constant, alive.
                         Instr::Const(d, _) => (Some(*d), true),
-                        Instr::Move(d, a)
-                        | Instr::Coerce { dst: d, src: a, .. }
-                        | Instr::Bin(BinOp::Push, d, a, _) => (Some(*d), borrowed[*a as usize]),
+                        Instr::Move(d, a) => {
+                            (Some(*d), borrowed[*a as usize] || stable[*a as usize])
+                        }
+                        Instr::Coerce { dst: d, src: a, .. } | Instr::Bin(BinOp::Push, d, a, _) => {
+                            (Some(*d), borrowed[*a as usize])
+                        }
                         // A list may change during the call: its elements are copied, a
                         // `for` goes over a copy of it (as in the interpreter).
                         Instr::Index(d, a, _) => (Some(*d), borrowed[*a as usize] && !may_mutate),
