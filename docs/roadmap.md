@@ -530,6 +530,13 @@ namespaces, `trait` for shared behavior.
       50th call, a configuration script stays interpreted (4.6 ms → 0.11 ms), `fib(25)`
       and a loop over objects as fast as before
 
+- [x] Size of the playground's module measured (2.0 MB, 628 KB compressed): Cranelift
+      is about 5% of it, Bokoni's own code most of it (its JIT a quarter, `Jit::define`
+      alone 260 KB, Cranelift's builder inlined into it). Left as it is: Chrome compiles
+      it in 1.5 ms whatever its size (lazily), the editor's JavaScript weighs 3.9 MB;
+      `opt-level = "s"` gives 1.5 MB but an interpreter 3 to 8% slower (built-ins up to
+      25%), `wasm-opt -O3` 1.7 MB but 3% less compressed for 30 s more per build
+
 ### Next
 
 - [ ] The same loop in native code, the closure inlined when small: about 2 ns of the
@@ -537,8 +544,6 @@ namespaces, `trait` for shared behavior.
 - [ ] Typed calls return a status with their result (two values): in V8, half the time
       of a recursive `fib` (`fib(30)` written by hand: 1.3 ms returning one value,
       2.4 ms returning two); an exception for the rare cases was no faster
-- [ ] Size of the playground's module: 1.9 MB (606 KB compressed), most of it
-      Cranelift's IR; parts it does not use could be left out
 - [ ] A trait that includes another one (v0.9)
 
 ## Decisions that commit the JIT
