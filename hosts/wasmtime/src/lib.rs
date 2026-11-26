@@ -29,6 +29,10 @@ pub struct Limits {
     pub stack: usize,
     /// Functions compiled to WebAssembly (1), from their first call (2), or none (0).
     pub jit: u32,
+    /// Calls of a function before it is compiled (0: typed code on the first call); a
+    /// function with a loop is compiled on its first call. Compiling a function costs
+    /// about a millisecond: a function called a few times is better interpreted.
+    pub jit_threshold: u32,
 }
 
 impl Default for Limits {
@@ -38,6 +42,7 @@ impl Default for Limits {
             memory: 64 << 20,
             stack: 4 << 20,
             jit: 1,
+            jit_threshold: 50,
         }
     }
 }
@@ -117,6 +122,9 @@ impl Host {
         let instance = linker.instantiate(&mut store, &self.module)?;
         let set_jit: TypedFunc<u32, ()> = instance.get_typed_func(&mut store, "set_jit")?;
         set_jit.call(&mut store, limits.jit)?;
+        let set_threshold: TypedFunc<u32, ()> =
+            instance.get_typed_func(&mut store, "set_jit_threshold")?;
+        set_threshold.call(&mut store, limits.jit_threshold)?;
         let alloc = instance.get_typed_func::<u32, u32>(&mut store, "alloc")?;
         let run = instance.get_typed_func::<(u32, u32), ()>(&mut store, "run")?;
         let result_ptr = instance.get_typed_func::<(), u32>(&mut store, "result_ptr")?;

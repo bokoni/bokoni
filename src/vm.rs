@@ -159,6 +159,9 @@ pub struct Runtime {
     pub jit_enabled: bool,
     /// Baseline compilation from the first call (tests).
     pub jit_eager: bool,
+    /// Calls of a function before it is compiled (0: typed code on the first, baseline
+    /// code on the second); a function with a loop is compiled on its first call.
+    pub jit_threshold: u32,
     /// String interpolation buffer.
     concat_buf: String,
     /// Errors kept by `rescue` / `ensure` handlers, by call (`Term::Reraise`).
@@ -213,6 +216,7 @@ impl Runtime {
             no_ctx: Rc::from([]),
             jit_enabled: cfg!(any(feature = "jit", feature = "wasm-jit")),
             jit_eager: false,
+            jit_threshold: 0,
             concat_buf: String::new(),
             caught: Vec::new(),
             gc_calls: GC_CALLS,
@@ -1414,7 +1418,7 @@ impl Runtime {
         }
         let n = proto.calls_seen.get() + 1;
         proto.calls_seen.set(n);
-        if n < 2 && !proto.has_loop && !self.jit_eager {
+        if n < self.jit_threshold.max(2) && !proto.has_loop && !self.jit_eager {
             return None;
         }
         if self.jit.is_none() {
@@ -1523,7 +1527,6 @@ impl Runtime {
                 && let Function::Script(c) = &**func
                 && c.proto.params.len() == 1
             {
-                rep.tried = true;
                 let arg = a.clone();
                 let r = self.call1(f, a, span);
                 let spec = if c.proto.untyped() {
@@ -1531,6 +1534,11 @@ impl Runtime {
                 } else {
                     Some(c.proto.clone())
                 };
+                // (Tried again on the next element while not compiled yet: below the
+                // threshold of calls.)
+                rep.tried = spec
+                    .as_ref()
+                    .is_none_or(|p| !matches!(*p.jit.borrow(), JitState::Untried));
                 rep.spec = spec.filter(|p| {
                     matches!(&*p.jit.borrow(), JitState::Native(code) if code.params.len() == 1)
                 });
@@ -1651,6 +1659,14 @@ impl Runtime {
             proto
         };
         if matches!(*proto.jit.borrow(), JitState::Untried) {
+            // Not called often enough yet (the calls interpreted so far are counted by
+            // `dyn_entry`).
+            if declared.calls_seen.get() + 1 < self.jit_threshold
+                && !declared.has_loop
+                && !self.jit_eager
+            {
+                return None;
+            }
             // Method: compiled for the class that declares it (`self` in register 0).
             let this = match &regs[0] {
                 Value::Object(o) if method => {

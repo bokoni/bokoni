@@ -525,6 +525,11 @@ namespaces, `trait` for shared behavior.
       elements, 10 times in a typed function: 28 ms → 14.8 ms natively, 34 ms → 21 ms
       in Chrome; faster than the same written with `for` loops and `<<`
 
+- [x] A threshold of calls before compiling (`Engine::set_jit_threshold`; a function
+      with a loop still compiled on its first call): the wasmtime host compiles from the
+      50th call, a configuration script stays interpreted (4.6 ms → 0.11 ms), `fib(25)`
+      and a loop over objects as fast as before
+
 ### Next
 
 - [ ] The same loop in native code, the closure inlined when small: about 2 ns of the
@@ -532,9 +537,6 @@ namespaces, `trait` for shared behavior.
 - [ ] Typed calls return a status with their result (two values): in V8, half the time
       of a recursive `fib` (`fib(30)` written by hand: 1.3 ms returning one value,
       2.4 ms returning two); an exception for the rare cases was no faster
-- [ ] wasmtime host: compiling costs about 1 ms and a few million units of fuel per
-      function; compile only after some calls, rather than run short scripts
-      (configurations) interpreted (`jit: 0`)
 - [ ] Size of the playground's module: 1.9 MB (606 KB compressed), most of it
       Cranelift's IR; parts it does not use could be left out
 - [ ] A trait that includes another one (v0.9)

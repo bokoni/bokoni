@@ -33,6 +33,8 @@ unsafe extern "C" {
 thread_local! {
     static RESULT: RefCell<String> = const { RefCell::new(String::new()) };
     static JIT: Cell<u32> = const { Cell::new(1) };
+    /// Calls of a function before it is compiled (`Engine::set_jit_threshold`).
+    static JIT_THRESHOLD: Cell<u32> = const { Cell::new(0) };
     /// The engine of `run_again`, kept from one call to the next.
     static KEPT: RefCell<Option<Engine>> = const { RefCell::new(None) };
 }
@@ -151,6 +153,7 @@ fn engine() -> Engine {
     let jit = JIT.with(Cell::get);
     e.set_jit(jit != 0);
     e.set_jit_eager(jit >= 2);
+    e.set_jit_threshold(JIT_THRESHOLD.with(Cell::get));
     bokoni::wasm_jit::set_structured(jit != 3);
     e
 }
@@ -167,6 +170,14 @@ fn compile(bytes: &[u8]) -> Option<u32> {
 #[unsafe(no_mangle)]
 pub extern "C" fn set_jit(mode: u32) {
     JIT.with(|j| j.set(mode));
+    KEPT.with(|k| k.borrow_mut().take());
+}
+
+/// Calls of a function before it is compiled (0: the default, typed code on the first
+/// call), from the next engine; a function with a loop is compiled on its first call.
+#[unsafe(no_mangle)]
+pub extern "C" fn set_jit_threshold(calls: u32) {
+    JIT_THRESHOLD.with(|j| j.set(calls));
     KEPT.with(|k| k.borrow_mut().take());
 }
 

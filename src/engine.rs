@@ -187,6 +187,15 @@ impl Engine {
         self.rt.jit_eager = eager;
     }
 
+    /// Compiles a function only from its `calls`-th call (by default, typed code on the
+    /// first, baseline code on the second); a function with a loop is still compiled on
+    /// its first call. Compiling costs more than running a short script: in a host where
+    /// it is dear (WebAssembly, see `hosts/wasmtime`), a function called a few times
+    /// stays interpreted.
+    pub fn set_jit_threshold(&mut self, calls: u32) {
+        self.rt.jit_threshold = calls;
+    }
+
     /// Whether the global function `name` was compiled to native code (after at least one
     /// call). For a `forall` function: one of its copies typed for the arguments of a call
     /// (`T = int`).

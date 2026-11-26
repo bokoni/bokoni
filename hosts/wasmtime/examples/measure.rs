@@ -39,9 +39,14 @@ fn main() {
             );
             for (name, src) in SCRIPTS {
                 println!("{name}");
-                for jit in [0, 1] {
+                for (jit, jit_threshold, label) in [
+                    (0, 0, "interpreted"),
+                    (1, 0, "compiled"),
+                    (1, Limits::default().jit_threshold, "after calls"),
+                ] {
                     let limits = Limits {
                         jit,
+                        jit_threshold,
                         ..Limits::default()
                     };
                     host.run(src, limits).unwrap();
@@ -50,7 +55,7 @@ fn main() {
                     let ms = t.elapsed().as_secs_f64() * 1e3;
                     println!(
                         "  {:<12} {ms:>7.2} ms  {:>11} fuel  {} modules",
-                        if jit == 0 { "interpreted" } else { "compiled" },
+                        label,
                         r.fuel,
                         r.modules
                     );

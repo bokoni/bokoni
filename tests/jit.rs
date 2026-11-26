@@ -1483,3 +1483,27 @@ fn ill_typed_code_matches_without_static_checks() {
         assert_eq!(a, b, "JIT differs from the interpreter for:\n{src}");
     }
 }
+
+#[test]
+fn compiled_after_a_threshold_of_calls() {
+    let mut e = Engine::new();
+    e.set_jit_threshold(10);
+    e.eval("def sq(x: int): int = x * x\ndef g(x) = x + 1\ndef lp(n: int): int\n  let t = 0\n  for i in 0...n\n    t += i\n  end\n  t\nend\nlet k = sq(2) + g(1) + lp(3)")
+        .unwrap();
+    // Called once: interpreted, except the function with a loop.
+    assert!(!e.is_native("sq"));
+    assert!(e.is_native("lp"));
+    let v = e.eval("let t = 0\nfor i in 0...20\n  t += sq(i) + g(i)\nend\nt").unwrap();
+    assert_eq!(e.inspect(&v), "2680");
+    assert!(e.is_native("sq"));
+    // The same answers below and above the threshold.
+    for n in [3, 30] {
+        let src = format!(
+            "def f(x: int): int = x * 3\ndef h(xs: [int]): int = xs.map(|x| x + f(x)).len()\nlet t = 0\nfor i in 0...{n}\n  t += f(i) + h([i, 1])\nend\nt"
+        );
+        let mut e = Engine::new();
+        e.set_jit_threshold(10);
+        let v = e.eval(&src).unwrap();
+        assert_eq!(e.inspect(&v), same(&src));
+    }
+}

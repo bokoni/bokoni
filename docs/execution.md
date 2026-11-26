@@ -71,8 +71,9 @@ WebAssembly is an index in that table.
   the host instantiates each module in the same store, under the same fuel and memory
   limits; components do not share memory, so it links core modules. Compiling a function
   costs a few million units of fuel and about a millisecond: `fib(25)` goes from 42 ms to
-  2.9 ms, but a configuration evaluated in 0.1 ms takes 4 ms compiled, so such scripts
-  run interpreted there.
+  2.9 ms, but a configuration evaluated in 0.1 ms would take 4.6 ms compiled. So the host
+  compiles a function only from its 50th call, or its first if it has a loop
+  (`Engine::set_jit_threshold`): the configuration stays at 0.1 ms.
 
 The translation:
 

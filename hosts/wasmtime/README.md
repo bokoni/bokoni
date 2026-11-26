@@ -13,7 +13,7 @@ links core modules.
 
 ```rust
 let host = Host::new(&wasm, Limits::default().stack)?;
-let run = host.run("def fib(n: int): int = …\nfib(25)", Limits { jit: 1, ..Limits::default() })?;
+let run = host.run("def fib(n: int): int = …\nfib(25)", Limits::default())?;
 // run.json: {"value": "75025", "diagnostics": []}; run.printed, run.fuel, run.modules
 ```
 
@@ -32,14 +32,16 @@ cargo run --release --example measure   # time and fuel, interpreted and compile
 
 Measured on hulk (x86_64), a new store per run, the module itself compiled once (150 ms):
 
-| Script | Interpreted | Compiled |
-|---|---:|---:|
-| recursive `fib(25)`, typed | 42 ms, 575 M fuel | 2.9 ms, 32 M fuel |
-| 100,000 `type` objects created and read | 20.5 ms, 374 M fuel | 8.9 ms, 139 M fuel |
-| a configuration: records, helpers, a list | 0.11 ms, 0.57 M fuel | 4.3 ms, 11 M fuel |
+| Script | Interpreted | Compiled from the first call | From the 50th (default) |
+|---|---:|---:|---:|
+| recursive `fib(25)`, typed | 42 ms, 575 M fuel | 2.9 ms, 28 M fuel | 2.7 ms, 28 M fuel |
+| 100,000 `type` objects created and read | 20.7 ms, 374 M fuel | 9.3 ms, 143 M fuel | 9.3 ms, 143 M fuel |
+| a configuration: records, helpers, a list | 0.10 ms, 0.58 M fuel | 4.6 ms, 11.6 M fuel | 0.11 ms, 0.59 M fuel |
 
 Compiling a function costs a few million units of fuel (the JIT builds its code and
 translates it to WebAssembly inside the module) and a module wasmtime compiles with
 Cranelift (about a millisecond): for a script evaluated in a fraction of a millisecond,
-such as a pipeline's configuration, that is forty times its run. Such scripts run
-interpreted (`jit: 0`); compiling pays for scripts that compute.
+such as a pipeline's configuration, that is forty times its run. So a function is
+compiled only from its 50th call (`Limits::jit_threshold`, `Engine::set_jit_threshold`),
+or on its first if it has a loop: a short script stays interpreted, one that computes is
+compiled.
