@@ -4734,6 +4734,7 @@ impl Jit {
         let blocks: Vec<_> = p.blocks.iter().map(|_| bx.create_block()).collect();
         // Error exit of the function; in a protected block, that of its handler (`catch`).
         let fail_fn = bx.create_block();
+        bx.set_cold_block(fail_fn);
         bx.append_block_param(fail_fn, types::I64);
         let catch: Vec<CBlock> = p
             .handlers
@@ -4833,6 +4834,7 @@ impl Jit {
             ($bx:expr, $cond:expr, $types:expr, $b:expr, $k:expr, $returned:expr) => {{
                 let returned: Option<Reg> = $returned;
                 let d = $bx.create_block();
+                $bx.set_cold_block(d);
                 let cont = $bx.create_block();
                 $bx.ins().brif($cond, d, &[], cont, &[]);
                 $bx.switch_to_block(d);
@@ -5334,6 +5336,7 @@ impl Jit {
                             .call(step_ref, &[ctxv, dp, base, envv, cellsv, outs]);
                         let status = bx.inst_results(call)[0];
                         let failed = bx.create_block();
+                        bx.set_cold_block(failed);
                         let cont = bx.create_block();
                         bx.ins().brif(status, failed, &[], cont, &[]);
                         bx.switch_to_block(failed);
@@ -5439,6 +5442,7 @@ impl Jit {
                         call_sites.push((q.name.clone(), span));
                         let tid = trace_base + (call_sites.len() - 1) as i64;
                         let failed = bx.create_block();
+                        bx.set_cold_block(failed);
                         let cont = bx.create_block();
                         bx.ins().brif(status, failed, &[], cont, &[]);
                         bx.switch_to_block(failed);
@@ -5453,6 +5457,7 @@ impl Jit {
                         let call = bx.ins().call(init_done_ref, &[ctxv, obj, sp]);
                         let missing = bx.inst_results(call)[0];
                         let failed = bx.create_block();
+                        bx.set_cold_block(failed);
                         let cont = bx.create_block();
                         bx.ins().brif(missing, failed, &[], cont, &[]);
                         bx.switch_to_block(failed);
@@ -5531,6 +5536,7 @@ impl Jit {
                         let other = bx.ins().icmp_imm_s(IntCC::Equal, status, 2);
                         deopt!(bx, other, cur, site_b, site_k + 1, Some(*dst));
                         let failed = bx.create_block();
+                        bx.set_cold_block(failed);
                         let cont = bx.create_block();
                         bx.ins().brif(status, failed, &[], cont, &[]);
                         bx.switch_to_block(failed);
@@ -5570,6 +5576,7 @@ impl Jit {
                             .call(binary_ref, &[ctxv, oc, wa, ka, wb, kb, slot, sp]);
                         let status = bx.inst_results(call)[0];
                         let failed = bx.create_block();
+                        bx.set_cold_block(failed);
                         let cont = bx.create_block();
                         bx.ins().brif(status, failed, &[], cont, &[]);
                         bx.switch_to_block(failed);
@@ -5698,6 +5705,7 @@ impl Jit {
                         let call = bx.ins().call(is_type_ref, &[ctxv, w, k, tp, sp]);
                         let r = bx.inst_results(call)[0];
                         let failed = bx.create_block();
+                        bx.set_cold_block(failed);
                         let cont = bx.create_block();
                         let err = bx.ins().icmp_imm_s(IntCC::Equal, r, 2);
                         bx.ins().brif(err, failed, &[], cont, &[]);
@@ -5819,6 +5827,7 @@ impl Jit {
                         let call = bx.ins().call(set_global_ref, &[ctxv, s, w, k, sp]);
                         let status = bx.inst_results(call)[0];
                         let failed = bx.create_block();
+                        bx.set_cold_block(failed);
                         bx.ins().brif(status, failed, &[], done, &[]);
                         bx.switch_to_block(failed);
                         let none = bx.ins().iconst(types::I64, -1);
@@ -6098,6 +6107,7 @@ impl Jit {
                         call_sites.push((target.proto.name.clone(), span));
                         let tid = trace_base + (call_sites.len() - 1) as i64;
                         let failed = bx.create_block();
+                        bx.set_cold_block(failed);
                         let traced = bx.create_block();
                         let cont = bx.create_block();
                         bx.ins().brif(status, failed, &[], cont, &[]);
@@ -6235,6 +6245,7 @@ impl Jit {
                         call_sites.push((q.name.clone(), span));
                         let tid = trace_base + (call_sites.len() - 1) as i64;
                         let failed = bx.create_block();
+                        bx.set_cold_block(failed);
                         let cont = bx.create_block();
                         bx.ins().brif(status, failed, &[], cont, &[]);
                         bx.switch_to_block(failed);
@@ -6565,6 +6576,7 @@ impl Jit {
                         call_sites.push((q.name.clone(), span));
                         let tid = trace_base + (call_sites.len() - 1) as i64;
                         let failed = bx.create_block();
+                        bx.set_cold_block(failed);
                         let cont = bx.create_block();
                         bx.ins().brif(status, failed, &[], cont, &[]);
                         bx.switch_to_block(failed);

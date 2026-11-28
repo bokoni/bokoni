@@ -538,13 +538,21 @@ namespaces, `trait` for shared behavior.
       `opt-level = "s"` gives 1.5 MB but an interpreter 3 to 8% slower (built-ins up to
       25%), `wasm-opt -O3` 1.7 MB but 3% less compressed for 30 s more per build
 
+- [x] The status typed calls return with their result (two values) measured again:
+      it costs little (a hand-written `fib(30)` in Chrome, 1.1 ms without it, 1.2 ms
+      with it); the 1.3 ms against 2.4 ms measured before came from calling the
+      function from JavaScript, where V8 is slower with two results (Rust calls it
+      through its adapter, in WebAssembly). In a global or in memory, the status was
+      slower (2.2 to 3.1 ms), a sentinel result no faster. What cost was the size of
+      the function: cold code (resumptions in the interpreter, the error exit) is now
+      written as functions of their own, called where it starts, and V8 inlines the
+      rest. `fib(30)` compiled in Chrome: 3.6 ms → 2.7 ms (the same written by hand
+      with its checks: 2.2 ms), 4.6 ms → 3.7 ms compilation included
+
 ### Next
 
 - [ ] The same loop in native code, the closure inlined when small: about 2 ns of the
       5 left per element (the call of the entry point, the `Value` built)
-- [ ] Typed calls return a status with their result (two values): in V8, half the time
-      of a recursive `fib` (`fib(30)` written by hand: 1.3 ms returning one value,
-      2.4 ms returning two); an exception for the rare cases was no faster
 
 ## Decisions that commit the JIT
 

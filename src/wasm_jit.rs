@@ -347,11 +347,14 @@ impl WasmModule {
             .map(|(i, (id, _))| (*id, 2 * i as u32))
             .collect();
         let mut sigs = Vec::new();
+        // The cold regions' functions, after those (`Region`).
+        let mut next = 2 * defined.len() as u32;
+        let mut cold: Vec<(u32, Function)> = Vec::new();
         for (i, (_, func)) in defined.iter().enumerate() {
             let sig = wasm_sig(&func.signature)?;
             let ty = types.index(sig.0.clone(), sig.1.clone());
-            let body = Translator::new(self, func, &local, &mut types)
-                .and_then(Translator::run)
+            let body = self
+                .translate(func, &local, &mut types, &sig, &mut next, &mut cold)
                 .inspect_err(|()| UNTRANSLATED.with(|c| c.set(c.get() + 1)))?;
             funcs.function(ty);
             code.function(&body);
@@ -362,6 +365,10 @@ impl WasmModule {
                 exports.export(&format!("f{k}"), ExportKind::Func, k as u32);
             }
             sigs.push(sig);
+        }
+        for (ty, body) in &cold {
+            funcs.function(*ty);
+            code.function(body);
         }
         let base = compiler(&assemble(&types, &funcs, &exports, &code)).ok_or(())?;
         for (i, ((id, _), ty)) in defined.into_iter().zip(sigs).enumerate() {
@@ -375,6 +382,46 @@ impl WasmModule {
             );
         }
         Ok(())
+    }
+
+    /// The code of `func` (signature `sig`), and of its cold regions, appended to `cold`
+    /// (their type, their code), numbered from `next`.
+    fn translate(
+        &self,
+        func: &ir::Function,
+        local: &FxHashMap<FuncId, u32>,
+        types: &mut Types,
+        sig: &Sig,
+        next: &mut u32,
+        cold: &mut Vec<(u32, Function)>,
+    ) -> Result<Function, ()> {
+        let mut t = Translator::new(self, func, local, types, None)?;
+        let (regions, kept) = t.cold_regions();
+        for r in &regions {
+            t.stubs.insert(r.blocks[0], (*next, r.params.clone()));
+            *next += 1;
+        }
+        // (A block of a region also written here, from a region too small to be apart,
+        // stays.)
+        for r in &regions {
+            let hidden = r
+                .blocks
+                .iter()
+                .filter(|b| !t.stubs.contains_key(b) && !kept.contains(b));
+            t.hidden.extend(hidden.copied().collect::<Vec<_>>());
+        }
+        let body = t.run()?;
+        for r in &regions {
+            let mut ps = Vec::with_capacity(r.params.len() + 1);
+            for v in &r.params {
+                ps.push(val_type(func.dfg.value_type(*v))?);
+            }
+            ps.push(ValType::I32);
+            let ty = types.index(ps, sig.1.clone());
+            let code = Translator::new(self, func, local, types, Some(r))?.run()?;
+            cold.push((ty, code));
+        }
+        Ok(body)
     }
 
     /// The function pointer of the adapter of function `id` (its table index).
@@ -524,7 +571,26 @@ struct Translator<'a> {
     dead_stores: FxHashSet<ir::Inst>,
     /// Values computed where they are used rather than kept in a local (`trees`).
     inline: FxHashSet<Value>,
+    /// Entries of the cold regions written as functions of their own: the function's
+    /// index, and its arguments (`cold_regions`).
+    stubs: FxHashMap<Block, (u32, Vec<Value>)>,
+    /// The other blocks of those regions, not written in this function.
+    hidden: FxHashSet<Block>,
 }
+
+/// Cold code that only returns (resumptions in the interpreter, errors), written as a
+/// function of its own: called by the function it comes from, which returns its result.
+/// The function stays small, and the host inlines it into its callers more readily
+/// (V8: `fib(30)` 3.6 → 2.8 ms).
+struct Region {
+    /// Its first block, and the blocks reached from it.
+    blocks: Vec<Block>,
+    /// The values it reads that are computed before it; the frame's address follows.
+    params: Vec<Value>,
+}
+
+/// Instructions a cold region has at least, to be written apart.
+const MIN_REGION: usize = 8;
 
 /// Instructions whose effect is more than their results.
 fn effect(op: Opcode) -> bool {
@@ -532,13 +598,18 @@ fn effect(op: Opcode) -> bool {
 }
 
 impl<'a> Translator<'a> {
+    /// The translation of function `func`, or of its cold `region`.
     fn new(
         module: &'a WasmModule,
         func: &'a ir::Function,
         local: &'a FxHashMap<FuncId, u32>,
         types: &'a mut Types,
+        region: Option<&Region>,
     ) -> Result<Self, ()> {
-        let blocks: Vec<Block> = func.layout.blocks().collect();
+        let blocks: Vec<Block> = match region {
+            Some(r) => r.blocks.clone(),
+            None => func.layout.blocks().collect(),
+        };
         let number = blocks
             .iter()
             .enumerate()
@@ -553,7 +624,10 @@ impl<'a> Translator<'a> {
             number,
             locals: FxHashMap::default(),
             decl: Vec::new(),
-            nparams: func.signature.params.len() as u32,
+            nparams: match region {
+                Some(r) => r.params.len() as u32 + 1,
+                None => func.signature.params.len() as u32,
+            },
             slots: Vec::new(),
             frame: 0,
             fp: 0,
@@ -564,12 +638,18 @@ impl<'a> Translator<'a> {
             live: FxHashSet::default(),
             dead_stores: FxHashSet::default(),
             inline: FxHashSet::default(),
+            stubs: FxHashMap::default(),
+            hidden: FxHashSet::default(),
         };
         t.liveness();
         t.trees();
-        // The parameters: those of the entry block.
+        // The parameters: those of the entry block, or the values the region reads.
         let entry = *t.blocks.first().ok_or(())?;
-        for (k, v) in func.dfg.block_params(entry).iter().enumerate() {
+        let params = match region {
+            Some(r) => r.params.clone(),
+            None => func.dfg.block_params(entry).to_vec(),
+        };
+        for (k, v) in params.iter().enumerate() {
             t.locals.insert(*v, k as u32);
         }
         for (slot, data) in func.sized_stack_slots.iter() {
@@ -590,7 +670,11 @@ impl<'a> Translator<'a> {
         if !used {
             t.frame = 0;
         }
-        t.fp = t.scratch(ValType::I32);
+        // (A region is given the frame of its function.)
+        t.fp = match region {
+            Some(_) => t.nparams - 1,
+            None => t.scratch(ValType::I32),
+        };
         t.s64 = std::array::from_fn(|_| 0);
         for k in 0..3 {
             t.s64[k] = t.scratch(ValType::I64);
@@ -776,6 +860,115 @@ impl<'a> Translator<'a> {
         }
     }
 
+    /// The cold regions of the function: blocks marked cold (`set_cold_block`) and those
+    /// only they lead to, from which every path returns. One region per block of them
+    /// entered from the rest of the function, with the blocks reached from it (a block
+    /// reached from several is written in each). Also the blocks of the regions too small
+    /// to be apart, written in the function.
+    fn cold_regions(&self) -> (Vec<Region>, FxHashSet<Block>) {
+        let f = self.func;
+        let n = self.blocks.len();
+        let succ: Vec<Vec<u32>> = self.blocks.iter().map(|b| self.successors(*b)).collect();
+        let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for (b, ss) in succ.iter().enumerate() {
+            for &s in ss {
+                preds[s as usize].push(b as u32);
+            }
+        }
+        let mut cold: Vec<bool> = self.blocks.iter().map(|b| f.layout.is_cold(*b)).collect();
+        cold[0] = false;
+        // Blocks only cold ones lead to.
+        loop {
+            let mut changed = false;
+            for b in 1..n {
+                if !cold[b] && !preds[b].is_empty() && preds[b].iter().all(|p| cold[*p as usize]) {
+                    cold[b] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // Those from which every path stays cold (and so returns).
+        loop {
+            let mut changed = false;
+            for b in 0..n {
+                if cold[b] && succ[b].iter().any(|s| !cold[*s as usize]) {
+                    cold[b] = false;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let dfg = &f.dfg;
+        let mut regions = Vec::new();
+        let mut kept = FxHashSet::default();
+        for e in 0..n {
+            if !cold[e] || preds[e].iter().all(|p| cold[*p as usize]) {
+                continue;
+            }
+            let mut seen = vec![false; n];
+            let mut order = vec![e as u32];
+            seen[e] = true;
+            let mut k = 0;
+            while k < order.len() {
+                for &s in &succ[order[k] as usize] {
+                    if !seen[s as usize] {
+                        seen[s as usize] = true;
+                        order.push(s);
+                    }
+                }
+                k += 1;
+            }
+            let blocks: Vec<Block> = order.iter().map(|b| self.blocks[*b as usize]).collect();
+            let size: usize = blocks
+                .iter()
+                .map(|b| f.layout.block_insts(*b).count())
+                .sum();
+            if size < MIN_REGION {
+                kept.extend(blocks);
+                continue;
+            }
+            // The values read there and computed before: those of the instructions
+            // written there (a value computed at its use, by its own instruction, is
+            // computed in the same block; a constant needs nothing).
+            let mut defined: FxHashSet<Value> = FxHashSet::default();
+            for (k, b) in blocks.iter().enumerate() {
+                if k > 0 {
+                    defined.extend(dfg.block_params(*b).iter().copied());
+                }
+                for i in f.layout.block_insts(*b) {
+                    defined.extend(dfg.inst_results(i).iter().copied());
+                }
+            }
+            let mut params: Vec<Value> = Vec::new();
+            let mut taken: FxHashSet<Value> = FxHashSet::default();
+            for b in &blocks {
+                for i in f.layout.block_insts(*b) {
+                    for v in dfg.inst_values(i) {
+                        let v = dfg.resolve_aliases(v);
+                        if defined.contains(&v) || !self.live.contains(&v) {
+                            continue;
+                        }
+                        if self.inline.contains(&v) {
+                            // (Only a constant: other values computed at their use are
+                            // used in their own block.)
+                            continue;
+                        }
+                        if taken.insert(v) {
+                            params.push(v);
+                        }
+                    }
+                }
+            }
+            regions.push(Region { blocks, params });
+        }
+        (regions, kept)
+    }
+
     fn scratch(&mut self, t: ValType) -> u32 {
         self.decl.push(t);
         self.nparams + self.decl.len() as u32 - 1
@@ -826,8 +1019,19 @@ impl<'a> Translator<'a> {
 
     /// The function's code; its locals are known once it is written.
     fn run(mut self) -> Result<Function, ()> {
-        let succ: Vec<Vec<u32>> = self.blocks.iter().map(|b| self.successors(*b)).collect();
-        let reached = vec![true; self.blocks.len()];
+        let succ: Vec<Vec<u32>> = self
+            .blocks
+            .iter()
+            .map(|b| match self.stubs.contains_key(b) {
+                true => Vec::new(),
+                false => self.successors(*b),
+            })
+            .collect();
+        let reached: Vec<bool> = self
+            .blocks
+            .iter()
+            .map(|b| !self.hidden.contains(b))
+            .collect();
         let mut bytes = Vec::new();
         {
             let mut x = InstructionSink::new(&mut bytes);
@@ -1312,6 +1516,17 @@ impl<'a> Translator<'a> {
 impl Blocks for Translator<'_> {
     fn block(&mut self, x: &mut InstructionSink, bi: usize) -> Exit {
         let b = self.blocks[bi];
+        if let Some((index, args)) = self.stubs.get(&b).cloned() {
+            // A cold region: its function returns this one's result (and gives the frame
+            // back).
+            for a in args {
+                self.get(x, a);
+            }
+            x.local_get(self.fp);
+            x.call(index);
+            x.return_();
+            return Exit::Return;
+        }
         let insts: Vec<ir::Inst> = self.func.layout.block_insts(b).collect();
         let Some((&term, body)) = insts.split_last() else {
             self.failed = true;
