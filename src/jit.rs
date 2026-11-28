@@ -2408,6 +2408,9 @@ struct Compiled {
 
 pub struct Jit {
     module: ClifModule,
+    /// Functions whose code could not be generated (an unexpected case of the code
+    /// generation, a Cranelift error), left to the interpreter: zero in the tests.
+    pub failures: u32,
     /// `Option<Value>` has the layout of a `Value` (`None` has a tag of a value that owns
     /// something): native code reads and writes globals of simple types in place.
     inline_globals: bool,
@@ -3138,8 +3141,15 @@ impl Analysis<'_> {
                 _ => JTy::Boxed,
             },
             SetUp(_, a) | SetCell(_, a) if word(g(*a)?) => return Some(None),
-            // The function's own cells (variables captured by its lambdas): any value.
-            GetCell(..) => JTy::Boxed,
+            // The function's own cells (variables captured by its lambdas): of the simple
+            // type the function always writes there (checked on every read: a lambda may
+            // write another), or any value.
+            GetCell(_, c) => match cell_ty(p, *c) {
+                Some(RegTy::Int) if !forced => JTy::Int,
+                Some(RegTy::Float) if !forced => JTy::Float,
+                Some(RegTy::Bool) if !forced => JTy::Bool,
+                _ => JTy::Boxed,
+            },
             NewCell(_) => return Some(None),
             Closure(..) => JTy::Boxed,
             // `x is T` (the type of a `rescue` clause…): by a helper.
@@ -3771,26 +3781,28 @@ fn lambda_env(p: &Proto, child: &Proto) -> Vec<Value> {
             let crate::ir::Capture::Cell(c) = *c else {
                 return Value::Nil;
             };
-            let mut tys = p
-                .blocks
-                .iter()
-                .flat_map(|b| &b.instrs)
-                .filter_map(|i| match i {
-                    Instr::SetCell(d, r) if *d == c => Some(p.regs[*r as usize]),
-                    _ => None,
-                });
-            let first = tys.next();
-            match first {
-                Some(t) if tys.all(|u| u == t) => match t {
-                    RegTy::Int => Value::Int(0),
-                    RegTy::Float => Value::Float(0.0),
-                    RegTy::Bool => Value::Bool(false),
-                    _ => Value::Nil,
-                },
+            match cell_ty(p, c) {
+                Some(RegTy::Int) => Value::Int(0),
+                Some(RegTy::Float) => Value::Float(0.0),
+                Some(RegTy::Bool) => Value::Bool(false),
                 _ => Value::Nil,
             }
         })
         .collect()
+}
+
+/// The type `p` writes into its cell `c`, if it always writes the same one.
+fn cell_ty(p: &Proto, c: u32) -> Option<RegTy> {
+    let mut tys = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instrs)
+        .filter_map(|i| match i {
+            Instr::SetCell(d, r) if *d == c => Some(p.regs[*r as usize]),
+            _ => None,
+        });
+    let first = tys.next()?;
+    tys.all(|u| u == first).then_some(first)
 }
 
 /// The closure in register `r` at `ins` (a call), if its function is known: made just
@@ -4579,6 +4591,7 @@ impl Jit {
         let mem_fns: [FuncId; 4] = mem.try_into().ok()?;
         Some(Jit {
             module,
+            failures: 0,
             inline_globals: inline_globals_ok(),
             cell_off: cell_value_off(),
             ctx: Box::into_raw(Box::new(JitCtx {
@@ -4721,7 +4734,8 @@ impl Jit {
             let key = Rc::as_ptr(p) as usize;
             let plan = plans.remove(&key).unwrap().unwrap();
             if self.define(p, &plan, globals).is_err() {
-                // Unexpected Cranelift failure: the interpreter is still available.
+                // Unexpected failure: the interpreter is still available.
+                self.failures += 1;
                 self.compiled.remove(&key);
                 *p.jit.borrow_mut() = JitState::Rejected;
                 continue;
@@ -4733,11 +4747,15 @@ impl Jit {
                     c.calls = plan.targets.values().map(Target::key).collect();
                     entries.push((p.clone(), e));
                 }
-                Err(_) => *p.jit.borrow_mut() = JitState::Rejected,
+                Err(_) => {
+                    self.failures += 1;
+                    *p.jit.borrow_mut() = JitState::Rejected;
+                }
             }
         }
         if self.module.finalize_definitions().is_err() {
             // (In WebAssembly: an instruction its translation does not know.) Interpreted.
+            self.failures += entries.len() as u32;
             for (p, _) in &entries {
                 self.compiled.remove(&(Rc::as_ptr(p) as usize));
                 *p.jit.borrow_mut() = JitState::Rejected;
@@ -5678,8 +5696,15 @@ impl Jit {
                 }
             }};
         }
+        let reached = p.reachable();
         for (bi, b) in p.blocks.iter().enumerate() {
             bx.switch_to_block(blocks[bi]);
+            // Never run (the analysis gives it no types): no code.
+            if !reached[bi] {
+                let none = bx.ins().iconst(types::I64, -1);
+                bx.ins().jump(fail_fn, &[none.into()]);
+                continue;
+            }
             cur = plan.entry[bi].iter().map(|l| l.get()).collect();
             fail = match b.handler {
                 Some(h) => catch[h as usize],
@@ -6084,8 +6109,16 @@ impl Jit {
                     // A captured variable of a simple type (that of its value at compile
                     // time): its payload if it still has that type, otherwise resumed in the
                     // interpreter.
-                    GetUp(d, u) if matches!(dty, Some(JTy::Int | JTy::Float | JTy::Bool)) => {
+                    GetUp(d, u) | GetCell(d, u)
+                        if matches!(dty, Some(JTy::Int | JTy::Float | JTy::Bool)) =>
+                    {
                         use crate::value::layout::{TAG_BOOL, TAG_FLOAT, TAG_INT, payload_of};
+                        // (A cell of the function: in its own array.)
+                        let envv = if matches!(ins, GetCell(..)) {
+                            cellsv
+                        } else {
+                            envv
+                        };
                         let (tag, ty) = match dty {
                             Some(JTy::Int) => (TAG_INT, types::I64),
                             Some(JTy::Float) => (TAG_FLOAT, types::F64),
@@ -8046,9 +8079,12 @@ impl Jit {
         bx.ins().return_(&[one]);
         bx.seal_all_blocks();
         bx.finalize(tc);
-        self.module.define_function(id, &mut ctx).ok()?;
+        let defined = self.module.define_function(id, &mut ctx).is_ok();
         self.module.clear_context(&mut ctx);
-        self.module.finalize_definitions().ok()?;
+        if !defined || self.module.finalize_definitions().is_err() {
+            self.failures += 1;
+            return None;
+        }
         #[cfg(feature = "wasm-jit")]
         crate::wasm_jit::count_baseline();
         Some(self.module.get_finalized_function(id) as usize)

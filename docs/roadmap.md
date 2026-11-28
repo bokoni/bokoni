@@ -562,6 +562,17 @@ namespaces, `trait` for shared behavior.
       ms → 1.8 ms, an `any` over the whole list 4.6 ms → 0.7 ms. In Chrome, 22 ms → 14
       ms
 
+- [x] A variable of the function its lambdas change (`xs.each(|x| t += x)`), read by
+      the function: of the simple type the function always writes into it, checked on
+      each read (the interpreter takes over if a lambda wrote another), no longer any
+      value. A function returning `[t]` as `[int]` stays compiled; a counter closure
+      called in a typed loop whose value the loop adds up, 10 M times: 70 ms → 20 ms
+- [x] Functions whose native code could not be generated are counted
+      (`Engine::jit_failures`, zero asserted by the tests of the JIT and the random
+      programs). The 49 of the tests: a script's loop compiled as a function of its own
+      (`outline`) keeps the blocks of the script around it, unreachable, which the
+      analysis gives no types; their code is no longer generated
+
 ### Next
 
 Nothing planned.

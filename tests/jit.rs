@@ -9,10 +9,12 @@ fn outcome(src: &str, jit: bool) -> String {
     let mut e = Engine::new();
     e.set_output(|_| {});
     e.set_jit(jit);
-    match e.eval(src) {
+    let r = match e.eval(src) {
         Ok(v) => e.inspect(&v),
         Err(err) => err.render(src, "test"),
-    }
+    };
+    assert_eq!(e.jit_failures(), 0, "native code not generated for:\n{src}");
+    r
 }
 
 /// The program gives the same thing with and without the JIT.
@@ -1353,6 +1355,64 @@ fn list_methods_loop_in_native_code() {
             assert_eq!(show(&mut e), want, "{defs}\n{call}");
         }
         assert!(e.is_native("f"), "`f` should be compiled: {defs}");
+    }
+}
+
+#[test]
+fn variables_captured_by_a_lambda_read_in_native_code() {
+    // A variable of the function its lambdas change: read as the simple type the function
+    // writes into it, checked on each read (a lambda may write another type); the function
+    // stays compiled.
+    for (defs, call) in [
+        (
+            "def f(xs: [int]): [int]\n  let t = 0\n  xs.each(|x| t += x)\n  [t, t * 2]\nend",
+            "f([4, 5])",
+        ),
+        (
+            "def f(xs: [float]): float\n  let t = 0.0\n  xs.each(|x| t += x)\n  t / 2.0\nend",
+            "f([1.5, 2.5])",
+        ),
+        (
+            "def f(n: int): bool\n  let seen = false\n  let mark = || seen = true\n  if n > 2 then mark() end\n  seen\nend",
+            "[f(1), f(3)]",
+        ),
+        // Another type written by the lambda: the interpreter takes over at the read.
+        (
+            "def f(xs: [int]): int\n  let t = 0\n  xs.each(|x| t = x * 1.5)\n  t + 1\nend",
+            "f([2])",
+        ),
+        (
+            "def f(xs: [int]): [int]\n  let t = 0\n  xs.each(|x| t = \"a\")\n  [t]\nend",
+            "f([1])",
+        ),
+        (
+            "def f(xs: [int]): int\n  let t = 0\n  xs.each(|x| t = nil)\n  t + 1\nend",
+            "f([1])",
+        ),
+    ] {
+        // (Without static checks: a lambda writing another type is then run.)
+        let mut e = Engine::new();
+        e.set_output(|_| {});
+        e.set_static_checks(false);
+        e.eval(defs).unwrap();
+        let mut i = Engine::new();
+        i.set_output(|_| {});
+        i.set_static_checks(false);
+        i.set_jit(false);
+        i.eval(defs).unwrap();
+        let show = |e: &mut Engine| match e.eval(call) {
+            Ok(v) => e.inspect(&v),
+            Err(err) => err.render(call, "test"),
+        };
+        let want = show(&mut i);
+        for _ in 0..3 {
+            assert_eq!(show(&mut e), want, "{defs}\n{call}");
+        }
+        assert_eq!(e.jit_failures(), 0, "{defs}");
+        // (The others end in a type error, after which `f` may stay interpreted.)
+        if !defs.contains("1.5") && !defs.contains("\"a\"") && !defs.contains("nil") {
+            assert!(e.is_native("f"), "`f` should be compiled: {defs}");
+        }
     }
 }
 

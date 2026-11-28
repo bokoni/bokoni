@@ -1056,3 +1056,24 @@ impl Term {
         }
     }
 }
+
+impl Proto {
+    /// Blocks reachable from the entry (through jumps and error handlers). Outlining a
+    /// loop leaves the blocks of the function around it in place, unreachable.
+    pub fn reachable(&self) -> Vec<bool> {
+        let mut seen = vec![false; self.blocks.len()];
+        let mut todo = vec![0usize];
+        while let Some(b) = todo.pop() {
+            if b >= seen.len() || std::mem::replace(&mut seen[b], true) {
+                continue;
+            }
+            let blk = &self.blocks[b];
+            let mut term = blk.term.clone();
+            todo.extend(term.targets_mut().into_iter().map(|t| *t as usize));
+            if let Some(h) = blk.handler {
+                todo.push(self.handlers[h as usize].block as usize);
+            }
+        }
+        seen
+    }
+}

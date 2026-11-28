@@ -32,7 +32,8 @@ Bokoni writes machine code into memory and jumps to it. Two tiers:
   typed for the arguments; a result without one is guessed (`guess_ret`: the type every
   `return` gives, the calls assumed to return their own guess), `def fib(n) = …`
   included. A wrong guess costs a resumption, as a typed copy returning another type
-  does (status 2).
+  does (status 2). A variable its lambdas change (`xs.each(|x| t += x)`) is read as the
+  simple type the function always writes into it, checked on each read.
 - **Baseline code**: any other function, compiled on its second call (or its first if it
   loops). Registers stay `Value`s in memory; native code does the simple cases
   (constants, copies, arithmetic, comparisons, branches) and calls the interpreter's own

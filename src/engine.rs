@@ -213,6 +213,18 @@ impl Engine {
         }
     }
 
+    /// Number of functions the JIT failed to compile (left to the interpreter) because of
+    /// an unexpected case of its code generation: a bug, zero in the tests.
+    #[doc(hidden)]
+    pub fn jit_failures(&self) -> u32 {
+        #[cfg(any(feature = "jit", feature = "wasm-jit"))]
+        {
+            self.rt.jit.as_ref().map_or(0, |j| j.failures)
+        }
+        #[cfg(not(any(feature = "jit", feature = "wasm-jit")))]
+        0
+    }
+
     /// Whether method `method` of type `ty` was compiled to native code (after at least one
     /// call).
     pub fn is_native_method(&self, ty: &str, method: &str) -> bool {

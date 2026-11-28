@@ -59,10 +59,12 @@ fn outcome(src: &str, jit: bool, eager: bool, checks: bool) -> String {
     e.set_jit_eager(eager);
     let _ = eager;
     e.set_max_call_depth(200);
-    match e.eval(src) {
+    let r = match e.eval(src) {
         Ok(v) => e.inspect(&v),
         Err(err) => err.render(src, "fuzz"),
-    }
+    };
+    assert_eq!(e.jit_failures(), 0, "native code not generated for:\n{src}");
+    r
 }
 
 /// Runs `src` in the three modes (interpreter, JIT, baseline code from the first call),
