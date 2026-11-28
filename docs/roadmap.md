@@ -549,10 +549,22 @@ namespaces, `trait` for shared behavior.
       rest. `fib(30)` compiled in Chrome: 3.6 ms → 2.7 ms (the same written by hand
       with its checks: 2.2 ms), 4.6 ms → 3.7 ms compilation included
 
+- [x] The loop of `map`, `filter`, `each`, `any`, `all` in the typed function's code
+      (`each_loop`), for a closure that changes no list, of a simple parameter and
+      result: the list read in place, the types of its elements checked first, the
+      closure inlined when it captures nothing (`emit_inline` now also does the untyped
+      IR's operations on numbers and `bool`s, which the closures without annotations
+      use; so do the other inlined calls), its typed code called directly otherwise;
+      the elements written into the list made for them. `bk_each` takes over if the
+      closure returns a value of another type (`bk_each_rest`). `map` then `filter`,
+      100 k elements, 10 times in a typed function, natively: 13.5 ms → 5.1 ms (the
+      closure capturing a variable, called), 13.2 ms → 4.0 ms (inlined); a `filter` 6.0
+      ms → 1.8 ms, an `any` over the whole list 4.6 ms → 0.7 ms. In Chrome, 22 ms → 14
+      ms
+
 ### Next
 
-- [ ] The same loop in native code, the closure inlined when small: about 2 ns of the
-      5 left per element (the call of the entry point, the `Value` built)
+Nothing planned.
 
 ## Decisions that commit the JIT
 

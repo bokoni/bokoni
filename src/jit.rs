@@ -652,8 +652,8 @@ extern "C" fn bk_fields_cached(obj: *const Value, cache: *const MethodCache) -> 
 }
 
 /// A small function, inlined at its calls: one block ending with its return, no call,
-/// simple values only (arithmetic, fields of `self`), from the same script (its errors
-/// point into it).
+/// simple values only (arithmetic, comparisons, fields of `self`: `inline_typed`), from
+/// the same script (its errors point into it).
 fn inlinable(q: &Proto, p: &Proto) -> bool {
     use Instr::*;
     let [b] = q.blocks.as_slice() else {
@@ -686,7 +686,7 @@ fn inlinable(q: &Proto, p: &Proto) -> bool {
                     | FNeg(..)
                     | IToF(..)
                     | FieldAt(_, 0, _)
-            )
+            ) || matches!(i, Bin(op, ..) if *op != BinOp::Push)
         })
 }
 
@@ -751,6 +751,28 @@ fn emit_inline(
             }
             FNeg(d, a) => (*d, bx.ins().fneg(get(a)?.0)),
             IToF(d, a) => (*d, bx.ins().fcvt_from_sint(types::F64, get(a)?.0)),
+            // (An operation of the untyped IR on numbers or `bool`s, as `define` does it.)
+            Bin(op, d, a, c) => {
+                let ((x, ta), (y, tb)) = (get(a)?, get(c)?);
+                let v = match (ta, tb) {
+                    (JTy::Int, JTy::Int) => {
+                        int_bin(bx, *op, x, y, &mut |bx, c, k| err(bx, c, k, span))
+                    }
+                    (JTy::Bool, JTy::Bool) => bx.ins().icmp(int_cc(*op), x, y),
+                    _ => {
+                        let x = match ta {
+                            JTy::Int => bx.ins().fcvt_from_sint(types::F64, x),
+                            _ => x,
+                        };
+                        let y = match tb {
+                            JTy::Int => bx.ins().fcvt_from_sint(types::F64, y),
+                            _ => y,
+                        };
+                        float_bin(bx, *op, x, y, frem_ref)
+                    }
+                };
+                (*d, v)
+            }
             FieldAt(d, 0, idx) => {
                 let fp = fields?;
                 let off = *idx as i32 * crate::value::layout::SIZE;
@@ -783,6 +805,288 @@ fn emit_inline(
         (RegTy::Float, JTy::Int) => bx.ins().fcvt_from_sint(types::F64, v),
         _ => v,
     })
+}
+
+/// Does the analysis `plan` of inlinable function `q` give the type of each of its
+/// registers (`emit_inline` needs them all), the operands of an operation of the untyped
+/// IR (`Bin`) both numbers or both `bool`s (compared)?
+fn inline_typed(q: &Proto, plan: &Plan) -> bool {
+    let mut ty: FxHashMap<Reg, JTy> = FxHashMap::default();
+    for p in &q.params {
+        match plan.entry[0][p.reg as usize].get() {
+            Some(t) => ty.insert(p.reg, t),
+            None => return false,
+        };
+    }
+    for (k, ins) in q.blocks[0].instrs.iter().enumerate() {
+        let Some(d) = plan.defs[0][k] else {
+            return false;
+        };
+        if let Instr::Bin(op, _, a, c) = ins {
+            let num = |t| matches!(t, Some(JTy::Int | JTy::Float));
+            let (ta, tb) = (ty.get(a).copied(), ty.get(c).copied());
+            let ok = (num(ta) && num(tb))
+                || (ta == Some(JTy::Bool) && tb == Some(JTy::Bool) && !is_arith(*op));
+            if !ok {
+                return false;
+            }
+        }
+        if let Some((_, Some(w))) = reads_writes(q, ins) {
+            ty.insert(w, d);
+        }
+    }
+    true
+}
+
+/// `xs.map(f)` (`filter`, `each`, `any`, `all`) done by native code (`each_loop`): `f`
+/// changes no list and takes and returns a simple value.
+struct EachLoop {
+    op: EachOp,
+    param: RegTy,
+    ret: RegTy,
+    ctx: CValue,
+    list: CValue,
+    closure: CValue,
+    /// The function the closure must be of.
+    declared: *const Proto,
+    /// The slot of the result (a list), or the word of the answer (`any`, `all`).
+    out: CValue,
+    /// Where to go if the loop cannot be done here (`bk_each` then does it all); where
+    /// the closure's code returned a status other than 0 (the element, the number kept,
+    /// the status); and where the loop is over (the status 0).
+    slow: CBlock,
+    rest: CBlock,
+    done: CBlock,
+    /// The call depth.
+    depth: CValue,
+}
+
+/// The code of the closure in `each_loop`: on an element's native value, its result
+/// and the status of the call of its code, if it calls it.
+type EachBody<'a> =
+    dyn FnMut(&mut FunctionBuilder, CValue) -> Option<(CValue, Option<CValue>)> + 'a;
+
+/// Helpers `each_loop` calls.
+struct EachRefs {
+    env: FuncRef,
+    view: FuncRef,
+    alloc: FuncRef,
+    finish: FuncRef,
+    clone: FuncRef,
+}
+
+/// The loop of `lp` over its list, read in place: the closure checked (its captured
+/// variables for its code: `bk_closure_env`), then every element (of the parameter's
+/// type), before anything is done; then `body` on each element's native value, which
+/// gives the result and, if it calls the closure's code (`calls`: at one more call
+/// depth), the status of that call. A `map` or `filter` writes its elements into a
+/// list made for them (`bk_list_alloc`, `bk_list_done`).
+fn each_loop(
+    bx: &mut FunctionBuilder,
+    lp: &EachLoop,
+    refs: &EachRefs,
+    calls: bool,
+    body: &mut EachBody,
+) -> Option<()> {
+    use crate::value::layout::{BOOL_PAYLOAD, PAYLOAD, SIZE, TAG_BOOL, TAG_FLOAT, TAG_INT};
+    let t = MemFlagsData::trusted();
+    let sv = bx.ins().iconst(types::I32, 0);
+    let pv = bx.ins().iconst(types::I64, lp.declared as i64);
+    let call = bx.ins().call(refs.env, &[lp.ctx, sv, lp.closure, pv]);
+    let bad = bx.inst_results(call)[0];
+    let viewed = bx.create_block();
+    bx.ins().brif(bad, lp.slow, &[], viewed, &[]);
+    bx.switch_to_block(viewed);
+    let slot = bx.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+        16,
+        3,
+    ));
+    let vb = bx.ins().stack_addr(types::I64, slot, 0);
+    let call = bx.ins().call(refs.view, &[lp.list, vb]);
+    let bad = bx.inst_results(call)[0];
+    let viewed = bx.create_block();
+    bx.ins().brif(bad, lp.slow, &[], viewed, &[]);
+    bx.switch_to_block(viewed);
+    let base = bx.ins().load(types::I64, t, vb, 0);
+    let n = bx.ins().load(types::I64, t, vb, 8);
+    // Every element of the parameter's type.
+    let head = bx.create_block();
+    bx.append_block_param(head, types::I64);
+    let check = bx.create_block();
+    let start = bx.create_block();
+    let zero = bx.ins().iconst(types::I64, 0);
+    bx.ins().jump(head, &[zero.into()]);
+    bx.switch_to_block(head);
+    let i = bx.block_params(head)[0];
+    let end = bx.ins().icmp(IntCC::Equal, i, n);
+    bx.ins().brif(end, start, &[], check, &[]);
+    bx.switch_to_block(check);
+    let off = bx.ins().imul_imm_s(i, SIZE as i64);
+    let addr = bx.ins().iadd(base, off);
+    let tag = bx.ins().load(types::I8, t, addr, 0);
+    let bad = match lp.param {
+        RegTy::Float => {
+            let a = bx.ins().icmp_imm_s(IntCC::NotEqual, tag, TAG_INT as i64);
+            let b = bx.ins().icmp_imm_s(IntCC::NotEqual, tag, TAG_FLOAT as i64);
+            bx.ins().band(a, b)
+        }
+        RegTy::Int => bx.ins().icmp_imm_s(IntCC::NotEqual, tag, TAG_INT as i64),
+        _ => bx.ins().icmp_imm_s(IntCC::NotEqual, tag, TAG_BOOL as i64),
+    };
+    let i1 = bx.ins().iadd_imm_s(i, 1);
+    bx.ins().brif(bad, lp.slow, &[], head, &[i1.into()]);
+    bx.switch_to_block(start);
+    let data = match lp.op {
+        EachOp::Map | EachOp::Filter => {
+            let call = bx.ins().call(refs.alloc, &[lp.out, n]);
+            bx.inst_results(call)[0]
+        }
+        _ => bx.ins().iconst(types::I64, 0),
+    };
+    // The loop: element `i`, `k` kept.
+    let head = bx.create_block();
+    bx.append_block_param(head, types::I64);
+    bx.append_block_param(head, types::I64);
+    let each = bx.create_block();
+    let over = bx.create_block();
+    bx.append_block_param(over, types::I64);
+    // The answer of `any` / `all`.
+    let answered = bx.create_block();
+    bx.append_block_param(answered, types::I64);
+    let zero = bx.ins().iconst(types::I64, 0);
+    bx.ins().jump(head, &[zero.into(), zero.into()]);
+    bx.switch_to_block(head);
+    let (i, k) = (bx.block_params(head)[0], bx.block_params(head)[1]);
+    let end = bx.ins().icmp(IntCC::Equal, i, n);
+    bx.ins().brif(end, over, &[k.into()], each, &[]);
+    bx.switch_to_block(each);
+    let off = bx.ins().imul_imm_s(i, SIZE as i64);
+    let addr = bx.ins().iadd(base, off);
+    let arg = match lp.param {
+        RegTy::Int => bx.ins().load(types::I64, t, addr, PAYLOAD),
+        RegTy::Bool => bx.ins().load(types::I8, t, addr, BOOL_PAYLOAD),
+        _ => {
+            let tag = bx.ins().load(types::I8, t, addr, 0);
+            let raw = bx.ins().load(types::I64, t, addr, PAYLOAD);
+            let from_int = bx.ins().fcvt_from_sint(types::F64, raw);
+            let float = bx.ins().bitcast(types::F64, MemFlagsData::new(), raw);
+            let is_int = bx.ins().icmp_imm_s(IntCC::Equal, tag, TAG_INT as i64);
+            bx.ins().select(is_int, from_int, float)
+        }
+    };
+    if calls {
+        let d1 = bx.ins().iadd_imm_s(lp.depth, 1);
+        bx.ins().store(t, d1, lp.ctx, DEPTH_OFFSET);
+    }
+    let (r, status) = body(bx, arg)?;
+    if calls {
+        bx.ins().store(t, lp.depth, lp.ctx, DEPTH_OFFSET);
+    }
+    if let Some(status) = status {
+        let ok = bx.create_block();
+        bx.ins().brif(
+            status,
+            lp.rest,
+            &[i.into(), k.into(), status.into()],
+            ok,
+            &[],
+        );
+        bx.switch_to_block(ok);
+    }
+    let i1 = bx.ins().iadd_imm_s(i, 1);
+    // (A result that is not a `bool` is true.)
+    let truthy = (lp.ret == RegTy::Bool).then_some(r);
+    match lp.op {
+        EachOp::Map => {
+            let off = bx.ins().imul_imm_s(i, SIZE as i64);
+            let dst = bx.ins().iadd(data, off);
+            let tag = match lp.ret {
+                RegTy::Int => TAG_INT,
+                RegTy::Float => TAG_FLOAT,
+                _ => TAG_BOOL,
+            };
+            let tv = bx.ins().iconst(types::I8, tag as i64);
+            bx.ins().store(t, tv, dst, 0);
+            bx.ins()
+                .store(t, r, dst, crate::value::layout::payload_of(tag));
+            bx.ins().jump(head, &[i1.into(), k.into()]);
+        }
+        EachOp::Filter => {
+            let keep = bx.create_block();
+            match truthy {
+                Some(c) => {
+                    bx.ins().brif(c, keep, &[], head, &[i1.into(), k.into()]);
+                }
+                None => {
+                    bx.ins().jump(keep, &[]);
+                }
+            }
+            bx.switch_to_block(keep);
+            let off = bx.ins().imul_imm_s(k, SIZE as i64);
+            let dst = bx.ins().iadd(data, off);
+            let w0 = bx.ins().load(types::I64, t, addr, 0);
+            let w1 = bx.ins().load(types::I64, t, addr, 8);
+            bx.ins().store(t, w0, dst, 0);
+            bx.ins().store(t, w1, dst, 8);
+            let k1 = bx.ins().iadd_imm_s(k, 1);
+            bx.ins().jump(head, &[i1.into(), k1.into()]);
+        }
+        EachOp::Each => {
+            bx.ins().jump(head, &[i1.into(), k.into()]);
+        }
+        EachOp::Any => {
+            let yes = bx.ins().iconst(types::I64, 1);
+            match truthy {
+                Some(c) => {
+                    bx.ins()
+                        .brif(c, answered, &[yes.into()], head, &[i1.into(), k.into()]);
+                }
+                None => {
+                    bx.ins().jump(answered, &[yes.into()]);
+                }
+            }
+        }
+        EachOp::All => {
+            let no = bx.ins().iconst(types::I64, 0);
+            match truthy {
+                Some(c) => {
+                    bx.ins()
+                        .brif(c, head, &[i1.into(), k.into()], answered, &[no.into()]);
+                }
+                None => {
+                    bx.ins().jump(head, &[i1.into(), k.into()]);
+                }
+            }
+        }
+    }
+    bx.switch_to_block(over);
+    let kept = bx.block_params(over)[0];
+    let ok = bx.ins().iconst(types::I32, 0);
+    match lp.op {
+        EachOp::Map => {
+            bx.ins().call(refs.finish, &[lp.out, n]);
+            bx.ins().jump(lp.done, &[ok.into()]);
+        }
+        EachOp::Filter => {
+            bx.ins().call(refs.finish, &[lp.out, kept]);
+            bx.ins().jump(lp.done, &[ok.into()]);
+        }
+        EachOp::Each => {
+            bx.ins().call(refs.clone, &[lp.out, lp.list]);
+            bx.ins().jump(lp.done, &[ok.into()]);
+        }
+        EachOp::Any | EachOp::All => {
+            let v = bx.ins().iconst(types::I64, (lp.op == EachOp::All) as i64);
+            bx.ins().jump(answered, &[v.into()]);
+        }
+    }
+    bx.switch_to_block(answered);
+    let v = bx.block_params(answered)[0];
+    bx.ins().store(t, v, lp.out, 0);
+    let ok = bx.ins().iconst(types::I32, 0);
+    bx.ins().jump(lp.done, &[ok.into()]);
+    Some(())
 }
 
 /// Function called through the interpreter from native code.
@@ -1462,6 +1766,52 @@ fn changes_no_list(q: &Proto) -> bool {
     })
 }
 
+/// Element `v`'s result `r` for `call`: kept (`map`, `filter`), or the answer into `out`
+/// (`any`, `all`): then true, the call is over.
+///
+/// # Safety
+/// `out` is the word of the answer for `any` and `all`.
+unsafe fn each_accept(
+    op: EachOp,
+    kept: &mut Vec<Value>,
+    out: *mut u64,
+    r: Value,
+    v: &Value,
+) -> bool {
+    match op {
+        EachOp::Map => kept.push(r),
+        EachOp::Filter => {
+            if r.truthy() {
+                kept.push(v.clone());
+            }
+        }
+        EachOp::Each => {}
+        // SAFETY: see above.
+        EachOp::Any if r.truthy() => {
+            unsafe { *out = 1 };
+            return true;
+        }
+        EachOp::All if !r.truthy() => {
+            unsafe { *out = 0 };
+            return true;
+        }
+        EachOp::Any | EachOp::All => {}
+    }
+    false
+}
+
+/// The native word of element `v` for parameter type `param`, if it has that type (an
+/// `int` for a `float`).
+fn each_arg(param: RegTy, v: &Value) -> Option<u64> {
+    Some(match (param, v) {
+        (RegTy::Int, Value::Int(i)) => *i as u64,
+        (RegTy::Float, Value::Int(i)) => (*i as f64).to_bits(),
+        (RegTy::Float, Value::Float(x)) => x.to_bits(),
+        (RegTy::Bool, Value::Bool(b)) => *b as u64,
+        _ => return None,
+    })
+}
+
 /// See `EachCall`. The result: a list (`map`, `filter`, `each`) into the slot `out`, a
 /// `bool` (`any`, `all`) as a word. Returns 0; 3 if nothing was done (another closure, an
 /// element not of the parameter's type, little native stack left: the interpreter does
@@ -1493,56 +1843,12 @@ extern "C" fn bk_each(
         {
             return 3;
         }
-        let fits = |v: &Value| {
-            matches!(
-                (call.param, v),
-                (RegTy::Int, Value::Int(_))
-                    | (RegTy::Float, Value::Int(_) | Value::Float(_))
-                    | (RegTy::Bool, Value::Bool(_))
-            )
-        };
-        if !l.borrow().iter().all(fits) {
+        if !l.borrow().iter().all(|v| each_arg(call.param, v).is_some()) {
             return 3;
         }
-        // A copy of the list if the closure may change it; otherwise its elements read
-        // as they come (simple values: no borrow held during the calls).
-        let copy: Vec<Value> = if call.pure {
-            Vec::new()
-        } else {
-            l.borrow().clone()
-        };
-        let n = if call.pure {
-            l.borrow().len()
-        } else {
-            copy.len()
-        };
+        let n = l.borrow().len();
         let depth = (*ctx).depth;
         let mut kept = Vec::with_capacity(if call.op == EachOp::Map { n } else { 0 });
-        // A `map` element not of the native result's type.
-        let mut other = false;
-        // The closure's result `r` for element `v`.
-        macro_rules! accept {
-            ($r:expr, $v:expr) => {
-                match call.op {
-                    EachOp::Map => kept.push($r),
-                    EachOp::Filter => {
-                        if $r.truthy() {
-                            kept.push($v.clone());
-                        }
-                    }
-                    EachOp::Each => {}
-                    EachOp::Any if $r.truthy() => {
-                        *out = 1;
-                        return 0;
-                    }
-                    EachOp::All if !$r.truthy() => {
-                        *out = 0;
-                        return 0;
-                    }
-                    EachOp::Any | EachOp::All => {}
-                }
-            };
-        }
         let mut start = 0;
         // A closure that changes no list and calls nothing, its native code returning a
         // simple value: the list read in place, its code looked up once (nothing it does
@@ -1560,12 +1866,8 @@ extern "C" fn bk_each(
             (*ctx).env = c.upvals.as_ptr();
             while start < n {
                 let v = &items[start];
-                let arg = match (call.param, v) {
-                    (RegTy::Float, Value::Int(i)) => (*i as f64).to_bits(),
-                    (_, Value::Int(i)) => *i as u64,
-                    (_, Value::Float(x)) => x.to_bits(),
-                    (_, Value::Bool(b)) => *b as u64,
-                    _ => return 3,
+                let Some(arg) = each_arg(call.param, v) else {
+                    return 3;
                 };
                 let mut word = 0u64;
                 (*ctx).depth = depth + 1;
@@ -1578,39 +1880,84 @@ extern "C" fn bk_each(
                         _ => Value::Bool(word & 1 == 1),
                     },
                     2 => {
-                        other = true;
-                        (*ctx).returned.take().unwrap_or(Value::Nil)
+                        drop(items);
+                        return each_from(ctx, call, list, f, out, start, kept, true);
                     }
                     _ => return 1,
                 };
                 start += 1;
-                accept!(r, v);
-                if status != 0 {
-                    break;
+                if each_accept(call.op, &mut kept, out, r, v) {
+                    return 0;
                 }
             }
         }
+        each_from(ctx, call, list, f, out, start, kept, false)
+    }
+}
+
+/// `bk_each` from element `start` on (those before it done, `kept` what they gave), the
+/// list and the closure checked; `resumed`: the result of element `start` is in
+/// `JitCtx::returned` (status 2 of the closure's code), of another type than the native
+/// one.
+///
+/// # Safety
+/// As `bk_each`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn each_from(
+    ctx: *mut JitCtx,
+    call: &EachCall,
+    list: *const Value,
+    f: *const Value,
+    out: *mut u64,
+    mut start: usize,
+    mut kept: Vec<Value>,
+    resumed: bool,
+) -> i32 {
+    unsafe {
+        let (Value::Function(func), Value::List(l)) = (&*f, &*list) else {
+            return 3;
+        };
+        let Function::Script(c) = &**func else {
+            return 3;
+        };
+        // A copy of the list if the closure may change it; otherwise its elements read
+        // as they come (simple values: no borrow held during the calls).
+        let copy: Vec<Value> = if call.pure {
+            Vec::new()
+        } else {
+            l.borrow()[start..].to_vec()
+        };
+        let n = if call.pure {
+            l.borrow().len()
+        } else {
+            start + copy.len()
+        };
+        let base = start;
+        let item = |k: usize| match copy.get(k - base) {
+            Some(v) => v.clone(),
+            None => l.borrow()[k].clone(),
+        };
+        // A `map` element not of the native result's type.
+        let mut other = false;
+        if resumed {
+            let r = (*ctx).returned.take().unwrap_or(Value::Nil);
+            other = true;
+            if each_accept(call.op, &mut kept, out, r, &item(start)) {
+                return 0;
+            }
+            start += 1;
+        }
+        let depth = (*ctx).depth;
         for k in start..n {
-            let item;
-            let v = match copy.get(k) {
-                Some(v) => v,
-                None => {
-                    item = l.borrow()[k].clone();
-                    &item
-                }
-            };
+            let v = item(k);
             let code = match &*call.proto.jit.borrow() {
                 JitState::Native(code) if code.params.len() == 1 => Some((code.entry, code.ret)),
                 _ => None,
             };
             let r = match code {
                 Some((entry, ret)) => {
-                    let arg = match (call.param, v) {
-                        (RegTy::Float, Value::Int(i)) => (*i as f64).to_bits(),
-                        (_, Value::Int(i)) => *i as u64,
-                        (_, Value::Float(x)) => x.to_bits(),
-                        (_, Value::Bool(b)) => *b as u64,
-                        _ => return 3,
+                    let Some(arg) = each_arg(call.param, &v) else {
+                        return 3;
                     };
                     let mut word = 0u64;
                     let mut result = Value::Nil;
@@ -1650,7 +1997,9 @@ extern "C" fn bk_each(
                     }
                 }
             };
-            accept!(r, v);
+            if each_accept(call.op, &mut kept, out, r, &v) {
+                return 0;
+            }
         }
         let v = match call.op {
             EachOp::Any => {
@@ -1670,6 +2019,63 @@ extern "C" fn bk_each(
         }
         *(out as *mut Value) = v;
         0
+    }
+}
+
+/// `bk_each` resumed at element `i`, whose result the native loop could not take
+/// (status 2 of the closure's code, the result in `JitCtx::returned`): the elements
+/// before it done by that loop, which wrote the `k` kept into the list of `out` (`map`,
+/// `filter`: `bk_list_alloc`, its length not set yet). Returns as `bk_each`.
+extern "C" fn bk_each_rest(
+    ctx: *mut JitCtx,
+    call: *const EachCall,
+    list: *const Value,
+    f: *const Value,
+    out: *mut u64,
+    i: u64,
+    k: u64,
+) -> i32 {
+    // SAFETY: as `bk_each`; for `map` and `filter`, `out` is the slot `bk_list_alloc`
+    // filled, with `k` elements written (simple values).
+    unsafe {
+        let call = &*call;
+        let kept = match call.op {
+            EachOp::Map | EachOp::Filter => {
+                let slot = &mut *(out as *mut Value);
+                let Value::List(l) = slot else {
+                    return 3;
+                };
+                let mut l = l.borrow_mut();
+                l.set_len(k as usize);
+                std::mem::take(&mut *l)
+            }
+            _ => Vec::new(),
+        };
+        each_from(ctx, call, list, f, out, i as usize, kept, true)
+    }
+}
+
+/// A list with room for `cap` elements into the slot `dst`, for native code to write
+/// (`map`, `filter`); the address of its elements. Their number set by `bk_list_done`.
+extern "C" fn bk_list_alloc(dst: *mut Value, cap: u64) -> *mut Value {
+    // SAFETY: `dst` is a slot of the native frame.
+    unsafe {
+        *dst = Value::list(Vec::with_capacity(cap as usize));
+        match &*dst {
+            Value::List(l) => l.borrow_mut().as_mut_ptr(),
+            _ => std::ptr::null_mut(),
+        }
+    }
+}
+
+/// The list of `bk_list_alloc` in the slot `dst` holds its first `len` elements, written
+/// by native code (simple values).
+extern "C" fn bk_list_done(dst: *mut Value, len: u64) {
+    // SAFETY: see above.
+    unsafe {
+        if let Value::List(l) = &*dst {
+            l.borrow_mut().set_len(len as usize);
+        }
     }
 }
 
@@ -2031,7 +2437,7 @@ pub struct Jit {
     str_fns: [FuncId; 4],
     /// `bk_call_boxed`, `bk_binary`, `bk_truthy`, `bk_global`, `bk_box_into`,
     /// `bk_new_object`, `bk_init_done`.
-    boxed_fns: [FuncId; 25],
+    boxed_fns: [FuncId; 28],
     /// Calls through the interpreter (addresses held by native code).
     #[allow(clippy::vec_box)]
     boxed_calls: Vec<Box<BoxedCall>>,
@@ -3892,6 +4298,9 @@ helpers!(
     bk_assign_up(_, _, _, _, _),
     bk_closure_env(_, _, _, _),
     bk_each(_, _, _, _, _),
+    bk_each_rest(_, _, _, _, _, _, _),
+    bk_list_alloc(_, _),
+    bk_list_done(_, _),
     bk_cells_init(_, _),
     bk_cells_drop(_, _),
     bk_cell_new(_, _),
@@ -4124,6 +4533,13 @@ impl Jit {
                 &[ptr, types::I32, types::I64, types::I32, types::I64][..],
                 types::I32,
             ),
+            (
+                "bk_each_rest",
+                &[ptr, ptr, ptr, ptr, ptr, types::I64, types::I64][..],
+                types::I32,
+            ),
+            ("bk_list_alloc", &[ptr, types::I64][..], ptr),
+            ("bk_list_done", &[ptr, types::I64][..], types::INVALID),
         ] {
             let mut sig = module.make_signature();
             for t in params {
@@ -4134,7 +4550,7 @@ impl Jit {
             }
             boxed_fns.push(module.declare_function(name, Linkage::Import, &sig).ok()?);
         }
-        let boxed_fns: [FuncId; 25] = boxed_fns.try_into().ok()?;
+        let boxed_fns: [FuncId; 28] = boxed_fns.try_into().ok()?;
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr));
         sig.params.push(AbiParam::new(ptr));
@@ -4482,6 +4898,9 @@ impl Jit {
             is_type_ref,
             caught_drop_ref,
             set_global_ref,
+            each_rest_ref,
+            list_alloc_ref,
+            list_done_ref,
         ] = self
             .boxed_fns
             .map(|f| self.module.declare_func_in_func(f, &mut ctx.func));
@@ -4581,6 +5000,7 @@ impl Jit {
                     Vec::new(),
                     &[],
                 )
+                && inline_typed(&t.proto, &qp)
             {
                 inlines.insert(*k, (t.proto.clone(), qp));
             }
@@ -6063,13 +6483,15 @@ impl Jit {
                         };
                         let op = each_op(self.list_syms, *name).ok_or(())?;
                         let target = &plan.targets[&key];
-                        let (cparams, _) = native_sig(&target.proto).ok_or(())?;
+                        let (cparams, cret) = native_sig(&target.proto).ok_or(())?;
+                        let declared = target.declared.clone().ok_or(())?;
+                        let pure = changes_no_list(&target.proto);
                         self.each_calls.push(Box::new(EachCall {
                             op,
                             proto: target.proto.clone(),
-                            declared: target.declared.clone().ok_or(())?,
+                            declared: declared.clone(),
                             param: cparams[0],
-                            pure: changes_no_list(&target.proto),
+                            pure,
                             span,
                         }));
                         let desc = &**self.each_calls.last().unwrap() as *const EachCall;
@@ -6094,8 +6516,100 @@ impl Jit {
                         } else {
                             own!(bx, *dst)
                         };
+                        call_sites.push((target.proto.name.clone(), span));
+                        let tid = trace_base + (call_sites.len() - 1) as i64;
+                        // The status of the call, as `bk_each` returns it.
+                        let join = bx.create_block();
+                        bx.append_block_param(join, types::I32);
+                        // A closure that changes no list, of a simple parameter and result:
+                        // the loop here (see `each_loop`), `bk_each` if something it
+                        // assumes does not hold.
+                        let fref = callee_refs.get(&target.key()).map(|(r, _)| *r);
+                        if let (true, Some(fref), [param]) =
+                            (pure && cret != RegTy::Value, fref, cparams.as_slice())
+                            && *param != RegTy::Value
+                        {
+                            let inline = inlinable(&target.proto, p)
+                                .then(|| {
+                                    analyze(
+                                        &target.proto,
+                                        None,
+                                        globals,
+                                        self.list_syms,
+                                        Vec::new(),
+                                        &[],
+                                    )
+                                })
+                                .flatten()
+                                .filter(|qp| inline_typed(&target.proto, qp));
+                            let slow = bx.create_block();
+                            bx.set_cold_block(slow);
+                            let rest = bx.create_block();
+                            bx.set_cold_block(rest);
+                            bx.append_block_param(rest, types::I64);
+                            bx.append_block_param(rest, types::I64);
+                            bx.append_block_param(rest, types::I32);
+                            let lp = EachLoop {
+                                op,
+                                param: *param,
+                                ret: cret,
+                                ctx: ctxv,
+                                list,
+                                closure: fv,
+                                declared: Rc::as_ptr(&declared),
+                                out,
+                                slow,
+                                rest,
+                                done: join,
+                                depth,
+                            };
+                            let refs = EachRefs {
+                                env: closure_env_ref,
+                                view: list_ref,
+                                alloc: list_alloc_ref,
+                                finish: list_done_ref,
+                                clone: clone_ref,
+                            };
+                            let calls = inline.is_none();
+                            each_loop(&mut bx, &lp, &refs, calls, &mut |bx, arg| match &inline {
+                                Some(qp) => emit_inline(
+                                    bx,
+                                    &target.proto,
+                                    qp,
+                                    &[arg],
+                                    None,
+                                    frem_ref,
+                                    &mut |bx, c, k, s| inline_err!(bx, c, k, s, tid),
+                                    &mut |bx, c| bail!(bx, c),
+                                )
+                                .map(|v| (v, None)),
+                                None => {
+                                    let call = bx.ins().call(fref, &[ctxv, arg]);
+                                    let r = bx.inst_results(call);
+                                    Some((r[1], Some(r[0])))
+                                }
+                            })
+                            .ok_or(())?;
+                            // 2: a result of another type, the rest done by `bk_each_rest`;
+                            // otherwise an error in the closure's code.
+                            bx.switch_to_block(rest);
+                            let ps = bx.block_params(rest).to_vec();
+                            let resumed = bx.create_block();
+                            let other = bx.ins().icmp_imm_s(IntCC::Equal, ps[2], 2);
+                            bx.ins().brif(other, resumed, &[], join, &[ps[2].into()]);
+                            bx.switch_to_block(resumed);
+                            let call = bx
+                                .ins()
+                                .call(each_rest_ref, &[ctxv, dp, list, fv, out, ps[0], ps[1]]);
+                            let status = bx.inst_results(call)[0];
+                            bx.ins().jump(join, &[status.into()]);
+                            bx.switch_to_block(slow);
+                        }
                         let call = bx.ins().call(each_ref, &[ctxv, dp, list, fv, out]);
                         let status = bx.inst_results(call)[0];
+                        bx.ins().jump(join, &[status.into()]);
+                        bx.switch_to_block(join);
+                        let status = bx.block_params(join)[0];
                         // 3: nothing done, the interpreter does it.
                         let none = bx.ins().icmp_imm_s(IntCC::Equal, status, 3);
                         bail!(bx, none);
@@ -6104,8 +6618,6 @@ impl Jit {
                         deopt!(bx, other, cur, site_b, site_k + 1, Some(*dst));
                         // 1: an error in the closure's code (its call added to the stack);
                         // 4: one raised through the interpreter.
-                        call_sites.push((target.proto.name.clone(), span));
-                        let tid = trace_base + (call_sites.len() - 1) as i64;
                         let failed = bx.create_block();
                         bx.set_cold_block(failed);
                         let traced = bx.create_block();

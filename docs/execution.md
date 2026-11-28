@@ -120,12 +120,17 @@ Measured in Chrome (V8), the interpreter against the compiled code of the playgr
 | a closure of the function called 300,000 times | 27.6 ms | 2.9 ms |
 | the same, reading a captured `float` | 34.6 ms | 2.8 ms |
 | a closure given as an argument, 300,000 calls | 27.0 ms | 2.8 ms |
-| `map` then `filter` in a typed function, 100,000 elements, 10 times | 148 ms | 21 ms |
+| `map` then `filter` in a typed function, 100,000 elements, 10 times | 148 ms | 14 ms |
 
 A built-in (`map`, `filter`…) called by the interpreter calls the closure's typed code
-on each element, the list copied first (the closure may change it); called by typed code
-with a known closure, a helper does the loop (`bk_each`), the list not copied when the
-closure cannot change one (then read in place, the closure's code looked up once).
+on each element, the list copied first (the closure may change it). Called by typed code
+with a known closure that changes no list, taking and returning a simple value, the loop
+is in the function's code (`each_loop`): the list read in place, every element's type
+checked first, the closure inlined when small (no captured variable) or its typed code
+called directly, the elements of a `map` or `filter` written into the list made for
+them. Otherwise a helper does the loop (`bk_each`), the list not copied when the closure
+cannot change one; the same helper takes over from the native loop when the closure
+returns a value of another type.
 
 Tested under Bun ([`playground/web/test/`](../playground/web/test)), each program run
 interpreted, compiled as usual, and with every function compiled from its first call,

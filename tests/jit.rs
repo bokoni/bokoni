@@ -1298,6 +1298,65 @@ fn list_methods_with_closures_in_typed_code() {
 }
 
 #[test]
+fn list_methods_loop_in_native_code() {
+    // A closure that changes no list, of a simple parameter and result: the loop in the
+    // function's native code (the closure inlined when small, called otherwise), which
+    // stays compiled.
+    for (defs, call) in [
+        (
+            "def f(xs: [int], k: int): [int] = xs.map(|x| x * k)",
+            "f([1, 2, 3], 4)",
+        ),
+        (
+            "def f(xs: [int]): [int] = xs.map(|x| x * 2).filter(|x| x % 3 == 0)",
+            "f((0...20).to_list())",
+        ),
+        (
+            "def f(xs: [int]): bool = xs.any(|x| x < 0)",
+            "f([1, 2, -3])",
+        ),
+        ("def f(xs: [int]): bool = xs.any(|x| x < 0)", "f([1, 2, 3])"),
+        ("def f(xs: [int]): bool = xs.all(|x| x > 0)", "f([1, 2, 3])"),
+        ("def f(xs: [int]): bool = xs.all(|x| x > 1)", "f([1, 2, 3])"),
+        ("def f(xs: [int]): bool = xs.any(|x| x * 1.5)", "f([1])"),
+        (
+            "def f(xs: [float]): [float] = xs.map(|x| x / 2.0)",
+            "f([1.0, 3.0])",
+        ),
+        (
+            "def f(xs: [float]): [bool] = xs.map(|x| x > 1.5)",
+            "f([1.0, 3])",
+        ),
+        (
+            "def f(xs: [bool]): int = xs.filter(|b| not b).len()",
+            "f([true, false, false])",
+        ),
+        (
+            "def f(xs: [int]): int = xs.each(|x| x * 2).len()",
+            "f([4, 5])",
+        ),
+        ("def f(xs: [int]): [int] = xs.filter(|x| x > 1)", "f([])"),
+    ] {
+        let mut e = Engine::new();
+        e.set_output(|_| {});
+        e.eval(defs).unwrap();
+        let mut i = Engine::new();
+        i.set_output(|_| {});
+        i.set_jit(false);
+        i.eval(defs).unwrap();
+        let show = |e: &mut Engine| match e.eval(call) {
+            Ok(v) => e.inspect(&v),
+            Err(err) => err.render(call, "test"),
+        };
+        let want = show(&mut i);
+        for _ in 0..3 {
+            assert_eq!(show(&mut e), want, "{defs}\n{call}");
+        }
+        assert!(e.is_native("f"), "`f` should be compiled: {defs}");
+    }
+}
+
+#[test]
 fn copies_of_values_set_once_are_borrowed() {
     // A copy of a value written once, on entry, borrows it (not copied through Rust):
     // same results, the value still freed once.
@@ -1493,7 +1552,9 @@ fn compiled_after_a_threshold_of_calls() {
     // Called once: interpreted, except the function with a loop.
     assert!(!e.is_native("sq"));
     assert!(e.is_native("lp"));
-    let v = e.eval("let t = 0\nfor i in 0...20\n  t += sq(i) + g(i)\nend\nt").unwrap();
+    let v = e
+        .eval("let t = 0\nfor i in 0...20\n  t += sq(i) + g(i)\nend\nt")
+        .unwrap();
     assert_eq!(e.inspect(&v), "2680");
     assert!(e.is_native("sq"));
     // The same answers below and above the threshold.
