@@ -54,10 +54,7 @@ impl Annotation {
     pub fn get<T: FromValue>(&self, field: &str) -> Result<T, String> {
         match self.value(field) {
             Some(v) => T::from_value(v).map_err(|e| format!("`{}.{field}`: {e}", self.name)),
-            None => Err(format!(
-                "annotation `{}` has no field `{field}`",
-                self.name
-            )),
+            None => Err(format!("annotation `{}` has no field `{field}`", self.name)),
         }
     }
 }
@@ -298,7 +295,12 @@ impl Runtime {
         }
         Ok(TypeDesc {
             name: info.name.to_string(),
-            params: info.generics.iter().flat_map(|g| &g.params).map(|p| self.name(p.name).to_string()).collect(),
+            params: info
+                .generics
+                .iter()
+                .flat_map(|g| &g.params)
+                .map(|p| self.name(p.name).to_string())
+                .collect(),
             kind: match info.kind {
                 crate::ast::TypeDeclKind::Type => DeclKind::Type,
                 crate::ast::TypeDeclKind::Class => DeclKind::Class,

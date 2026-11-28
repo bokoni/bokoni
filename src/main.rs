@@ -97,7 +97,10 @@ fn main() -> ExitCode {
 fn load_file(name: &str, from: &str) -> Result<Source, String> {
     let base = match from.starts_with('<') {
         true => PathBuf::from("."),
-        false => Path::new(from).parent().map(Path::to_path_buf).unwrap_or_default(),
+        false => Path::new(from)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default(),
     };
     let mut path = base.join(name);
     if path.extension().is_none() {

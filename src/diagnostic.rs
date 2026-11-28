@@ -162,9 +162,7 @@ impl Error {
         ));
         for (name, call) in &self.trace {
             let (l, c) = line_col(src, call.start);
-            out.push_str(&format!(
-                "{pad} = in `{name}` called from {file}:{l}:{c}\n"
-            ));
+            out.push_str(&format!("{pad} = in `{name}` called from {file}:{l}:{c}\n"));
         }
         out
     }

@@ -70,10 +70,7 @@ fn names() {
     assert!(has(&errors("break"), "`break` outside of a loop"));
     assert!(has(&errors("@x"), "only be used inside a method"));
     assert!(has(&errors("let s: Servr = 1"), "unknown type `Servr`"));
-    assert!(has(
-        &errors("let s: strr = 1"),
-        "(did you mean `str`?)"
-    ));
+    assert!(has(&errors("let s: strr = 1"), "(did you mean `str`?)"));
     // A function may use a variable declared further down (called afterwards).
     ok("def show() = config + 1\nlet config = 1\nshow()");
     // Block scope.
@@ -160,10 +157,7 @@ fn types_and_classes() {
         &e("Route do\n  pth = \"/\"\nend"),
         "(did you mean `path`?)"
     ));
-    assert!(has(
-        &e("Route(path: \"/\").pth"),
-        "(did you mean `path`?)"
-    ));
+    assert!(has(&e("Route(path: \"/\").pth"), "(did you mean `path`?)"));
     assert!(has(
         &e("def reg(r: Route) = r\nreg({path: \"/\", verb: 1})"),
         "`Route` has no field `verb`"
@@ -251,10 +245,7 @@ fn checks_use_earlier_definitions() {
         .unwrap();
     // The type and function defined earlier are known to the checker.
     let errs = e.eval("Server do\n  prot = 1\nend").unwrap_err();
-    assert!(
-        errs[0].message.contains("(did you mean `port`?)"),
-        "{errs}"
-    );
+    assert!(errs[0].message.contains("(did you mean `port`?)"), "{errs}");
     assert!(
         e.eval("double(\"a\")").unwrap_err()[0]
             .message
@@ -480,9 +471,17 @@ fn check_without_running() {
     let mut e = Engine::new();
     let out = printed.clone();
     e.set_output(move |s| out.borrow_mut().push_str(s));
-    assert!(e.check("print(\"x\")\ndef f(a: int): int = a\nf(2)", "a.bk").is_ok());
-    let errs = e.check("print(\"x\")\nlet n: int = \"s\"", "b.bk").unwrap_err();
+    assert!(
+        e.check("print(\"x\")\ndef f(a: int): int = a\nf(2)", "a.bk")
+            .is_ok()
+    );
+    let errs = e
+        .check("print(\"x\")\nlet n: int = \"s\"", "b.bk")
+        .unwrap_err();
     assert!(errs.0[0].message.contains("expected type `int`"));
-    assert!(errs.render("print(\"x\")\nlet n: int = \"s\"", "b.bk").contains("b.bk:2:14"));
+    assert!(
+        errs.render("print(\"x\")\nlet n: int = \"s\"", "b.bk")
+            .contains("b.bk:2:14")
+    );
     assert_eq!(*printed.borrow(), "");
 }

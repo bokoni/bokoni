@@ -680,8 +680,10 @@ impl Checker<'_> {
     }
 
     fn is_module(&mut self, q: Symbol) -> bool {
-        matches!(self.lookup(q).map(|(v, _)| v.ty.clone()), Some(Ty::Module(_)))
-            || self.globals.is_module(q)
+        matches!(
+            self.lookup(q).map(|(v, _)| v.ty.clone()),
+            Some(Ty::Module(_))
+        ) || self.globals.is_module(q)
     }
 
     /// Module named by a path written here, looked up in the enclosing modules first.
@@ -1047,7 +1049,11 @@ impl Checker<'_> {
             kind: info.kind,
             parent: None,
             traits: Vec::new(),
-            required: info.required.iter().map(|r| (r.name, r.by.clone())).collect(),
+            required: info
+                .required
+                .iter()
+                .map(|r| (r.name, r.by.clone()))
+                .collect(),
             is_abstract: info.is_abstract,
             ready: true,
             fields: Vec::new(),
@@ -1702,7 +1708,11 @@ impl Checker<'_> {
 
     /// Is `a` the class `b` or one of its descendants?
     fn descends(&self, mut a: TypeId, b: TypeId) -> bool {
-        if self.types.get(b).is_some_and(|t| t.kind == TypeDeclKind::Trait) {
+        if self
+            .types
+            .get(b)
+            .is_some_and(|t| t.kind == TypeDeclKind::Trait)
+        {
             return self.types.get(a).is_some_and(|t| t.traits.contains(&b)) || a == b;
         }
         loop {
@@ -1775,7 +1785,8 @@ impl Checker<'_> {
             }
             match &s.kind {
                 StmtKind::Type(t) => {
-                    self.decl_ids.insert(&**t as *const TypeDecl as usize, self.types.len());
+                    self.decl_ids
+                        .insert(&**t as *const TypeDecl as usize, self.types.len());
                     let id = self.types.len();
                     let deprecated = self.ast_deprecation(&t.annotations);
                     let qname = self.decl_name(t.name);
@@ -1909,7 +1920,10 @@ impl Checker<'_> {
             let mut access =
                 parent.map_or(FxHashMap::default(), |pid| self.types[pid].access.clone());
             let (mut required, mut traits) = match parent {
-                Some(pid) => (self.types[pid].required.clone(), self.types[pid].traits.clone()),
+                Some(pid) => (
+                    self.types[pid].required.clone(),
+                    self.types[pid].traits.clone(),
+                ),
                 None => (Vec::new(), Vec::new()),
             };
             self.types[id].parent = parent;
@@ -1921,7 +1935,9 @@ impl Checker<'_> {
                 .collect();
             // Traits first: the class's own methods take precedence.
             for m in &t.members {
-                let Member::Include(n, args, span) = m else { continue };
+                let Member::Include(n, args, span) = m else {
+                    continue;
+                };
                 let found = match self.lookup(*n) {
                     Some((v, _)) => Some(v.ty.clone()),
                     None => self.global_ty(*n).map(|(t, _)| t),
@@ -2709,8 +2725,7 @@ impl Checker<'_> {
                     },
                     Ty::Any => Ty::Any,
                     r => {
-                        let msg =
-                            format!("`.{idx}` applies to a tuple, got `{}`", self.show_v(&r));
+                        let msg = format!("`.{idx}` applies to a tuple, got `{}`", self.show_v(&r));
                         self.error(msg, span);
                         Ty::Any
                     }
@@ -2893,7 +2908,9 @@ impl Checker<'_> {
                 union(types)
             }
             ExprKind::Super(args) => {
-                let target = self.method.and_then(|(id, m)| Some((self.types[id].parent?, m)));
+                let target = self
+                    .method
+                    .and_then(|(id, m)| Some((self.types[id].parent?, m)));
                 let Some((parent, m)) = target else {
                     self.error(
                         "`super` can only be used in a method of a class that inherits",
@@ -2906,7 +2923,11 @@ impl Checker<'_> {
                 };
                 match self.types[parent].methods.get(&m).cloned() {
                     Some(sig) => {
-                        let what = format!("`super` (`{}.{}`)", self.name(self.types[parent].name), self.name(m));
+                        let what = format!(
+                            "`super` (`{}.{}`)",
+                            self.name(self.types[parent].name),
+                            self.name(m)
+                        );
                         // A generic parent (`< Box(T)`): its parameters as given.
                         let cur = self.method.unwrap().0;
                         let this = self.this_ty(cur);
@@ -2988,7 +3009,8 @@ impl Checker<'_> {
                     (Some(v), None) => self.expr(v, None),
                     (None, Some(r)) => {
                         if !self.assignable(&Ty::Nil, r) {
-                            let msg = format!("`return` without a value, expected `{}`", self.show(r));
+                            let msg =
+                                format!("`return` without a value, expected `{}`", self.show(r));
                             self.error(msg, span);
                         }
                         Ty::Nil
@@ -3026,7 +3048,10 @@ impl Checker<'_> {
                 let ty = self.refined(name).unwrap_or(ty);
                 if let Ty::Module(m) = ty {
                     let m = self.name(m).to_string();
-                    self.error(format!("`{m}` is a module: use `{m}::Name` or `{m}.f(…)`"), span);
+                    self.error(
+                        format!("`{m}` is a module: use `{m}::Name` or `{m}.f(…)`"),
+                        span,
+                    );
                     return Ty::Any;
                 }
                 self.warn_value(&ty, name, span);
@@ -3035,7 +3060,9 @@ impl Checker<'_> {
             None => {
                 // Member of an enclosing module declared by an earlier script.
                 for m in self.modules() {
-                    if let Some(t) = self.member_ty(m, name).filter(|_| self.qualified(m, name).is_some())
+                    if let Some(t) = self
+                        .member_ty(m, name)
+                        .filter(|_| self.qualified(m, name).is_some())
                     {
                         return t;
                     }
@@ -3043,7 +3070,10 @@ impl Checker<'_> {
                 if let Some((t, _)) = self.global_ty(name) {
                     if let Ty::Module(m) = t {
                         let m = self.name(m).to_string();
-                        self.error(format!("`{m}` is a module: use `{m}::Name` or `{m}.f(…)`"), span);
+                        self.error(
+                            format!("`{m}` is a module: use `{m}::Name` or `{m}.f(…)`"),
+                            span,
+                        );
                         return Ty::Any;
                     }
                     self.warn_value(&t, name, span);
@@ -3085,10 +3115,7 @@ impl Checker<'_> {
 
     fn ivar(&mut self, name: Symbol, span: Span) -> Ty {
         let Some(this) = self.fns.last().and_then(|f| f.this.clone()) else {
-            self.error(
-                "`self` and `@field` can only be used inside a method",
-                span,
-            );
+            self.error("`self` and `@field` can only be used inside a method", span);
             return Ty::Any;
         };
         let Ty::Object(id, _) = this else {
@@ -3545,8 +3572,12 @@ impl Checker<'_> {
                 Some(n) => match sig.params.iter().position(|p| p.name == n) {
                     Some(i) => Some((i, &sig.params[i])),
                     None => {
-                        let names: Vec<&str> =
-                            sig.params.iter().filter(|p| !unnamed(p.name)).map(|p| self.name(p.name)).collect();
+                        let names: Vec<&str> = sig
+                            .params
+                            .iter()
+                            .filter(|p| !unnamed(p.name))
+                            .map(|p| self.name(p.name))
+                            .collect();
                         let hint = suggest(self.name(n), names);
                         let msg = format!("{what} has no parameter `{}`{hint}", self.name(n));
                         self.error(msg, ast.span(a.value));
@@ -3925,7 +3956,10 @@ impl Checker<'_> {
                 .get(&format!("{n}="))
                 .and_then(|s| def.methods.get(&s).cloned());
             if let Some(sig) = setter {
-                return sig.params.first().map_or(Ty::Any, |p| self.subst(&p.ty, &m));
+                return sig
+                    .params
+                    .first()
+                    .map_or(Ty::Any, |p| self.subst(&p.ty, &m));
             }
             if def.kind == TypeDeclKind::Class
                 && self.this_type() != Some(*id)
@@ -4328,7 +4362,10 @@ impl Checker<'_> {
                     match usize::try_from(pos).ok().and_then(|p| ts.get(p)) {
                         Some(t) => t.clone(),
                         None => {
-                            self.error(format!("index {n} out of tuple bounds (length {len})"), span);
+                            self.error(
+                                format!("index {n} out of tuple bounds (length {len})"),
+                                span,
+                            );
                             Ty::Any
                         }
                     }

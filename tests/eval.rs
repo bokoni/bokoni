@@ -56,11 +56,7 @@ fn variables_and_constants() {
     assert_eq!(run("let x = 1\nx = x + 1\nx += 10\nx"), "=> 12");
     assert_eq!(run("MAX = 10\nMAX * 2"), "=> 20");
     assert!(err("x = 1").1.contains("use `let x = …`"));
-    assert!(
-        err("MAX = 1\nMAX = 2")
-            .1
-            .contains("cannot be modified")
-    );
+    assert!(err("MAX = 1\nMAX = 2").1.contains("cannot be modified"));
     assert!(err("y").1.contains("`y` is not defined"));
     // Block scope: a `let` inside an `if` does not leak.
     assert!(
@@ -121,11 +117,7 @@ fn functions() {
             .1
             .contains("has no parameter `z`")
     );
-    assert!(
-        err("def f = 1\nf = 2")
-            .1
-            .contains("cannot be modified")
-    );
+    assert!(err("def f = 1\nf = 2").1.contains("cannot be modified"));
 }
 
 #[test]
@@ -177,10 +169,16 @@ fn control_flow() {
         "=> [\"zero\", 1]"
     );
     assert_eq!(
-        run("let xs = [1]\nlet k = 0\ndef f(): int?\n  k += 1\n  nil\nend\n[xs[3]? ?? 9, xs[0]? ?? 9, false ?? 1, f() ?? 2, k, nil ?? 1 + 1, nil ?? 0 > 5, \"7\".to_i?() ?? 0]"),
+        run(
+            "let xs = [1]\nlet k = 0\ndef f(): int?\n  k += 1\n  nil\nend\n[xs[3]? ?? 9, xs[0]? ?? 9, false ?? 1, f() ?? 2, k, nil ?? 1 + 1, nil ?? 0 > 5, \"7\".to_i?() ?? 0]"
+        ),
         "=> [9, 1, false, 2, 1, 2, false, 7]"
     );
-    assert!(err("true ? 1").1.contains("between the two values of `? :`"));
+    assert!(
+        err("true ? 1")
+            .1
+            .contains("between the two values of `? :`")
+    );
     // Type reflection: `is_a?`, `as`, `as?`, `responds_to?`.
     let classes = "trait Greet\n  def hi(): str = \"hi\"\nend\nclass Animal\n  def name = \"animal\"\nend\nclass Dog < Animal\n  include Greet\n  def bark = \"woof\"\nend\ntype Point\n  x: int = 0\nend\ndef id(x) = x\nlet d = Dog()\n";
     assert_eq!(
@@ -215,7 +213,9 @@ fn control_flow() {
     );
     // `a?.b`: `nil` for a `nil` `a`, the rest of the chain skipped, `a` evaluated once.
     assert_eq!(
-        run("class U\n  def init(@n: str, @up: U?)\n  end\n  def n = @n\n  def up = @up\n  def hi(x: str): str = x + @n\nend\nlet a = U(\"a\", nil)\nlet b = U(\"b\", a)\nlet k = 0\ndef f(u: U?): U?\n  k += 1\n  u\nend\nlet none: U? = nil\nlet ps = [{x: 1}]\n[b.up?.n, a.up?.n, a.up?.up?.n, none?.up.n, none?.n ?? \"?\", f(b)?.hi(\"h\"), f(nil)?.hi(\"h\"), k, ps[0]?.x, ps[5]?.x, b\n  ?.up\n  ?.n]"),
+        run(
+            "class U\n  def init(@n: str, @up: U?)\n  end\n  def n = @n\n  def up = @up\n  def hi(x: str): str = x + @n\nend\nlet a = U(\"a\", nil)\nlet b = U(\"b\", a)\nlet k = 0\ndef f(u: U?): U?\n  k += 1\n  u\nend\nlet none: U? = nil\nlet ps = [{x: 1}]\n[b.up?.n, a.up?.n, a.up?.up?.n, none?.up.n, none?.n ?? \"?\", f(b)?.hi(\"h\"), f(nil)?.hi(\"h\"), k, ps[0]?.x, ps[5]?.x, b\n  ?.up\n  ?.n]"
+        ),
         "=> [\"a\", nil, nil, nil, \"?\", \"hb\", nil, 2, 1, nil, \"a\"]"
     );
     // `if let a = e`, `if (let a = e).is_a?(T)`: `a` for the whole `if`, `e` once.
@@ -227,15 +227,23 @@ fn control_flow() {
     );
     // `a?[i]` (`c ?[1] : [2]`: a ternary).
     assert_eq!(
-        run("let xs: [int]? = [1, 2]\nlet none: [int]? = nil\nlet h: {str => [int]}? = {\"a\" => [5]}\nlet c = true\n[xs?[0], none?[0], none?[0].abs(), xs?[1].abs(), h?[\"a\"]?[0], none?[0] ?? 9, c ?[1] : [2], xs?[5]?]"),
+        run(
+            "let xs: [int]? = [1, 2]\nlet none: [int]? = nil\nlet h: {str => [int]}? = {\"a\" => [5]}\nlet c = true\n[xs?[0], none?[0], none?[0].abs(), xs?[1].abs(), h?[\"a\"]?[0], none?[0] ?? 9, c ?[1] : [2], xs?[5]?]"
+        ),
         "=> [1, nil, nil, 2, 5, 9, [1], nil]"
     );
     // A method ending with `?`, without parentheses.
     assert_eq!(
-        run("class U\n  def ok? = true\nend\n[\"5\".to_i?, \"x\".to_i? ?? 0, U().ok?, \"5\".to_i?().abs()]"),
+        run(
+            "class U\n  def ok? = true\nend\n[\"5\".to_i?, \"x\".to_i? ?? 0, U().ok?, \"5\".to_i?().abs()]"
+        ),
         "=> [5, 0, true, 5]"
     );
-    assert!(err("let x: int = false ? 1 : \"a\"").1.contains("expected type `int`"));
+    assert!(
+        err("let x: int = false ? 1 : \"a\"")
+            .1
+            .contains("expected type `int`")
+    );
     assert_eq!(run("let x = 5\nx = 0 if x > 3\nx"), "=> 0");
     assert_eq!(
         run(
@@ -356,11 +364,7 @@ fn type_annotations() {
             .contains("expected type `str`")
     );
     assert!(err("let s: Server = 1").1.contains("unknown type `Server`"));
-    assert!(
-        err("let s: Sever = 1")
-            .1
-            .contains("unknown type `Sever`")
-    );
+    assert!(err("let s: Sever = 1").1.contains("unknown type `Sever`"));
 }
 
 const ROUTE: &str = "type Route\n  path: str\n  methods: [str] = [\"GET\"]\nend\n";

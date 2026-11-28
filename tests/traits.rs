@@ -280,17 +280,33 @@ let gs: [Named] = [User(\"a\"), up(User(\"b\"))]
     );
     assert_eq!(run(&src), "=> \"<f>\"");
     let err = run(&format!("{NAMED}class U\n  include Greet\nend"));
-    assert!(err.contains("`U` must define `name` (required by `Named`)"), "{err}");
-    let err = run_mode(&format!("{NAMED}class U\n  include Greet\nend"), false, false, false);
-    assert!(err.contains("`U` must define `name` (required by `Named`)"), "{err}");
+    assert!(
+        err.contains("`U` must define `name` (required by `Named`)"),
+        "{err}"
+    );
+    let err = run_mode(
+        &format!("{NAMED}class U\n  include Greet\nend"),
+        false,
+        false,
+        false,
+    );
+    assert!(
+        err.contains("`U` must define `name` (required by `Named`)"),
+        "{err}"
+    );
     // Not a `Greet` for including only `Named`.
     let err = run(&format!(
         "{NAMED}class U\n  include Named\n  def name(): str = \"u\"\nend\ndef f(x: Greet) = x\nf(U())"
     ));
-    assert!(err.contains("expected type `Greet` for `x`, got `U`"), "{err}");
+    assert!(
+        err.contains("expected type `Greet` for `x`, got `U`"),
+        "{err}"
+    );
     // Without static checks: checked when calling.
     let out = run_mode(
-        &format!("{NAMED}class U\n  include Named\n  def name(): str = \"u\"\nend\ndef f(x: Greet) = x\nf(U())"),
+        &format!(
+            "{NAMED}class U\n  include Named\n  def name(): str = \"u\"\nend\ndef f(x: Greet) = x\nf(U())"
+        ),
         false,
         false,
         false,
@@ -316,10 +332,11 @@ end
 def same(a: T, b: T): bool forall T: Eq(T) = a.eq(b)
 [M(1).ne(M(2)), same(M(3), M(3)), M(1).is_a?(Eq)]";
     assert_eq!(run(src), "=> [true, true, true]");
-    let err = run(&format!(
-        "{src}\ndef f(x: Eq(int)) = x\nf(M(1))"
-    ));
-    assert!(err.contains("expected type `Eq(int)` for `x`, got `M`"), "{err}");
+    let err = run(&format!("{src}\ndef f(x: Eq(int)) = x\nf(M(1))"));
+    assert!(
+        err.contains("expected type `Eq(int)` for `x`, got `M`"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -339,7 +356,10 @@ fn included_traits_from_a_previous_script() {
         .eval("class Mute\n  include Loud\nend")
         .unwrap_err()
         .to_string();
-    assert!(err.contains("`Mute` must define `name` (required by `Named`)"), "{err}");
+    assert!(
+        err.contains("`Mute` must define `name` (required by `Named`)"),
+        "{err}"
+    );
     let ty = e.type_info("Bot").unwrap();
     assert_eq!(ty.traits, ["Named", "Greet", "Loud"]);
     assert_eq!(e.type_info("Loud").unwrap().traits, ["Named", "Greet"]);
